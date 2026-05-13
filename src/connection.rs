@@ -865,7 +865,6 @@ impl Connection {
             let mut current_send_interval = send_interval;
             let mut current_recv_interval = recv_interval;
             let mut first_iteration = true;
-            
             // Track subscription errors across reconnections. If a subscription
             // receives too many consecutive errors, we remove it to prevent
             // error loops (e.g., Artemis sending repeated permission errors).
@@ -977,10 +976,9 @@ impl Connection {
                 // Resubscribe any existing subscriptions after reconnect.
                 // We snapshot the subscription entries while holding the lock
                 // and then issue SUBSCRIBE frames using the sink.
-                if first_iteration{
+                if first_iteration {
                     first_iteration = false;
-                }
-                else{
+                } else {
                     let subs_snapshot: Vec<ResubEntry> = {
                         let map = subscriptions.lock().await;
                         let mut v: Vec<ResubEntry> = Vec::new();
