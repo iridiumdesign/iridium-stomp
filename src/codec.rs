@@ -54,6 +54,7 @@ pub struct StompCodec {
 }
 
 impl StompCodec {
+    /// Create a new `StompCodec` instance.
     pub fn new() -> Self {
         Self {}
     }

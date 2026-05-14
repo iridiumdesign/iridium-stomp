@@ -325,7 +325,7 @@ impl AppState {
 
         // Sort destinations by message count (descending)
         let mut subs: Vec<_> = self.subscriptions.iter().collect();
-        subs.sort_by(|a, b| b.1.message_count.cmp(&a.1.message_count));
+        subs.sort_by_key(|b| std::cmp::Reverse(b.1.message_count));
 
         let max_dest_len = subs
             .iter()

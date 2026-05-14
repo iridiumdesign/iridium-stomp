@@ -3,10 +3,15 @@
 //! Additional user-facing guides from the `docs/` directory are exposed as
 //! rustdoc modules so they appear on docs.rs. See the `subscriptions_docs`
 //! module for information about durable subscriptions and `SubscriptionOptions`.
+/// STOMP wire-protocol codec for use with `tokio_util::codec::Framed`.
 pub mod codec;
+/// Connection lifecycle, retry, reconnection, and the main `Connection` API.
 pub mod connection;
+/// STOMP frame representation (command, headers, body).
 pub mod frame;
+/// Low-level STOMP frame parser (byte-level decoding).
 pub mod parser;
+/// Subscription handles and configuration types.
 pub mod subscription;
 
 /// Re-export the codec types (`StompCodec`, `StompItem`) for easy use with
