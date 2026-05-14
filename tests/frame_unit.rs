@@ -259,6 +259,26 @@ fn frame_duplicate_headers() {
 }
 
 #[test]
+fn frame_get_header_is_case_insensitive() {
+    let frame = Frame::new("MESSAGE")
+        .header("Message-Id", "msg-123")
+        .header("Subscription", "sub-1");
+
+    assert_eq!(frame.get_header("message-id"), Some("msg-123"));
+    assert_eq!(frame.get_header("MESSAGE-ID"), Some("msg-123"));
+    assert_eq!(frame.get_header("subscription"), Some("sub-1"));
+}
+
+#[test]
+fn frame_get_header_returns_first_case_insensitive_match() {
+    let frame = Frame::new("MESSAGE")
+        .header("Message-Id", "first")
+        .header("message-id", "second");
+
+    assert_eq!(frame.get_header("MESSAGE-ID"), Some("first"));
+}
+
+#[test]
 fn frame_header_special_characters() {
     let frame =
         Frame::new("SEND").header("url", "http://example.com:8080/path?query=value&other=123");
