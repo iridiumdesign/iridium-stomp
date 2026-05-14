@@ -76,12 +76,12 @@ impl Frame {
 
     /// Get the value of a header by name.
     ///
-    /// Returns the first header value matching the given key (case-sensitive),
+    /// Returns the first header value matching the given key (case-insensitive),
     /// or `None` if no such header exists.
     pub fn get_header(&self, key: &str) -> Option<&str> {
         self.headers
             .iter()
-            .find(|(k, _)| k == key)
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
             .map(|(_, v)| v.as_str())
     }
 }
