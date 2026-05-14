@@ -139,8 +139,8 @@ pub(crate) type PendingMap = HashMap<String, VecDeque<(String, Frame)>>;
 /// Internal type for resubscribe snapshot entries: (destination, id, ack, headers)
 pub(crate) type ResubEntry = (String, String, String, Vec<(String, String)>);
 
-/// Alias for pending receipt map: receipt-id -> oneshot sender to notify when received.
-pub(crate) type PendingReceipts = HashMap<String, oneshot::Sender<()>>;
+/// Alias for pending receipt map: receipt-id -> oneshot sender to notify when resolved.
+pub(crate) type PendingReceipts = HashMap<String, oneshot::Sender<Result<(), ServerError>>>;
 
 /// Errors returned by `Connection` operations.
 #[derive(Error, Debug)]
@@ -154,13 +154,18 @@ pub enum ConnError {
     /// Receipt timeout error
     #[error("receipt timeout: no RECEIPT received for '{0}' within timeout")]
     ReceiptTimeout(String),
-    /// Server rejected the connection (e.g., authentication failure)
+    /// Server rejected the connection (e.g., authentication failure).
     ///
     /// This error is returned when the server sends an ERROR frame in response
     /// to the CONNECT frame. Common causes include invalid credentials,
     /// unauthorized access, or broker configuration issues.
     #[error("server rejected connection: {0}")]
     ServerRejected(ServerError),
+    /// A frame that requested a receipt was rejected by the broker via
+    /// an ERROR frame with a matching receipt-id. The connection may
+    /// still be usable depending on broker behavior.
+    #[error("frame rejected: {0}")]
+    FrameRejected(ServerError),
 }
 
 /// Represents an ERROR frame received from the STOMP server.
@@ -1140,12 +1145,24 @@ impl Connection {
                                         if let Some(receipt_id) = f.get_header("receipt-id") {
                                             let mut receipts = pending_receipts_clone.lock().await;
                                             if let Some(sender) = receipts.remove(receipt_id) {
-                                                let _ = sender.send(());
+                                                let _ = sender.send(Ok(()));
                                             }
                                         }
                                         // Don't forward RECEIPT frames to inbound channel
                                         continue;
                                     } else if f.command == "ERROR" {
+                                        // An ERROR with receipt-id is the failed response to a
+                                        // frame that requested a receipt. Wake that waiter with
+                                        // the broker error, then continue forwarding the frame.
+                                        if let Some(receipt_id) = f.get_header("receipt-id") {
+                                            let mut receipts =
+                                                pending_receipts_clone.lock().await;
+                                            if let Some(sender) = receipts.remove(receipt_id) {
+                                                let _ = sender
+                                                    .send(Err(ServerError::from_frame(f.clone())));
+                                            }
+                                        }
+
                                         // Track subscription-related errors. If we see repeated
                                         // errors for the same destination, remove the subscription
                                         // to prevent error loops.
@@ -1420,16 +1437,17 @@ impl Connection {
 
     /// Wait for a receipt confirmation from the server.
     ///
-    /// This method blocks until the server sends a RECEIPT frame with the
-    /// matching receipt-id, or until the timeout expires.
+    /// This method blocks until the server sends a RECEIPT or ERROR frame with
+    /// the matching receipt-id, or until the timeout expires.
     ///
     /// # Parameters
     /// - `receipt_id`: the receipt ID returned by `send_frame_with_receipt()`.
     /// - `timeout`: maximum time to wait for the receipt.
     ///
     /// # Returns
-    /// `Ok(())` if the receipt was received, or `Err(ConnError::ReceiptTimeout)`
-    /// if the timeout expired.
+    /// `Ok(())` if the receipt was received, `Err(ConnError::FrameRejected)`
+    /// if the broker rejected the frame, or `Err(ConnError::ReceiptTimeout)` if
+    /// the timeout expired.
     ///
     /// # Example
     /// ```ignore
@@ -1456,7 +1474,8 @@ impl Connection {
 
         // Wait for the receipt with timeout
         match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(err))) => Err(ConnError::FrameRejected(err)),
             Ok(Err(_)) => {
                 // Channel was closed without receiving - connection likely dropped
                 Err(ConnError::Protocol(
@@ -1517,7 +1536,8 @@ impl Connection {
 
         // Wait for the receipt with timeout
         match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(err))) => Err(ConnError::FrameRejected(err)),
             Ok(Err(_)) => Err(ConnError::Protocol(
                 "receipt channel closed unexpectedly".into(),
             )),
@@ -1904,6 +1924,9 @@ fn current_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::thread;
     use tokio::sync::mpsc;
 
     // Helper to build a MESSAGE frame with given message-id and subscription/destination headers
@@ -1921,6 +1944,155 @@ mod tests {
             f = f.header("destination", d);
         }
         f
+    }
+
+    fn read_stomp_frame(stream: &mut TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            stream.read_exact(&mut byte).unwrap();
+            bytes.push(byte[0]);
+            if byte[0] == 0 {
+                break;
+            }
+        }
+        String::from_utf8(bytes).unwrap()
+    }
+
+    fn header_value<'a>(frame: &'a str, name: &str) -> &'a str {
+        frame
+            .lines()
+            .find_map(|line| line.strip_prefix(&format!("{}:", name)))
+            .unwrap()
+    }
+
+    fn start_receipt_rejection_server(
+        message: &'static str,
+        body: &'static str,
+        response_delay: Duration,
+    ) -> (SocketAddr, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _connect = read_stomp_frame(&mut stream);
+                stream
+                    .write_all(b"CONNECTED\nversion:1.2\nheart-beat:0,0\n\n\0")
+                    .unwrap();
+                stream.flush().unwrap();
+
+                let send_frame = read_stomp_frame(&mut stream);
+                let receipt_id = header_value(&send_frame, "receipt").to_string();
+                thread::sleep(response_delay);
+                let error_frame = format!(
+                    "ERROR\nreceipt-id:{}\nmessage:{}\n\n{}\0",
+                    receipt_id, message, body
+                );
+                stream.write_all(error_frame.as_bytes()).unwrap();
+                stream.flush().unwrap();
+
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn error_with_receipt_id_rejects_confirmed_send_and_stays_inbound() {
+        let (addr, server) =
+            start_receipt_rejection_server("publish denied", "not allowed", Duration::ZERO);
+        let addr = addr.to_string();
+
+        let conn = Connection::connect(&addr, "guest", "guest", "0,0")
+            .await
+            .unwrap();
+
+        let result = conn
+            .send_frame_confirmed(
+                Frame::new("SEND")
+                    .header("destination", "/queue/forbidden")
+                    .set_body(b"payload".to_vec()),
+                Duration::from_secs(2),
+            )
+            .await;
+
+        let rejected_receipt_id = match result {
+            Err(ConnError::FrameRejected(err)) => {
+                assert_eq!(err.message, "publish denied");
+                assert_eq!(err.body, Some("not allowed".to_string()));
+                err.receipt_id
+                    .expect("frame rejection should include receipt-id")
+            }
+            other => panic!("expected FrameRejected, got {:?}", other),
+        };
+
+        let received = tokio::time::timeout(Duration::from_secs(1), conn.next_frame())
+            .await
+            .unwrap();
+        match received {
+            Some(ReceivedFrame::Error(err)) => {
+                assert_eq!(err.message, "publish denied");
+                assert_eq!(err.body, Some("not allowed".to_string()));
+                assert_eq!(err.receipt_id, Some(rejected_receipt_id));
+            }
+            other => panic!("expected forwarded ERROR frame, got {:?}", other),
+        }
+
+        conn.close().await;
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_for_receipt_reports_frame_rejection_and_keeps_error_inbound() {
+        let (addr, server) = start_receipt_rejection_server(
+            "receipt rejected",
+            "permission denied",
+            Duration::from_millis(100),
+        );
+        let addr = addr.to_string();
+
+        let conn = Connection::connect(&addr, "guest", "guest", "0,0")
+            .await
+            .unwrap();
+
+        let receipt_id = conn
+            .send_frame_with_receipt(
+                Frame::new("SEND")
+                    .header("destination", "/queue/forbidden")
+                    .set_body(b"payload".to_vec()),
+            )
+            .await
+            .unwrap();
+
+        let result = conn
+            .wait_for_receipt(&receipt_id, Duration::from_secs(2))
+            .await;
+
+        match result {
+            Err(ConnError::FrameRejected(err)) => {
+                assert_eq!(err.message, "receipt rejected");
+                assert_eq!(err.body, Some("permission denied".to_string()));
+                assert_eq!(err.receipt_id, Some(receipt_id.clone()));
+            }
+            other => panic!("expected FrameRejected, got {:?}", other),
+        }
+
+        let received = tokio::time::timeout(Duration::from_secs(1), conn.next_frame())
+            .await
+            .unwrap();
+        match received {
+            Some(ReceivedFrame::Error(err)) => {
+                assert_eq!(err.message, "receipt rejected");
+                assert_eq!(err.body, Some("permission denied".to_string()));
+                assert_eq!(err.receipt_id, Some(receipt_id));
+            }
+            other => panic!("expected forwarded ERROR frame, got {:?}", other),
+        }
+
+        conn.close().await;
+        server.join().unwrap();
     }
 
     #[tokio::test]
