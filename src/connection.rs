@@ -994,7 +994,7 @@ impl Connection {
                         }
                         v
                     };
-    
+
                     for (dest, id, ack, headers) in subs_snapshot {
                         let mut sf = Frame::new("SUBSCRIBE");
                         sf = sf
