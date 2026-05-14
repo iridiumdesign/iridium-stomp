@@ -250,6 +250,13 @@ pub fn format_connection_error_pub(err: &ConnError, address: &str) -> (String, u
             }
             (message, super::exit_codes::AUTH_ERROR)
         }
+        ConnError::FrameRejected(server_err) => {
+            let mut message = format!("Frame rejected: {}", server_err.message);
+            if let Some(body) = &server_err.body {
+                message.push_str(&format!(" ({})", body));
+            }
+            (message, super::exit_codes::FRAME_REJECTED)
+        }
         ConnError::Protocol(msg) => (
             format!("Protocol error: {}", msg),
             super::exit_codes::PROTOCOL_ERROR,
@@ -258,5 +265,29 @@ pub fn format_connection_error_pub(err: &ConnError, address: &str) -> (String, u
             format!("Receipt timeout: {}", id),
             super::exit_codes::PROTOCOL_ERROR,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iridium_stomp::connection::ServerError;
+
+    #[test]
+    fn frame_rejected_uses_distinct_exit_code() {
+        let err = ConnError::FrameRejected(ServerError {
+            message: "publish denied".to_string(),
+            body: Some("not allowed".to_string()),
+            receipt_id: Some("receipt-1".to_string()),
+            frame: Frame::new("ERROR")
+                .header("message", "publish denied")
+                .header("receipt-id", "receipt-1")
+                .set_body(b"not allowed".to_vec()),
+        });
+
+        let (message, code) = format_connection_error_pub(&err, "127.0.0.1:61613");
+
+        assert_eq!(message, "Frame rejected: publish denied (not allowed)");
+        assert_eq!(code, super::super::exit_codes::FRAME_REJECTED);
     }
 }
