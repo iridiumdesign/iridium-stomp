@@ -306,8 +306,13 @@ impl ReceivedFrame {
 /// Subscription acknowledgement modes as defined by STOMP 1.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AckMode {
+    /// Server considers the message delivered as soon as it is sent (no
+    /// explicit acknowledgement required from the client).
     Auto,
+    /// Client must send an ACK frame; the ACK is cumulative — it
+    /// acknowledges all messages up to and including the specified one.
     Client,
+    /// Client must send an ACK frame for each individual message.
     ClientIndividual,
 }
 
@@ -1347,6 +1352,11 @@ impl Connection {
         self.send_frame(frame).await
     }
 
+    /// Send an arbitrary STOMP frame to the broker.
+    ///
+    /// Use this when you need full control over the frame (custom headers,
+    /// binary body, receipt requests, etc.). For simple text messages, prefer
+    /// [`send`](Self::send).
     pub async fn send_frame(&self, frame: Frame) -> Result<(), ConnError> {
         // Send a frame to the background writer task.
         //
@@ -1865,6 +1875,9 @@ impl Connection {
         }
     }
 
+    /// Gracefully shut down the connection.
+    ///
+    /// Signals the background task to stop and drops the connection handle.
     pub async fn close(self) {
         // Signal the background task to shutdown by broadcasting on the
         // shutdown channel. Consumers may await task termination separately
