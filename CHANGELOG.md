@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-05-13
+
+### Fixed
+
+- Resubscribe loop ran on the initial connection, causing duplicate subscriptions ([#72])
+  - User-issued `SUBSCRIBE` raced the background loop's resubscribe pass on the first iteration, producing duplicate deliveries on ActiveMQ Classic and `There already is a subscription for: <id>` errors on Artemis
+  - Resubscribe is now correctly limited to reconnect iterations
+- Silent failures during resubscription after reconnect ([#48])
+  - `sink.send()` errors during the resubscribe pass were swallowed; they are now surfaced via `tracing::warn!` with destination, subscription id, and error context
+
+### Changed
+
+- Restored 100% rustdoc coverage on the public API ([#73])
+- Applied `clippy::unnecessary_sort_by` fix in CLI state module (lint added in clippy 1.95) ([#73])
+
+### Dependencies
+
+- `rand` 0.8.5 → 0.8.6 ([#70])
+
+## [0.4.0] - 2026-04-03
+
+### Added
+
+- Initial connection retry with exponential backoff ([#67])
+  - `Connection::connect` now retries automatically when the broker is unreachable or crashes mid-handshake (1s → 2s → 4s → 8s → 16s, capped at 30s)
+  - Services can start before the broker is available
+  - Authentication failures (`ConnError::ServerRejected`) still fail immediately so bad configuration surfaces fast
+- `Connection::send()` convenience method for sending a text message in one call
+- Tracing observability — connect and reconnect lifecycle events instrumented with the `tracing` crate (warn on failures, info on success)
+
+### Changed
+
+- **Breaking**: `Connection::connect` no longer returns `ConnError::Io` on initial connection failure — it retries instead. Only `ConnError::ServerRejected` returns immediately.
+- Examples split into focused use cases: `send`, `send_advanced`, `listen` (replaces `quickstart`)
+- Docker Swarm config replaced with Docker Compose for broader accessibility
+- Documentation overhaul across subscriber guide, heartbeats, durable subscriptions, README, and all examples ([#64], [#65])
+
+## [0.3.2] - 2026-03-17
+
+### Added
+
+- New `multi_subscribe` example demonstrating multiple destinations, per-message ACK, and error monitoring ([#63])
+- Subscriber guide at `docs/subscriber-guide.md`
+- `tokio::signal` support in the CLI
+
+### Changed
+
+- Reconnect backoff is now stability-aware: stable connections reset to 1s instead of continuing to back off ([#60])
+- CLI error handling improvements ([#63])
+
+### Dependencies
+
+- `bytes` 1.10.1 → 1.11.1 ([#61])
+- `time` 0.3.46 → 0.3.47 ([#62])
+
 ## [0.3.1] - 2026-01-24
 
 ### Fixed
@@ -108,7 +163,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Feature-gated CLI (`--features cli`)
 - Comprehensive test suite (150+ tests)
 
-[Unreleased]: https://github.com/bsiegfreid/iridium-stomp/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/bsiegfreid/iridium-stomp/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/bsiegfreid/iridium-stomp/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/bsiegfreid/iridium-stomp/compare/v0.3.2...v0.4.0
+[0.3.2]: https://github.com/bsiegfreid/iridium-stomp/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/bsiegfreid/iridium-stomp/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/bsiegfreid/iridium-stomp/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/bsiegfreid/iridium-stomp/compare/v0.2.0...v0.2.1
@@ -120,4 +178,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#35]: https://github.com/bsiegfreid/iridium-stomp/issues/35
 [#36]: https://github.com/bsiegfreid/iridium-stomp/issues/36
 [#37]: https://github.com/bsiegfreid/iridium-stomp/pull/37
+[#48]: https://github.com/bsiegfreid/iridium-stomp/issues/48
 [#54]: https://github.com/bsiegfreid/iridium-stomp/pull/54
+[#60]: https://github.com/bsiegfreid/iridium-stomp/pull/60
+[#61]: https://github.com/bsiegfreid/iridium-stomp/pull/61
+[#62]: https://github.com/bsiegfreid/iridium-stomp/pull/62
+[#63]: https://github.com/bsiegfreid/iridium-stomp/pull/63
+[#64]: https://github.com/bsiegfreid/iridium-stomp/pull/64
+[#65]: https://github.com/bsiegfreid/iridium-stomp/pull/65
+[#67]: https://github.com/bsiegfreid/iridium-stomp/pull/67
+[#70]: https://github.com/bsiegfreid/iridium-stomp/pull/70
+[#72]: https://github.com/bsiegfreid/iridium-stomp/pull/72
+[#73]: https://github.com/bsiegfreid/iridium-stomp/pull/73
