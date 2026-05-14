@@ -6,31 +6,26 @@
 use iridium_stomp::Connection;
 use iridium_stomp::connection::ConnError;
 use std::io::{Read, Write};
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// Helper to find an available port
-fn get_available_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+fn bind_loopback_listener() -> (TcpListener, SocketAddr) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    (listener, addr)
 }
 
-/// Test that server sending ERROR frame during CONNECT returns ServerRejected
-#[tokio::test]
-async fn connect_error_frame_returns_server_rejected() {
-    let port = get_available_port();
-    let addr = format!("127.0.0.1:{}", port);
+fn unused_loopback_addr() -> String {
+    let (listener, addr) = bind_loopback_listener();
+    drop(listener);
+    addr.to_string()
+}
 
-    // Spawn a mock server that sends an ERROR frame
-    let server_addr = addr.clone();
-    let server = thread::spawn(move || {
-        let listener = TcpListener::bind(&server_addr).unwrap();
-        listener.set_nonblocking(false).unwrap();
+fn start_error_frame_server() -> (String, thread::JoinHandle<()>) {
+    let (listener, addr) = bind_loopback_listener();
 
+    let handle = thread::spawn(move || {
         if let Ok((mut stream, _)) = listener.accept() {
             // Read the CONNECT frame (we don't need to parse it fully)
             let mut buf = [0u8; 1024];
@@ -40,14 +35,40 @@ async fn connect_error_frame_returns_server_rejected() {
             let error_frame = "ERROR\nmessage:Authentication failed\n\nInvalid credentials\0";
             stream.write_all(error_frame.as_bytes()).unwrap();
             stream.flush().unwrap();
-
-            // Keep connection open briefly so client can read
-            thread::sleep(Duration::from_millis(100));
         }
     });
 
-    // Give server time to start
-    thread::sleep(Duration::from_millis(50));
+    (addr.to_string(), handle)
+}
+
+fn start_close_during_handshake_server(run_for: Duration) -> (String, thread::JoinHandle<()>) {
+    let (listener, addr) = bind_loopback_listener();
+    listener.set_nonblocking(true).unwrap();
+
+    let handle = thread::spawn(move || {
+        let deadline = Instant::now() + run_for;
+        while Instant::now() < deadline {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    drop(stream);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    (addr.to_string(), handle)
+}
+
+/// Test that server sending ERROR frame during CONNECT returns ServerRejected
+#[tokio::test]
+async fn connect_error_frame_returns_server_rejected() {
+    let (addr, server) = start_error_frame_server();
 
     // Attempt connection
     let result = Connection::connect(&addr, "user", "wrongpass", "0,0").await;
@@ -69,32 +90,7 @@ async fn connect_error_frame_returns_server_rejected() {
 /// (not an immediate failure). Protocol errors during handshake are transient.
 #[tokio::test]
 async fn connect_closed_before_connected_retries() {
-    let port = get_available_port();
-    let addr = format!("127.0.0.1:{}", port);
-
-    // Spawn a mock server that closes immediately after receiving CONNECT
-    let server_addr = addr.clone();
-    let server = thread::spawn(move || {
-        let listener = TcpListener::bind(&server_addr).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while std::time::Instant::now() < deadline {
-            match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let mut buf = [0u8; 1024];
-                    let _ = stream.read(&mut buf);
-                    drop(stream);
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    thread::sleep(Duration::from_millis(50));
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    // Give server time to start
-    thread::sleep(Duration::from_millis(50));
+    let (addr, server) = start_close_during_handshake_server(Duration::from_secs(2));
 
     // Should keep retrying, not return an error
     let result = tokio::time::timeout(
@@ -118,8 +114,7 @@ async fn connect_closed_before_connected_retries() {
 /// then cancel the attempt.
 #[tokio::test]
 async fn connect_refused_retries_instead_of_failing() {
-    let port = get_available_port();
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = unused_loopback_addr();
 
     // No server listening — connect should retry, not return an error.
     let result = tokio::time::timeout(
