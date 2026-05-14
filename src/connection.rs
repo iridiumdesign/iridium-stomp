@@ -1009,7 +1009,14 @@ impl Connection {
                         for (k, v) in headers {
                             sf = sf.header(&k, &v);
                         }
-                        let _ = sink.send(StompItem::Frame(sf)).await;
+                        if let Err(e) = sink.send(StompItem::Frame(sf)).await {
+                            tracing::warn!(
+                                destination = %dest,
+                                subscription_id = %id,
+                                error = %e,
+                                "failed to resubscribe after reconnect",
+                            );
+                        }
                     }
                 }
                 let mut hb_tick = match send_interval {
