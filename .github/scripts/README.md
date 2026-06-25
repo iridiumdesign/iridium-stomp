@@ -21,7 +21,7 @@ Usage
 export GITHUB_TOKEN=ghp_...
 ```
 
-   - Then run the script above. The script defaults to repository `bsiegfreid/iridium-stomp`.
+   - Then run the script above. The script defaults to repository `iridiumdesign/iridium-stomp`.
 
 Notes
 

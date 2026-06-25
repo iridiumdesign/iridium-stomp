@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-06-24
+
+### Added
+
+- Project banner in the README
+
+### Changed
+
+- Repository moved to the `iridiumdesign` GitHub organization; `repository` and
+  `homepage` metadata and the URL printed by the CLI now point to
+  `github.com/iridiumdesign/iridium-stomp`
+
 ## [0.4.1] - 2026-05-13
 
 ### Fixed
@@ -163,30 +175,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Feature-gated CLI (`--features cli`)
 - Comprehensive test suite (150+ tests)
 
-[Unreleased]: https://github.com/bsiegfreid/iridium-stomp/compare/v0.4.1...HEAD
-[0.4.1]: https://github.com/bsiegfreid/iridium-stomp/compare/v0.4.0...v0.4.1
-[0.4.0]: https://github.com/bsiegfreid/iridium-stomp/compare/v0.3.2...v0.4.0
-[0.3.2]: https://github.com/bsiegfreid/iridium-stomp/compare/v0.3.1...v0.3.2
-[0.3.1]: https://github.com/bsiegfreid/iridium-stomp/compare/v0.3.0...v0.3.1
-[0.3.0]: https://github.com/bsiegfreid/iridium-stomp/compare/v0.2.1...v0.3.0
-[0.2.1]: https://github.com/bsiegfreid/iridium-stomp/compare/v0.2.0...v0.2.1
-[0.2.0]: https://github.com/bsiegfreid/iridium-stomp/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/bsiegfreid/iridium-stomp/releases/tag/v0.1.0
-[#32]: https://github.com/bsiegfreid/iridium-stomp/issues/32
-[#33]: https://github.com/bsiegfreid/iridium-stomp/issues/33
-[#34]: https://github.com/bsiegfreid/iridium-stomp/issues/34
-[#35]: https://github.com/bsiegfreid/iridium-stomp/issues/35
-[#36]: https://github.com/bsiegfreid/iridium-stomp/issues/36
-[#37]: https://github.com/bsiegfreid/iridium-stomp/pull/37
-[#48]: https://github.com/bsiegfreid/iridium-stomp/issues/48
-[#54]: https://github.com/bsiegfreid/iridium-stomp/pull/54
-[#60]: https://github.com/bsiegfreid/iridium-stomp/pull/60
-[#61]: https://github.com/bsiegfreid/iridium-stomp/pull/61
-[#62]: https://github.com/bsiegfreid/iridium-stomp/pull/62
-[#63]: https://github.com/bsiegfreid/iridium-stomp/pull/63
-[#64]: https://github.com/bsiegfreid/iridium-stomp/pull/64
-[#65]: https://github.com/bsiegfreid/iridium-stomp/pull/65
-[#67]: https://github.com/bsiegfreid/iridium-stomp/pull/67
-[#70]: https://github.com/bsiegfreid/iridium-stomp/pull/70
-[#72]: https://github.com/bsiegfreid/iridium-stomp/pull/72
-[#73]: https://github.com/bsiegfreid/iridium-stomp/pull/73
+[Unreleased]: https://github.com/iridiumdesign/iridium-stomp/compare/v0.4.2...HEAD
+[0.4.2]: https://github.com/iridiumdesign/iridium-stomp/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/iridiumdesign/iridium-stomp/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/iridiumdesign/iridium-stomp/compare/v0.3.2...v0.4.0
+[0.3.2]: https://github.com/iridiumdesign/iridium-stomp/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/iridiumdesign/iridium-stomp/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/iridiumdesign/iridium-stomp/compare/v0.2.1...v0.3.0
+[0.2.1]: https://github.com/iridiumdesign/iridium-stomp/compare/v0.2.0...v0.2.1
+[0.2.0]: https://github.com/iridiumdesign/iridium-stomp/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/iridiumdesign/iridium-stomp/releases/tag/v0.1.0
+[#32]: https://github.com/iridiumdesign/iridium-stomp/issues/32
+[#33]: https://github.com/iridiumdesign/iridium-stomp/issues/33
+[#34]: https://github.com/iridiumdesign/iridium-stomp/issues/34
+[#35]: https://github.com/iridiumdesign/iridium-stomp/issues/35
+[#36]: https://github.com/iridiumdesign/iridium-stomp/issues/36
+[#37]: https://github.com/iridiumdesign/iridium-stomp/pull/37
+[#48]: https://github.com/iridiumdesign/iridium-stomp/issues/48
+[#54]: https://github.com/iridiumdesign/iridium-stomp/pull/54
+[#60]: https://github.com/iridiumdesign/iridium-stomp/pull/60
+[#61]: https://github.com/iridiumdesign/iridium-stomp/pull/61
+[#62]: https://github.com/iridiumdesign/iridium-stomp/pull/62
+[#63]: https://github.com/iridiumdesign/iridium-stomp/pull/63
+[#64]: https://github.com/iridiumdesign/iridium-stomp/pull/64
+[#65]: https://github.com/iridiumdesign/iridium-stomp/pull/65
+[#67]: https://github.com/iridiumdesign/iridium-stomp/pull/67
+[#70]: https://github.com/iridiumdesign/iridium-stomp/pull/70
+[#72]: https://github.com/iridiumdesign/iridium-stomp/pull/72
+[#73]: https://github.com/iridiumdesign/iridium-stomp/pull/73

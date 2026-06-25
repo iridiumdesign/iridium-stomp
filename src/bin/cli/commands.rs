@@ -248,6 +248,6 @@ pub fn print_about() {
     println!("© 2025 Brad Siegfreid");
     println!();
     println!("Licensed under the MIT License.");
-    println!("See https://github.com/bsiegfreid/iridium-stomp for more information.");
+    println!("See https://github.com/iridiumdesign/iridium-stomp for more information.");
     println!();
 }

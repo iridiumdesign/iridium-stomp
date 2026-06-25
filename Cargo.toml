@@ -1,13 +1,13 @@
 [package]
 name = "iridium-stomp"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 license = "MIT"
 authors = ["Brad Siegfreid <bsiegfreid@me.com>"]
 description = "Async STOMP 1.2 client for Rust"
 readme = "README.md"
-repository = "https://github.com/bsiegfreid/iridium-stomp"
-homepage = "https://github.com/bsiegfreid/iridium-stomp"
+repository = "https://github.com/iridiumdesign/iridium-stomp"
+homepage = "https://github.com/iridiumdesign/iridium-stomp"
 documentation = "https://docs.rs/iridium-stomp"
 keywords = ["stomp", "async", "messaging", "tokio", "rabbitmq"]
 categories = ["network-programming", "asynchronous"]

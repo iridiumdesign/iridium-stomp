@@ -1,6 +1,11 @@
-# iridium-stomp
+<p align="center">
+  <img
+    src="https://raw.githubusercontent.com/iridiumdesign/iridium-stomp/main/branding/iridium-stomp-github-banner.png"
+    alt="iridium-stomp — frame relay :: async rust"
+    width="880">
+</p>
 
-[![CI](https://github.com/bsiegfreid/iridium-stomp/actions/workflows/ci.yml/badge.svg)](https://github.com/bsiegfreid/iridium-stomp/actions/workflows/ci.yml)
+[![CI](https://github.com/iridiumdesign/iridium-stomp/actions/workflows/ci.yml/badge.svg)](https://github.com/iridiumdesign/iridium-stomp/actions/workflows/ci.yml)
 
 An asynchronous STOMP 1.2 client library for Rust.
 
