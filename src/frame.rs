@@ -54,8 +54,12 @@ impl Frame {
     /// Request a receipt for this frame (builder style).
     ///
     /// When sent, the server will respond with a RECEIPT frame containing
-    /// the same receipt ID. Use this with `Connection::wait_for_receipt()`
-    /// to confirm delivery.
+    /// the same receipt ID.
+    ///
+    /// Use this only with `Connection::send_frame`, which sends the frame
+    /// as-is. `Connection::send_frame_with_receipt` and
+    /// `Connection::send_frame_confirmed` add a generated receipt header of
+    /// their own and track it for you.
     ///
     /// Parameters
     /// - `id`: the receipt identifier. Must be unique per connection.

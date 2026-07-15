@@ -215,19 +215,19 @@ use std::time::Duration;
 
 let msg = Frame::new("SEND")
     .header("destination", "/queue/important")
-    .receipt("msg-123")  // Request receipt with this ID
     .set_body(b"critical data".to_vec());
 
-// Send and wait for confirmation (with timeout)
+// Send and wait for confirmation (with timeout). The receipt header is added
+// for you - do not set one yourself.
 conn.send_frame_confirmed(msg, Duration::from_secs(5)).await?;
 
-// Or handle receipts manually
+// Or hold the confirmation and await it later. The receipt id is generated
+// for you and carried by the returned handle.
 let msg = Frame::new("SEND")
     .header("destination", "/queue/test")
-    .receipt("msg-456")
     .set_body(b"data".to_vec());
-conn.send_frame_with_receipt(msg).await?;
-conn.wait_for_receipt("msg-456", Duration::from_secs(5)).await?;
+let handle = conn.send_frame_with_receipt(msg).await?;
+handle.wait(Duration::from_secs(5)).await?;
 ```
 
 ### Connection Error Handling

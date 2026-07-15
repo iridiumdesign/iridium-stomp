@@ -19,10 +19,11 @@ pub mod subscription;
 pub use codec::{StompCodec, StompItem};
 
 /// Re-export the high-level `Connection`, `AckMode`, `ConnectOptions`, `ConnError`,
-/// `Heartbeat`, `ReceivedFrame`, `ServerError`, and the heartbeat helper functions.
+/// `Heartbeat`, `ReceiptHandle`, `ReceivedFrame`, `ServerError`, and the heartbeat
+/// helper functions.
 pub use connection::{
-    AckMode, ConnError, ConnectOptions, Connection, Heartbeat, ReceivedFrame, ServerError,
-    negotiate_heartbeats, parse_heartbeat_header,
+    AckMode, ConnError, ConnectOptions, Connection, Heartbeat, ReceiptHandle, ReceivedFrame,
+    ServerError, negotiate_heartbeats, parse_heartbeat_header,
 };
 
 /// Re-export the `Frame` type used to construct/send and receive frames.
