@@ -1661,20 +1661,16 @@ impl Connection {
     /// Subscribe with a typed `SubscriptionOptions` structure.
     ///
     /// `SubscriptionOptions.headers` are forwarded to the broker and persisted
-    /// for automatic resubscribe after reconnect. If `durable_queue` is set,
-    /// it will be used as the actual destination instead of `destination`.
+    /// for automatic resubscribe after reconnect. Durable subscriptions are
+    /// requested through those headers - see the module docs for
+    /// [`SubscriptionOptions`](crate::subscription::SubscriptionOptions).
     pub async fn subscribe_with_options(
         &self,
         destination: &str,
         ack: AckMode,
         options: crate::subscription::SubscriptionOptions,
     ) -> Result<crate::subscription::Subscription, ConnError> {
-        let dest = options
-            .durable_queue
-            .as_deref()
-            .unwrap_or(destination)
-            .to_string();
-        self.subscribe_with_headers(&dest, ack, options.headers)
+        self.subscribe_with_headers(destination, ack, options.headers)
             .await
     }
 

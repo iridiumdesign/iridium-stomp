@@ -26,18 +26,20 @@ let sub = conn.subscribe("/queue/orders", AckMode::Auto).await?;
 ### `subscribe_with_options(destination, ack, options)`
 
 Accepts a `SubscriptionOptions` struct for typed configuration. Use this
-when you need a durable queue name or broker-specific headers.
+when you need broker-specific headers, such as a durable subscription name.
 
 ```rust
 use iridium_stomp::{AckMode, SubscriptionOptions};
 
 let opts = SubscriptionOptions {
-    durable_queue: Some("/queue/my-durable-queue".to_string()),
-    headers: vec![],
+    headers: vec![(
+        "activemq.subscriptionName".to_string(),
+        "my-durable-sub".to_string(),
+    )],
 };
 
 let sub = conn
-    .subscribe_with_options("/exchange/amq.topic", AckMode::Client, opts)
+    .subscribe_with_options("/topic/my-topic", AckMode::Client, opts)
     .await?;
 ```
 
@@ -64,10 +66,15 @@ let sub = conn
 
 | Field | Type | Purpose |
 |-------|------|---------|
-| `durable_queue` | `Option<String>` | Override the destination with a named queue (useful for RabbitMQ durable queues). |
 | `headers` | `Vec<(String, String)>` | Extra headers included on the SUBSCRIBE frame (e.g., broker-specific durable subscription names). |
 
-Both fields are preserved internally and replayed on reconnect.
+Headers are preserved internally and replayed on reconnect.
+
+STOMP has no durable-subscription concept of its own, so durability is
+whatever the broker defines it to be. On ActiveMQ that is a header such as
+`activemq.subscriptionName`; on RabbitMQ the queue is declared
+administratively and you simply subscribe to it by name as the
+`destination`.
 
 ---
 
@@ -94,8 +101,6 @@ or options you provided are all preserved and replayed.
 
 This means:
 
-- Durable queue names (`durable_queue`) are sent again, so the broker
-  resumes delivery from the same queue.
 - Broker-specific headers (e.g., `activemq.subscriptionName`) are resent,
   so durable topic subscriptions are restored.
 - Your application code does not need to handle resubscription — the

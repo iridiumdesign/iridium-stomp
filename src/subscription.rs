@@ -11,14 +11,29 @@ use tokio::sync::mpsc;
 /// they can be re-sent on reconnect. This allows broker-specific durable
 /// subscription extensions to be used (for example ActiveMQ's durable
 /// subscription headers) while keeping the library generic.
+///
+/// # Durability
+///
+/// Durability is requested through `headers`, using whatever header the broker
+/// defines for it - STOMP itself has no durable-subscription concept. For
+/// example, ActiveMQ uses `activemq.subscriptionName`:
+///
+/// ```ignore
+/// let options = SubscriptionOptions {
+///     headers: vec![(
+///         "activemq.subscriptionName".to_string(),
+///         "my-durable-sub".to_string(),
+///     )],
+/// };
+/// ```
+///
+/// On brokers where a durable queue is declared administratively, such as
+/// RabbitMQ, pass that queue as the `destination` argument; nothing extra is
+/// needed here.
 #[derive(Debug, Clone, Default)]
 pub struct SubscriptionOptions {
     /// Extra headers to include on the SUBSCRIBE frame.
     pub headers: Vec<(String, String)>,
-
-    /// Optional named queue to subscribe to (convenience; typically you can
-    /// just put this in the `destination` argument). Kept for clarity.
-    pub durable_queue: Option<String>,
 }
 
 /// A lightweight handle returned from `Connection::subscribe` that packages the

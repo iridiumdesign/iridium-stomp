@@ -16,16 +16,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     // Subscribe to a queue using client ack mode (so we must ack messages).
-    // Here we use `SubscriptionOptions` to optionally specify a durable
-    // queue name (for brokers like RabbitMQ) or include broker-specific
-    // headers (for example ActiveMQ's durable subscription headers).
-    let opts = SubscriptionOptions {
-        durable_queue: Some("/queue/example-durable".to_string()),
-        headers: vec![],
-    };
+    // `SubscriptionOptions` carries broker-specific headers; durability is
+    // requested through them, for example ActiveMQ's durable subscription
+    // headers. On brokers where the durable queue is declared
+    // administratively, such as RabbitMQ, name it as the destination and no
+    // extra headers are needed.
+    let opts = SubscriptionOptions { headers: vec![] };
 
     let mut sub = conn
-        .subscribe_with_options("/exchange/topic", AckMode::Client, opts)
+        .subscribe_with_options("/queue/example-durable", AckMode::Client, opts)
         .await?;
 
     println!("subscribed id={} dest={}", sub.id(), sub.destination());

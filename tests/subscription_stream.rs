@@ -14,7 +14,6 @@ use iridium_stomp::SubscriptionOptions;
 fn subscription_options_default() {
     let opts = SubscriptionOptions::default();
     assert!(opts.headers.is_empty());
-    assert!(opts.durable_queue.is_none());
 }
 
 #[test]
@@ -27,7 +26,6 @@ fn subscription_options_with_headers() {
             ),
             ("selector".to_string(), "priority > 5".to_string()),
         ],
-        durable_queue: None,
     };
     assert_eq!(opts.headers.len(), 2);
     assert_eq!(opts.headers[0].0, "activemq.subscriptionName");
@@ -35,31 +33,19 @@ fn subscription_options_with_headers() {
 }
 
 #[test]
-fn subscription_options_with_durable_queue() {
-    let opts = SubscriptionOptions {
-        headers: vec![],
-        durable_queue: Some("/queue/durable-test".to_string()),
-    };
-    assert_eq!(opts.durable_queue, Some("/queue/durable-test".to_string()));
-}
-
-#[test]
 fn subscription_options_clone() {
     let original = SubscriptionOptions {
         headers: vec![("key".to_string(), "value".to_string())],
-        durable_queue: Some("/queue/test".to_string()),
     };
     let cloned = original.clone();
 
     assert_eq!(original.headers, cloned.headers);
-    assert_eq!(original.durable_queue, cloned.durable_queue);
 }
 
 #[test]
 fn subscription_options_debug() {
     let opts = SubscriptionOptions {
         headers: vec![("test".to_string(), "value".to_string())],
-        durable_queue: None,
     };
     let debug_str = format!("{:?}", opts);
     assert!(debug_str.contains("SubscriptionOptions"));
@@ -78,11 +64,9 @@ fn subscription_options_full_config() {
             ("activemq.noLocal".to_string(), "true".to_string()),
             ("selector".to_string(), "type = 'important'".to_string()),
         ],
-        durable_queue: Some("/queue/events".to_string()),
     };
 
     assert_eq!(opts.headers.len(), 3);
-    assert_eq!(opts.durable_queue.as_deref(), Some("/queue/events"));
 }
 
 // =============================================================================
@@ -96,7 +80,6 @@ fn subscription_options_empty_header_values() {
             ("empty-value".to_string(), "".to_string()),
             ("".to_string(), "empty-key".to_string()),
         ],
-        durable_queue: None,
     };
     assert_eq!(opts.headers[0].1, "");
     assert_eq!(opts.headers[1].0, "");
@@ -109,8 +92,6 @@ fn subscription_options_special_characters() {
             "selector".to_string(),
             "id > 100 AND type = 'test'".to_string(),
         )],
-        durable_queue: Some("/queue/test?param=value&other=123".to_string()),
     };
     assert!(opts.headers[0].1.contains("'test'"));
-    assert!(opts.durable_queue.as_ref().unwrap().contains("?param="));
 }
