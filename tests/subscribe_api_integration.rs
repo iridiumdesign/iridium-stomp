@@ -65,23 +65,6 @@ fn test_stream_api_usage_pattern() {
 // Acceptance Criteria 2: Support durable subscriptions
 // =============================================================================
 
-/// Test that SubscriptionOptions supports durable queue configuration.
-/// This demonstrates support for RabbitMQ-style durable queues.
-#[test]
-fn test_subscription_options_durable_queue() {
-    // RabbitMQ durable subscription pattern
-    let opts = SubscriptionOptions {
-        durable_queue: Some("/queue/durable-events".to_string()),
-        headers: vec![],
-    };
-
-    assert_eq!(
-        opts.durable_queue,
-        Some("/queue/durable-events".to_string()),
-        "Should support durable queue configuration"
-    );
-}
-
 /// Test that SubscriptionOptions supports broker-specific headers.
 /// This demonstrates support for ActiveMQ-style durable subscriptions
 /// and other broker-specific features via custom headers.
@@ -89,7 +72,6 @@ fn test_subscription_options_durable_queue() {
 fn test_subscription_options_broker_specific_headers() {
     // ActiveMQ durable subscription pattern
     let opts = SubscriptionOptions {
-        durable_queue: None,
         headers: vec![
             (
                 "activemq.subscriptionName".to_string(),
@@ -134,16 +116,13 @@ fn test_subscription_options_ergonomics() {
     // Default should provide empty options
     let default_opts = SubscriptionOptions::default();
     assert!(default_opts.headers.is_empty());
-    assert!(default_opts.durable_queue.is_none());
 
     // Clone should preserve all fields
     let opts = SubscriptionOptions {
-        durable_queue: Some("/queue/test".to_string()),
         headers: vec![("key".to_string(), "value".to_string())],
     };
 
     let cloned = opts.clone();
-    assert_eq!(opts.durable_queue, cloned.durable_queue);
     assert_eq!(opts.headers, cloned.headers);
 }
 
@@ -297,7 +276,6 @@ fn test_durable_subscription_example_compiles() {
         //         ("activemq.subscriptionName".into(), "my-durable-sub".into()),
         //         ("selector".into(), "priority > 5".into()),
         //     ],
-        //     durable_queue: None,
         // };
         //
         // let sub = conn.subscribe_with_options(

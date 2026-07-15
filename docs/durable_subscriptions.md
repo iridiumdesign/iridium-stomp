@@ -43,11 +43,13 @@ equivalent pattern is a durable named queue bound to an exchange.
 
 ### Client code
 
-Use `SubscriptionOptions.durable_queue` to subscribe to the named queue:
+Durability here is a property of the queue you declared above, not of the
+SUBSCRIBE frame. Subscribe to that queue by naming it as the destination —
+no options are needed at all:
 
 ```rust
-use iridium_stomp::{Connection, SubscriptionOptions};
 use iridium_stomp::AckMode;
+use iridium_stomp::Connection;
 
 let conn = Connection::connect(
     "127.0.0.1:61613",
@@ -56,13 +58,8 @@ let conn = Connection::connect(
     Connection::DEFAULT_HEARTBEAT,
 ).await?;
 
-let opts = SubscriptionOptions {
-    durable_queue: Some("/queue/my-app-queue".to_string()),
-    headers: vec![],
-};
-
 let sub = conn
-    .subscribe_with_options("/exchange/amq.topic", AckMode::Client, opts)
+    .subscribe("/queue/my-app-queue", AckMode::Client)
     .await?;
 ```
 
@@ -101,7 +98,6 @@ let conn = Connection::connect_with_options(
 ).await?;
 
 let opts = SubscriptionOptions {
-    durable_queue: None,
     headers: vec![
         ("activemq.subscriptionName".to_string(), "my-durable-sub".to_string()),
     ],

@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking**: `SubscriptionOptions::durable_queue` is removed ([#91])
+  - Despite the name it did not request durability. Its only effect was to override the `destination` argument, so a user who set it expecting an ActiveMQ durable subscription silently got a plain one against a different destination — and because STOMP cannot reject a "wrong" subscription header, the broker accepted it without complaint and messages quietly failed to persist across a disconnect.
+  - Durability is requested through `SubscriptionOptions::headers`, which is what the struct-level docs already described. Pass the broker's own header (ActiveMQ's `activemq.subscriptionName`, for example). Where the durable queue is declared administratively, as on RabbitMQ, name it as the `destination` and no options are needed.
+  - Migration: move the value into the `destination` argument. `subscribe_with_options("/exchange/x", ack, opts)` with `durable_queue: Some("/queue/y")` was only ever subscribing to `/queue/y`, so it becomes `subscribe_with_options("/queue/y", ack, opts)`.
 - **Breaking**: `Connection::send_frame_with_receipt` returns `ReceiptHandle` instead of `String`. Await the confirmation with `handle.wait(timeout)` and read the generated id with `handle.receipt_id()`.
 - **Breaking**: `Connection::wait_for_receipt` is removed, superseded by `ReceiptHandle::wait`
   - Before: `let id = conn.send_frame_with_receipt(f).await?; conn.wait_for_receipt(&id, t).await?;`
@@ -33,6 +37,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- `docs/durable_subscriptions.md` no longer presents `durable_queue` as the RabbitMQ durability mechanism ([#91]). Durability there is a property of the administratively declared queue, so the guide now simply subscribes to it by name. `docs/subscriptions.md` gains a note that STOMP has no durable-subscription concept of its own and that durability is whatever the broker defines it to be.
+- `examples/subscribe.rs` passed `/exchange/topic` as the destination while setting `durable_queue` to `/queue/example-durable`, so it silently subscribed to the latter and demonstrated the confusion the field caused ([#91]). It now names the queue it means.
 - README's receipt examples no longer set a `receipt` header by hand. Both `send_frame_with_receipt` and `send_frame_confirmed` add a generated one, and because `Frame::header` appends rather than overwrites, a hand-set id produced a frame with two `receipt` headers; brokers honour the first, so the confirmation never matched and the wait always timed out.
 
 ## [0.4.2] - 2026-06-24
@@ -232,4 +238,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#72]: https://github.com/iridiumdesign/iridium-stomp/pull/72
 [#73]: https://github.com/iridiumdesign/iridium-stomp/pull/73
 [#82]: https://github.com/iridiumdesign/iridium-stomp/issues/82
+[#91]: https://github.com/iridiumdesign/iridium-stomp/issues/91
 [#96]: https://github.com/iridiumdesign/iridium-stomp/issues/96
