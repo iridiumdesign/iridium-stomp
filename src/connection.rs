@@ -488,14 +488,14 @@ impl ConnectOptions {
     ///
     /// let (tx, mut rx) = mpsc::channel(16);
     /// let options = ConnectOptions::default()
-    ///     .with_heartbeat_notify(tx);
+    ///     .heartbeat_notify(tx);
     ///
     /// // In another task:
     /// while rx.recv().await.is_some() {
     ///     println!("Heartbeat received!");
     /// }
     /// ```
-    pub fn with_heartbeat_notify(mut self, tx: mpsc::Sender<()>) -> Self {
+    pub fn heartbeat_notify(mut self, tx: mpsc::Sender<()>) -> Self {
         self.heartbeat_tx = Some(tx);
         self
     }

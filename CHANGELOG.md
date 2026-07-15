@@ -16,6 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking**: `ConnectOptions::with_heartbeat_notify` is renamed to `heartbeat_notify`
+  - It was the only `with_`-prefixed builder on the type, and the only one in the public API; `accept_version`, `client_id`, `host`, `header`, and `disconnect_timeout` are all unprefixed, as is the convention for Rust builders. Renamed now because 0.5.0 is already a breaking release.
 - **Breaking**: `Connection::close` returns `Result<(), ConnError>` instead of `()`. The connection is torn down either way; the result reports only whether the shutdown was clean. `Err(ConnError::ReceiptTimeout)` means the broker never confirmed within the disconnect timeout — it does not mean the connection is still open. Callers with nothing to do about that can discard it with `let _ = conn.close().await;`.
 
 ### Fixed

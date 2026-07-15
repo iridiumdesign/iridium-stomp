@@ -353,5 +353,5 @@ other indication of why. The error task above is the only way to detect this.
 
 - [Subscriptions](subscriptions.md) — full API reference for subscribe methods, `SubscriptionOptions`, and resubscribe behavior
 - [Durable Subscriptions](durable_subscriptions.md) — broker-specific recipes for RabbitMQ durable queues and ActiveMQ durable topics
-- [Heartbeats](heartbeats.md) — detailed heartbeat negotiation, the `Heartbeat` type, and monitoring via `with_heartbeat_notify`
+- [Heartbeats](heartbeats.md) — detailed heartbeat negotiation, the `Heartbeat` type, and monitoring via `heartbeat_notify`
 - [`multi_subscribe` example](../examples/multi_subscribe.rs) — runnable version of the patterns in this guide
