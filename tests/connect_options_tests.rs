@@ -215,7 +215,7 @@ fn connect_options_heartbeat_notify_default_none() {
 #[test]
 fn connect_options_heartbeat_notify_sets_channel() {
     let (tx, _rx) = tokio::sync::mpsc::channel::<()>(16);
-    let opts = ConnectOptions::default().with_heartbeat_notify(tx);
+    let opts = ConnectOptions::default().heartbeat_notify(tx);
     assert!(opts.heartbeat_tx.is_some());
 }
 
@@ -224,7 +224,7 @@ fn connect_options_heartbeat_notify_chainable() {
     let (tx, _rx) = tokio::sync::mpsc::channel::<()>(16);
     let opts = ConnectOptions::default()
         .client_id("test-client")
-        .with_heartbeat_notify(tx)
+        .heartbeat_notify(tx)
         .host("localhost");
 
     assert!(opts.heartbeat_tx.is_some());

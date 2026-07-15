@@ -389,6 +389,11 @@ pub struct ConnectOptions {
     /// When set, the connection will send a `()` on this channel each time
     /// a heartbeat is received from the server.
     pub heartbeat_tx: Option<mpsc::Sender<()>>,
+
+    /// How long `Connection::close` waits for the broker's RECEIPT after it
+    /// sends DISCONNECT. Defaults to
+    /// [`Connection::DEFAULT_DISCONNECT_TIMEOUT`] if not set.
+    pub disconnect_timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for ConnectOptions {
@@ -402,6 +407,7 @@ impl std::fmt::Debug for ConnectOptions {
                 "heartbeat_tx",
                 &self.heartbeat_tx.as_ref().map(|_| "Some(...)"),
             )
+            .field("disconnect_timeout", &self.disconnect_timeout)
             .finish()
     }
 }
@@ -442,6 +448,25 @@ impl ConnectOptions {
         self
     }
 
+    /// Set how long [`Connection::close`] waits for the broker to confirm the
+    /// DISCONNECT (builder style).
+    ///
+    /// Defaults to [`Connection::DEFAULT_DISCONNECT_TIMEOUT`]. The socket is
+    /// torn down when the timeout expires regardless, so this bounds how long a
+    /// clean shutdown may take against an unresponsive broker; it does not
+    /// decide whether the connection closes.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let options = ConnectOptions::default()
+    ///     .disconnect_timeout(Duration::from_secs(2));
+    /// ```
+    pub fn disconnect_timeout(mut self, timeout: Duration) -> Self {
+        self.disconnect_timeout = Some(timeout);
+        self
+    }
+
     /// Set a channel to receive heartbeat notifications (builder style).
     ///
     /// When set, the connection will send a `()` on this channel each time
@@ -463,14 +488,14 @@ impl ConnectOptions {
     ///
     /// let (tx, mut rx) = mpsc::channel(16);
     /// let options = ConnectOptions::default()
-    ///     .with_heartbeat_notify(tx);
+    ///     .heartbeat_notify(tx);
     ///
     /// // In another task:
     /// while rx.recv().await.is_some() {
     ///     println!("Heartbeat received!");
     /// }
     /// ```
-    pub fn with_heartbeat_notify(mut self, tx: mpsc::Sender<()>) -> Self {
+    pub fn heartbeat_notify(mut self, tx: mpsc::Sender<()>) -> Self {
         self.heartbeat_tx = Some(tx);
         self
     }
@@ -641,6 +666,8 @@ pub struct Connection {
     /// here with a oneshot sender. When the server responds with a RECEIPT
     /// frame, the sender is notified.
     pending_receipts: Arc<Mutex<PendingReceipts>>,
+    /// How long `close` waits for the broker's RECEIPT after DISCONNECT.
+    disconnect_timeout: Duration,
 }
 
 /// A pending receipt confirmation for a frame sent with
@@ -751,6 +778,13 @@ impl Connection {
     /// ).await?;
     /// ```
     pub const DEFAULT_HEARTBEAT: &'static str = "10000,10000";
+
+    /// How long [`close`](Connection::close) waits for the broker to confirm the
+    /// DISCONNECT before giving up and tearing the socket down anyway.
+    ///
+    /// Override per connection with
+    /// [`ConnectOptions::disconnect_timeout`].
+    pub const DEFAULT_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
     /// Establish a connection to the STOMP server at `addr` with the given
     /// credentials and heartbeat header string (e.g. "10000,10000").
@@ -1364,6 +1398,9 @@ impl Connection {
             sub_id_counter,
             pending,
             pending_receipts,
+            disconnect_timeout: options
+                .disconnect_timeout
+                .unwrap_or(Self::DEFAULT_DISCONNECT_TIMEOUT),
         })
     }
 
@@ -1939,12 +1976,54 @@ impl Connection {
 
     /// Gracefully shut down the connection.
     ///
-    /// Signals the background task to stop and drops the connection handle.
-    pub async fn close(self) {
-        // Signal the background task to shutdown by broadcasting on the
-        // shutdown channel. Consumers may await task termination separately
-        // if needed.
+    /// Performs the STOMP 1.2 shutdown sequence: sends a DISCONNECT frame
+    /// carrying a `receipt` header, waits for the broker's RECEIPT, then stops
+    /// the background task and closes the socket.
+    ///
+    /// Because frames are written in the order they are submitted, and the
+    /// broker only answers a DISCONNECT once it has processed what came before,
+    /// a confirmed close also proves that everything previously sent on this
+    /// connection reached the broker.
+    ///
+    /// # Returns
+    /// `Ok(())` once the broker has confirmed the DISCONNECT.
+    /// `Err(ConnError::ReceiptTimeout)` if it did not answer within the
+    /// disconnect timeout, or another `ConnError` if the DISCONNECT could not be
+    /// submitted or was rejected.
+    ///
+    /// **The connection is torn down either way.** An error reports that the
+    /// shutdown was not clean - that the broker may not have run whatever it
+    /// does on a protocol-level disconnect, such as transactional rollback or
+    /// durable subscription cleanup - not that the connection is still open.
+    /// Callers with nothing to do about that may discard the result.
+    ///
+    /// The wait is bounded by [`ConnectOptions::disconnect_timeout`], defaulting
+    /// to [`DEFAULT_DISCONNECT_TIMEOUT`](Connection::DEFAULT_DISCONNECT_TIMEOUT),
+    /// so an unresponsive broker cannot make `close` hang.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Report an unclean shutdown.
+    /// conn.close().await?;
+    ///
+    /// // Or shut down best-effort.
+    /// let _ = conn.close().await;
+    /// ```
+    pub async fn close(self) -> Result<(), ConnError> {
+        // Queued frames are written before this one, and the broker answers the
+        // receipt only after processing them, so awaiting it drains the outbound
+        // queue rather than abandoning it at the shutdown signal below.
+        let result = match self.send_frame_with_receipt(Frame::new("DISCONNECT")).await {
+            Ok(handle) => handle.wait(self.disconnect_timeout).await,
+            Err(err) => Err(err),
+        };
+
+        // Tear down regardless of how the broker answered: the caller asked for
+        // the connection to close, and `result` reports only whether it got to
+        // do so cleanly.
         let _ = self.shutdown_tx.send(());
+
+        result
     }
 }
 
@@ -1992,6 +2071,21 @@ mod tests {
             }
         }
         String::from_utf8(bytes).unwrap()
+    }
+
+    /// Connect with a short disconnect timeout. These stubs do not answer a
+    /// DISCONNECT, so the default would make every teardown wait out the full
+    /// receipt timeout.
+    async fn connect_for_test(addr: &str) -> Connection {
+        Connection::connect_with_options(
+            addr,
+            "guest",
+            "guest",
+            "0,0",
+            ConnectOptions::default().disconnect_timeout(Duration::from_millis(50)),
+        )
+        .await
+        .unwrap()
     }
 
     /// Read a header from a raw frame the way a broker does: the first
@@ -2076,9 +2170,7 @@ mod tests {
         let (addr, server) = start_receipt_success_server(Duration::ZERO);
         let addr = addr.to_string();
 
-        let conn = Connection::connect(&addr, "guest", "guest", "0,0")
-            .await
-            .unwrap();
+        let conn = connect_for_test(&addr).await;
 
         let handle = conn
             .send_frame_with_receipt(
@@ -2097,7 +2189,7 @@ mod tests {
             .await
             .expect("RECEIPT delivered before the wait began must still resolve it");
 
-        conn.close().await;
+        let _ = conn.close().await;
         server.join().unwrap();
     }
 
@@ -2110,9 +2202,7 @@ mod tests {
         let (addr, server) = start_receipt_success_server(Duration::ZERO);
         let addr = addr.to_string();
 
-        let conn = Connection::connect(&addr, "guest", "guest", "0,0")
-            .await
-            .unwrap();
+        let conn = connect_for_test(&addr).await;
 
         let handle = conn
             .send_frame_with_receipt(
@@ -2131,7 +2221,7 @@ mod tests {
             .await
             .expect("generated receipt id must be the only one on the wire");
 
-        conn.close().await;
+        let _ = conn.close().await;
         server.join().unwrap();
     }
 
@@ -2141,9 +2231,7 @@ mod tests {
             start_receipt_rejection_server("publish denied", "not allowed", Duration::ZERO);
         let addr = addr.to_string();
 
-        let conn = Connection::connect(&addr, "guest", "guest", "0,0")
-            .await
-            .unwrap();
+        let conn = connect_for_test(&addr).await;
 
         let result = conn
             .send_frame_confirmed(
@@ -2176,7 +2264,7 @@ mod tests {
             other => panic!("expected forwarded ERROR frame, got {:?}", other),
         }
 
-        conn.close().await;
+        let _ = conn.close().await;
         server.join().unwrap();
     }
 
@@ -2189,9 +2277,7 @@ mod tests {
         );
         let addr = addr.to_string();
 
-        let conn = Connection::connect(&addr, "guest", "guest", "0,0")
-            .await
-            .unwrap();
+        let conn = connect_for_test(&addr).await;
 
         let handle = conn
             .send_frame_with_receipt(
@@ -2226,7 +2312,7 @@ mod tests {
             other => panic!("expected forwarded ERROR frame, got {:?}", other),
         }
 
-        conn.close().await;
+        let _ = conn.close().await;
         server.join().unwrap();
     }
 
@@ -2284,6 +2370,7 @@ mod tests {
             sub_id_counter,
             pending: pending.clone(),
             pending_receipts: Arc::new(Mutex::new(HashMap::new())),
+            disconnect_timeout: Connection::DEFAULT_DISCONNECT_TIMEOUT,
         };
 
         // ack m2 cumulatively: should remove m1 and m2, leaving m3
@@ -2362,6 +2449,7 @@ mod tests {
             sub_id_counter,
             pending: pending.clone(),
             pending_receipts: Arc::new(Mutex::new(HashMap::new())),
+            disconnect_timeout: Connection::DEFAULT_DISCONNECT_TIMEOUT,
         };
 
         // ack only 'b' individually
@@ -2407,6 +2495,7 @@ mod tests {
             sub_id_counter,
             pending: pending.clone(),
             pending_receipts: Arc::new(Mutex::new(HashMap::new())),
+            disconnect_timeout: Connection::DEFAULT_DISCONNECT_TIMEOUT,
         };
 
         // subscribe
@@ -2462,6 +2551,7 @@ mod tests {
             sub_id_counter,
             pending: pending.clone(),
             pending_receipts: Arc::new(Mutex::new(HashMap::new())),
+            disconnect_timeout: Connection::DEFAULT_DISCONNECT_TIMEOUT,
         };
 
         // subscribe with client ack
@@ -2524,6 +2614,7 @@ mod tests {
             sub_id_counter,
             pending,
             pending_receipts: Arc::new(Mutex::new(HashMap::new())),
+            disconnect_timeout: Connection::DEFAULT_DISCONNECT_TIMEOUT,
         };
 
         (conn, out_rx)

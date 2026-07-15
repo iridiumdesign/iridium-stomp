@@ -57,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Transaction {} aborted", tx_id_2);
 
     // Close the connection
-    conn.close().await;
+    conn.close().await?;
 
     Ok(())
 }

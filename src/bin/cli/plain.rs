@@ -22,7 +22,7 @@ pub async fn run(cli: &Cli) -> Result<(), (String, u8)> {
     let (hb_tx, mut hb_rx) = mpsc::channel::<()>(16);
 
     // Build connection options
-    let options = ConnectOptions::default().with_heartbeat_notify(hb_tx);
+    let options = ConnectOptions::default().heartbeat_notify(hb_tx);
 
     let conn = Connection::connect_with_options(
         &cli.address,
@@ -139,7 +139,9 @@ pub async fn run(cli: &Cli) -> Result<(), (String, u8)> {
                     let s = state.lock().await;
                     println!("{}", s.generate_summary());
                 }
-                conn.close().await;
+                if let Err(e) = conn.close().await {
+                    eprintln!("Warning: broker did not confirm the disconnect: {}", e);
+                }
                 break;
             }
             CommandResult::Info(msg) => {

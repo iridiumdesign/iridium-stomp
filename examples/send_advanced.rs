@@ -21,6 +21,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     conn.send_frame(msg).await?;
 
     println!("Message sent");
-    conn.close().await;
+    conn.close().await?;
     Ok(())
 }

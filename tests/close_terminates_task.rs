@@ -14,8 +14,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
-/// A broker that stays up and counts every connection it accepts, answering
-/// CONNECT with CONNECTED and then holding the socket open.
+/// A broker that stays up and counts every connection it accepts. It answers
+/// CONNECT with CONNECTED, and answers a DISCONNECT with its RECEIPT as a real
+/// broker does, so `close` does not have to wait out its receipt timeout here.
 fn start_counting_broker() -> (String, Arc<AtomicUsize>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
@@ -28,16 +29,42 @@ fn start_counting_broker() -> (String, Arc<AtomicUsize>) {
             accepts_clone.fetch_add(1, Ordering::SeqCst);
             thread::spawn(move || {
                 let mut buf = [0u8; 4096];
+
+                // CONNECT -> CONNECTED
                 if stream.read(&mut buf).is_ok() {
                     let _ = stream.write_all(b"CONNECTED\nversion:1.2\nheart-beat:0,0\n\n\0");
                     let _ = stream.flush();
                 }
-                thread::sleep(Duration::from_secs(30));
+
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let text = String::from_utf8_lossy(&buf[..n]).to_string();
+                            if !text.starts_with("DISCONNECT") {
+                                continue;
+                            }
+                            if let Some(id) = receipt_id_of(&text) {
+                                let frame = format!("RECEIPT\nreceipt-id:{}\n\n\0", id);
+                                let _ = stream.write_all(frame.as_bytes());
+                                let _ = stream.flush();
+                            }
+                        }
+                    }
+                }
             });
         }
     });
 
     (addr, accepts)
+}
+
+/// Pull the `receipt` header out of a raw frame.
+fn receipt_id_of(frame: &str) -> Option<&str> {
+    frame.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.eq_ignore_ascii_case("receipt").then_some(value)
+    })
 }
 
 /// Backoff starts at 1s and doubles to 2s for a short-lived connection, so a
@@ -63,7 +90,7 @@ async fn close_terminates_the_background_task() {
     // the shutdown receiver live. This is the ordinary case.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    conn.close().await;
+    let _ = conn.close().await;
     tokio::time::sleep(OBSERVE).await;
 
     let total = accepts.load(Ordering::SeqCst);
@@ -92,7 +119,7 @@ async fn close_immediately_after_connect_terminates_the_background_task() {
 
     // No await between connect returning and close: the task may not have been
     // polled even once yet.
-    conn.close().await;
+    let _ = conn.close().await;
     tokio::time::sleep(OBSERVE).await;
 
     let total = accepts.load(Ordering::SeqCst);
@@ -123,7 +150,7 @@ async fn close_terminates_the_background_task_with_a_clone_outstanding() {
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    conn.close().await;
+    let _ = conn.close().await;
     tokio::time::sleep(OBSERVE).await;
 
     let total = accepts.load(Ordering::SeqCst);

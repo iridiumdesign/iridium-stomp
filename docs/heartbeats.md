@@ -112,7 +112,7 @@ use iridium_stomp::{Connection, ConnectOptions};
 
 let (tx, mut rx) = mpsc::channel(16);
 let options = ConnectOptions::default()
-    .with_heartbeat_notify(tx);
+    .heartbeat_notify(tx);
 
 let conn = Connection::connect_with_options(
     "127.0.0.1:61613", "guest", "guest", Connection::DEFAULT_HEARTBEAT, options
