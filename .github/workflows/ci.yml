@@ -171,6 +171,12 @@ jobs:
         run: |
           cargo test --lib --verbose
 
+      # The CLI lives behind the `cli` feature, so `--lib` never builds it and
+      # its tests would otherwise be written but never run.
+      - name: Run CLI tests
+        run: |
+          cargo test --test cli_oneshot --features cli --verbose
+
   build-examples:
     name: Build examples
     needs: [format, clippy, unit-tests]
