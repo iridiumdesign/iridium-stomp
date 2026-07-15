@@ -16,9 +16,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+Every breaking change in this release is listed here, with its migration.
+
+- **Breaking**: `Connection::send_frame_with_receipt` returns `ReceiptHandle` instead of `String`. Await the confirmation with `handle.wait(timeout)` and read the generated id with `handle.receipt_id()`. ([#82])
+- **Breaking**: `Connection::wait_for_receipt` is removed, superseded by `ReceiptHandle::wait` ([#82])
+  - Before: `let id = conn.send_frame_with_receipt(f).await?; conn.wait_for_receipt(&id, t).await?;`
+  - After: `let h = conn.send_frame_with_receipt(f).await?; h.wait(t).await?;`
+  - Sending several frames before awaiting any still works — each handle is independent
+- **Breaking**: `Connection::close` returns `Result<(), ConnError>` instead of `()` ([#81])
+  - The connection is torn down either way; the result reports only whether the shutdown was clean. `Err(ConnError::ReceiptTimeout)` means the broker never confirmed within the disconnect timeout — it does not mean the connection is still open.
+  - Migration: `conn.close().await?;` to surface an unclean shutdown, or `let _ = conn.close().await;` to keep the previous fire-and-forget behaviour.
+- **Breaking**: `SubscriptionOptions::durable_queue` is removed ([#91])
+  - Despite the name it did not request durability. Its only effect was to override the `destination` argument, so a user who set it expecting an ActiveMQ durable subscription silently got a plain one against a different destination — and because STOMP cannot reject a "wrong" subscription header, the broker accepted it without complaint and messages quietly failed to persist across a disconnect.
+  - Durability is requested through `SubscriptionOptions::headers`, which is what the struct-level docs already described. Pass the broker's own header (ActiveMQ's `activemq.subscriptionName`, for example). Where the durable queue is declared administratively, as on RabbitMQ, name it as the `destination` and no options are needed.
+  - Migration: move the value into the `destination` argument. `subscribe_with_options("/exchange/x", ack, opts)` with `durable_queue: Some("/queue/y")` was only ever subscribing to `/queue/y`, so it becomes `subscribe_with_options("/queue/y", ack, opts)`.
 - **Breaking**: `ConnectOptions::with_heartbeat_notify` is renamed to `heartbeat_notify`
   - It was the only `with_`-prefixed builder on the type, and the only one in the public API; `accept_version`, `client_id`, `host`, `header`, and `disconnect_timeout` are all unprefixed, as is the convention for Rust builders. Renamed now because 0.5.0 is already a breaking release.
-- **Breaking**: `Connection::close` returns `Result<(), ConnError>` instead of `()`. The connection is torn down either way; the result reports only whether the shutdown was clean. `Err(ConnError::ReceiptTimeout)` means the broker never confirmed within the disconnect timeout — it does not mean the connection is still open. Callers with nothing to do about that can discard it with `let _ = conn.close().await;`.
+  - Migration: drop the `with_` prefix at the call site.
+- `send_frame_confirmed` is now a thin wrapper over `send_frame_with_receipt` + `ReceiptHandle::wait`, rather than duplicating the registration and timeout logic ([#82])
 
 ### Fixed
 
@@ -34,19 +49,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A caller-supplied `receipt` header silently broke `send_frame_with_receipt` and `send_frame_confirmed`
   - `Frame::header` appends rather than overwrites, so a hand-set id put two `receipt` headers on the wire. Brokers honour the first, while the client tracked the generated id, so the confirmation never matched and the wait always timed out.
   - Caller-supplied `receipt` headers are now replaced by the generated one, matched case-insensitively to agree with header lookup
-
-### Changed
-
-- **Breaking**: `SubscriptionOptions::durable_queue` is removed ([#91])
-  - Despite the name it did not request durability. Its only effect was to override the `destination` argument, so a user who set it expecting an ActiveMQ durable subscription silently got a plain one against a different destination — and because STOMP cannot reject a "wrong" subscription header, the broker accepted it without complaint and messages quietly failed to persist across a disconnect.
-  - Durability is requested through `SubscriptionOptions::headers`, which is what the struct-level docs already described. Pass the broker's own header (ActiveMQ's `activemq.subscriptionName`, for example). Where the durable queue is declared administratively, as on RabbitMQ, name it as the `destination` and no options are needed.
-  - Migration: move the value into the `destination` argument. `subscribe_with_options("/exchange/x", ack, opts)` with `durable_queue: Some("/queue/y")` was only ever subscribing to `/queue/y`, so it becomes `subscribe_with_options("/queue/y", ack, opts)`.
-- **Breaking**: `Connection::send_frame_with_receipt` returns `ReceiptHandle` instead of `String`. Await the confirmation with `handle.wait(timeout)` and read the generated id with `handle.receipt_id()`.
-- **Breaking**: `Connection::wait_for_receipt` is removed, superseded by `ReceiptHandle::wait`
-  - Before: `let id = conn.send_frame_with_receipt(f).await?; conn.wait_for_receipt(&id, t).await?;`
-  - After: `let h = conn.send_frame_with_receipt(f).await?; h.wait(t).await?;`
-  - Sending several frames before awaiting any still works — each handle is independent
-- `send_frame_confirmed` is now a thin wrapper over `send_frame_with_receipt` + `ReceiptHandle::wait`, rather than duplicating the registration and timeout logic
 
 ### Documentation
 
