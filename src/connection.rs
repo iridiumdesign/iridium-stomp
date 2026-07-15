@@ -936,8 +936,15 @@ impl Connection {
             }
         };
 
-        // Now spawn background task for ongoing I/O and reconnection
-        let shutdown_tx_clone = shutdown_tx.clone();
+        // Now spawn background task for ongoing I/O and reconnection.
+        //
+        // Subscribe before spawning, and keep the one receiver for the task's
+        // whole life. A broadcast drops a message when nobody is subscribed and
+        // delivers only to receivers that existed when it was sent, so
+        // subscribing inside the task would lose a shutdown signalled before the
+        // task is first polled, and re-subscribing per iteration would discard
+        // one that arrived during the reconnect backoff.
+        let mut shutdown_sub = shutdown_tx.subscribe();
         let subscriptions_clone = subscriptions.clone();
 
         tokio::spawn(async move {
@@ -959,8 +966,6 @@ impl Connection {
             const SUBSCRIPTION_ERROR_THRESHOLD: u32 = 3;
 
             loop {
-                let mut shutdown_sub = shutdown_tx_clone.subscribe();
-
                 // Check for shutdown before attempting connection
                 tokio::select! {
                     biased;
@@ -1105,9 +1110,14 @@ impl Connection {
 
                 let conn_start = tokio::time::Instant::now();
 
+                // Set when the branch below takes the shutdown signal. The
+                // reconnect check after this loop cannot re-read it from
+                // `shutdown_sub`, which is drained by then.
+                let mut shutting_down = false;
+
                 'conn: loop {
                     tokio::select! {
-                        _ = shutdown_sub.recv() => { let _ = sink.close().await; break 'conn; }
+                        _ = shutdown_sub.recv() => { let _ = sink.close().await; shutting_down = true; break 'conn; }
                         maybe = out_rx.recv() => {
                             match maybe {
                                 Some(item) => if sink.send(item).await.is_err() { break 'conn } else { writer_last_sent.store(current_millis(), Ordering::SeqCst); }
@@ -1319,7 +1329,7 @@ impl Connection {
                     }
                 }
 
-                if shutdown_sub.try_recv().is_ok() {
+                if shutting_down || shutdown_sub.try_recv().is_ok() {
                     break;
                 }
                 let stable_duration = conn_start.elapsed();

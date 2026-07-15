@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `Connection::close` did not terminate the background task; it reconnected indefinitely ([#96])
+  - Every closed connection left a task re-establishing a broker session every 30s for the life of the process, so a long-running service accumulated them. From the broker's side this looked like sessions and reconnects with no client that owned them.
+  - Two independent causes. The task subscribed to the shutdown broadcast from inside its own loop, so a `close` issued before the task was first polled reached a channel with no subscribers and was discarded outright, and a shutdown arriving during the reconnect backoff was dropped by the next iteration's re-subscribe. Separately, the inner select consumed the shutdown message while the reconnect check re-read the same drained receiver and concluded it should reconnect — reachable whenever a `Connection` clone kept the outbound channel open, as the CLI does.
+  - The task now subscribes once, before it is spawned, and keeps that receiver for its lifetime; the reconnect check consults a flag set where the signal is consumed rather than re-reading it
+
 - Fast RECEIPT could be lost between `send_frame_with_receipt` and `wait_for_receipt` ([#82])
   - `send_frame_with_receipt` registered a sender whose receiver it dropped immediately. A RECEIPT arriving before `wait_for_receipt` ran was delivered to that orphaned receiver and its registration removed, so the subsequent wait blocked for its full timeout and returned `ConnError::ReceiptTimeout` for a frame the broker had accepted. Most likely against a localhost or LAN broker.
   - The confirmation receiver is now owned by the caller from the moment the frame is queued, so the response cannot arrive before there is somewhere to put it
@@ -227,3 +232,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#72]: https://github.com/iridiumdesign/iridium-stomp/pull/72
 [#73]: https://github.com/iridiumdesign/iridium-stomp/pull/73
 [#82]: https://github.com/iridiumdesign/iridium-stomp/issues/82
+[#96]: https://github.com/iridiumdesign/iridium-stomp/issues/96
