@@ -48,7 +48,7 @@ fn replay_problematic_chunk_sequence() {
 
     for c in chunks {
         buf.extend_from_slice(c);
-        eprintln!("after extend: buf len={} -> {:02x?}", buf.len(), &buf);
+        eprintln!("after extend: buf len={} -> {:02x?}", buf.len(), buf);
         loop {
             eprintln!("attempting decode: buf len={}", buf.len());
             match dec.decode(&mut buf) {
@@ -74,7 +74,7 @@ fn replay_problematic_chunk_sequence() {
     }
 
     if decoded != expected {
-        eprintln!("combined (len={}): {:02x?}", combined.len(), &combined);
+        eprintln!("combined (len={}): {:02x?}", combined.len(), combined);
         let nul_positions: Vec<usize> = combined
             .iter()
             .enumerate()
@@ -92,7 +92,7 @@ fn replay_problematic_chunk_sequence() {
         eprintln!(
             "remaining buf after drain (len={}): {:02x?}",
             buf.len(),
-            &buf
+            buf
         );
         panic!(
             "decoded frames mismatch (decoded={}, expected={})",

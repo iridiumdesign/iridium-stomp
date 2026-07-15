@@ -1145,7 +1145,7 @@ impl Connection {
                                         let mut need_pending = false;
                                         if let Some(sub_id) = &sub_opt {
                                             let map = subscriptions.lock().await;
-                                            for (_dest, vec) in map.iter() {
+                                            for vec in map.values() {
                                                 for entry in vec.iter() {
                                                     if &entry.id == sub_id && entry.ack != "auto" {
                                                         need_pending = true;
@@ -1197,7 +1197,7 @@ impl Connection {
                                         // Deliver to subscribers.
                                         if let Some(sub_id) = sub_opt {
                                             let mut map = subscriptions.lock().await;
-                                            for (_dest, vec) in map.iter_mut() {
+                                            for vec in map.values_mut() {
                                                 vec.retain(|entry| {
                                                     if entry.id == sub_id {
                                                         let _ = entry.sender.try_send(f.clone());
@@ -1729,7 +1729,7 @@ impl Connection {
                     let mut ack_mode = "client".to_string();
                     {
                         let map = self.subscriptions.lock().await;
-                        'outer: for (_dest, vec) in map.iter() {
+                        'outer: for vec in map.values() {
                             for entry in vec.iter() {
                                 if entry.id == subscription_id {
                                     ack_mode = entry.ack.clone();
@@ -1795,7 +1795,7 @@ impl Connection {
                     let mut ack_mode = "client".to_string();
                     {
                         let map = self.subscriptions.lock().await;
-                        'outer2: for (_dest, vec) in map.iter() {
+                        'outer2: for vec in map.values() {
                             for entry in vec.iter() {
                                 if entry.id == subscription_id {
                                     ack_mode = entry.ack.clone();
