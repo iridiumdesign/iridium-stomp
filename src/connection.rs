@@ -1513,6 +1513,16 @@ impl Connection {
             receipts.insert(receipt_id.clone(), tx);
         }
 
+        // Drop any caller-supplied receipt header before adding ours. `Frame::header`
+        // appends rather than overwrites, so leaving one in place would put two
+        // receipt headers on the wire; brokers honour the first, which would never
+        // match the id registered above. Matched case-insensitively, as header
+        // lookup is.
+        let mut frame = frame;
+        frame
+            .headers
+            .retain(|(key, _)| !key.eq_ignore_ascii_case("receipt"));
+
         // Add receipt header and send the frame
         let frame_with_receipt = frame.receipt(&receipt_id);
         if let Err(err) = self.send_frame(frame_with_receipt).await {
@@ -1978,10 +1988,15 @@ mod tests {
         String::from_utf8(bytes).unwrap()
     }
 
+    /// Read a header from a raw frame the way a broker does: the first
+    /// occurrence wins, and the name is matched case-insensitively.
     fn header_value<'a>(frame: &'a str, name: &str) -> &'a str {
         frame
             .lines()
-            .find_map(|line| line.strip_prefix(&format!("{}:", name)))
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case(name).then_some(value)
+            })
             .unwrap()
     }
 
@@ -2075,6 +2090,40 @@ mod tests {
             .wait(Duration::from_secs(2))
             .await
             .expect("RECEIPT delivered before the wait began must still resolve it");
+
+        conn.close().await;
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn caller_supplied_receipt_header_is_replaced_not_appended() {
+        // The stub echoes back the first receipt header it reads. If a
+        // caller-set header survived, the broker would answer with that id
+        // while the client tracked the generated one, and the wait would time
+        // out. Mixed case, since header lookup is case-insensitive.
+        let (addr, server) = start_receipt_success_server(Duration::ZERO);
+        let addr = addr.to_string();
+
+        let conn = Connection::connect(&addr, "guest", "guest", "0,0")
+            .await
+            .unwrap();
+
+        let handle = conn
+            .send_frame_with_receipt(
+                Frame::new("SEND")
+                    .header("destination", "/queue/test")
+                    .header("Receipt", "caller-set")
+                    .set_body(b"payload".to_vec()),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(handle.receipt_id(), "caller-set");
+
+        handle
+            .wait(Duration::from_secs(2))
+            .await
+            .expect("generated receipt id must be the only one on the wire");
 
         conn.close().await;
         server.join().unwrap();

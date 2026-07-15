@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `send_frame_with_receipt` registered a sender whose receiver it dropped immediately. A RECEIPT arriving before `wait_for_receipt` ran was delivered to that orphaned receiver and its registration removed, so the subsequent wait blocked for its full timeout and returned `ConnError::ReceiptTimeout` for a frame the broker had accepted. Most likely against a localhost or LAN broker.
   - The confirmation receiver is now owned by the caller from the moment the frame is queued, so the response cannot arrive before there is somewhere to put it
 - `send_frame_with_receipt` no longer leaves a stale registration behind when the send itself fails
+- A caller-supplied `receipt` header silently broke `send_frame_with_receipt` and `send_frame_confirmed`
+  - `Frame::header` appends rather than overwrites, so a hand-set id put two `receipt` headers on the wire. Brokers honour the first, while the client tracked the generated id, so the confirmation never matched and the wait always timed out.
+  - Caller-supplied `receipt` headers are now replaced by the generated one, matched case-insensitively to agree with header lookup
 
 ### Changed
 
