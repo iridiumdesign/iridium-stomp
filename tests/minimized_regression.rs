@@ -30,7 +30,7 @@ fn minimized_replay_should_decode_all_frames() {
     for c in chunks {
         buf.extend_from_slice(c);
         loop {
-            eprintln!("calling decode: buf len={} -> {:02x?}", buf.len(), &buf);
+            eprintln!("calling decode: buf len={} -> {:02x?}", buf.len(), buf);
             match dec.decode(&mut buf) {
                 Ok(Some(StompItem::Frame(f))) => {
                     eprintln!("decoded frame, remaining buf len={}", buf.len());
@@ -60,7 +60,7 @@ fn minimized_replay_should_decode_all_frames() {
     }
 
     if decoded != expected {
-        eprintln!("combined (len={}): {:02x?}", combined.len(), &combined);
+        eprintln!("combined (len={}): {:02x?}", combined.len(), combined);
         let nul_positions: Vec<usize> = combined
             .iter()
             .enumerate()
@@ -78,7 +78,7 @@ fn minimized_replay_should_decode_all_frames() {
         eprintln!(
             "remaining buf after drain (len={}): {:02x?}",
             buf.len(),
-            &buf
+            buf
         );
     }
     assert_eq!(

@@ -643,6 +643,79 @@ pub struct Connection {
     pending_receipts: Arc<Mutex<PendingReceipts>>,
 }
 
+/// A pending receipt confirmation for a frame sent with
+/// [`Connection::send_frame_with_receipt`].
+///
+/// The handle owns the receiving half of the confirmation channel from the
+/// moment the frame is queued for sending. A RECEIPT that arrives before
+/// [`wait`](ReceiptHandle::wait) is called is therefore buffered in the channel
+/// rather than dropped, so the confirmation cannot be lost to a fast broker.
+///
+/// Handles are independent, so several frames may be sent before any of them is
+/// awaited:
+///
+/// ```ignore
+/// let mut handles = Vec::new();
+/// for order in orders {
+///     handles.push(conn.send_frame_with_receipt(order).await?);
+/// }
+/// for handle in handles {
+///     handle.wait(Duration::from_secs(5)).await?;
+/// }
+/// ```
+#[derive(Debug)]
+pub struct ReceiptHandle {
+    /// The client-generated receipt id carried by the sent frame.
+    receipt_id: String,
+    /// Resolves when the broker answers with RECEIPT or a matching ERROR.
+    rx: oneshot::Receiver<Result<(), ServerError>>,
+    /// Shared registry, used to deregister this receipt if the wait times out.
+    pending_receipts: Arc<Mutex<PendingReceipts>>,
+}
+
+impl ReceiptHandle {
+    /// The receipt id the client generated for this frame.
+    ///
+    /// This is the value sent in the frame's `receipt` header and echoed by the
+    /// broker in the `receipt-id` header of its response.
+    pub fn receipt_id(&self) -> &str {
+        &self.receipt_id
+    }
+
+    /// Wait for the broker to confirm the frame.
+    ///
+    /// # Parameters
+    /// - `timeout`: maximum time to wait for the broker's response.
+    ///
+    /// # Returns
+    /// `Ok(())` if the broker sent a RECEIPT, `Err(ConnError::FrameRejected)`
+    /// if it answered with an ERROR carrying this receipt id, or
+    /// `Err(ConnError::ReceiptTimeout)` if the timeout expired first.
+    pub async fn wait(self, timeout: Duration) -> Result<(), ConnError> {
+        let ReceiptHandle {
+            receipt_id,
+            rx,
+            pending_receipts,
+        } = self;
+
+        match tokio::time::timeout(timeout, rx).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(err))) => Err(ConnError::FrameRejected(err)),
+            Ok(Err(_)) => {
+                // Sender dropped without a response - connection likely gone.
+                Err(ConnError::Protocol(
+                    "receipt channel closed unexpectedly".into(),
+                ))
+            }
+            Err(_) => {
+                let mut receipts = pending_receipts.lock().await;
+                receipts.remove(&receipt_id);
+                Err(ConnError::ReceiptTimeout(receipt_id))
+            }
+        }
+    }
+}
+
 impl Connection {
     /// Heartbeat value that disables heartbeats entirely.
     ///
@@ -1072,7 +1145,7 @@ impl Connection {
                                         let mut need_pending = false;
                                         if let Some(sub_id) = &sub_opt {
                                             let map = subscriptions.lock().await;
-                                            for (_dest, vec) in map.iter() {
+                                            for vec in map.values() {
                                                 for entry in vec.iter() {
                                                     if &entry.id == sub_id && entry.ack != "auto" {
                                                         need_pending = true;
@@ -1124,7 +1197,7 @@ impl Connection {
                                         // Deliver to subscribers.
                                         if let Some(sub_id) = sub_opt {
                                             let mut map = subscriptions.lock().await;
-                                            for (_dest, vec) in map.iter_mut() {
+                                            for vec in map.values_mut() {
                                                 vec.retain(|entry| {
                                                     if entry.id == sub_id {
                                                         let _ = entry.sender.try_send(f.clone());
@@ -1399,103 +1472,84 @@ impl Connection {
         format!("rcpt-{}", RECEIPT_COUNTER.fetch_add(1, Ordering::SeqCst))
     }
 
-    /// Send a frame with a receipt request and return the receipt ID.
+    /// Send a frame with a receipt request and return a handle to its
+    /// confirmation.
     ///
-    /// This method adds a unique `receipt` header to the frame and registers
-    /// the receipt ID for tracking. Use `wait_for_receipt()` to wait for the
-    /// server's RECEIPT response.
+    /// This method adds a unique `receipt` header to the frame, registers the
+    /// receipt id for tracking, and returns a [`ReceiptHandle`]. Call
+    /// [`ReceiptHandle::wait`] to await the broker's RECEIPT response.
+    ///
+    /// Any `receipt` header already present on `frame` is ignored in favour of
+    /// the generated id; use [`ReceiptHandle::receipt_id`] to read it back.
+    ///
+    /// The returned handle owns the confirmation channel from the moment the
+    /// frame is queued, so the broker's response cannot arrive before there is
+    /// somewhere to put it. Awaiting may be deferred freely - see
+    /// [`ReceiptHandle`] for sending several frames before awaiting any.
     ///
     /// # Parameters
     /// - `frame`: the frame to send. A `receipt` header will be added.
     ///
     /// # Returns
-    /// The generated receipt ID that can be used with `wait_for_receipt()`.
+    /// A [`ReceiptHandle`] for the sent frame.
     ///
     /// # Example
     /// ```ignore
-    /// let receipt_id = conn.send_frame_with_receipt(frame).await?;
-    /// conn.wait_for_receipt(&receipt_id, Duration::from_secs(5)).await?;
+    /// let handle = conn.send_frame_with_receipt(frame).await?;
+    /// handle.wait(Duration::from_secs(5)).await?;
     /// ```
-    pub async fn send_frame_with_receipt(&self, frame: Frame) -> Result<String, ConnError> {
+    pub async fn send_frame_with_receipt(&self, frame: Frame) -> Result<ReceiptHandle, ConnError> {
         let receipt_id = Self::generate_receipt_id();
 
-        // Create the oneshot channel for notification
-        let (tx, _rx) = oneshot::channel();
+        // Create the oneshot channel for notification. The receiver goes into
+        // the returned handle, so it stays alive for as long as the caller
+        // cares about the response.
+        let (tx, rx) = oneshot::channel();
 
-        // Register the pending receipt
+        // Register the pending receipt before sending, so the background task
+        // can never see the response with nothing registered for it.
         {
             let mut receipts = self.pending_receipts.lock().await;
             receipts.insert(receipt_id.clone(), tx);
         }
 
+        // Drop any caller-supplied receipt header before adding ours. `Frame::header`
+        // appends rather than overwrites, so leaving one in place would put two
+        // receipt headers on the wire; brokers honour the first, which would never
+        // match the id registered above. Matched case-insensitively, as header
+        // lookup is.
+        let mut frame = frame;
+        frame
+            .headers
+            .retain(|(key, _)| !key.eq_ignore_ascii_case("receipt"));
+
         // Add receipt header and send the frame
         let frame_with_receipt = frame.receipt(&receipt_id);
-        self.send_frame(frame_with_receipt).await?;
-
-        Ok(receipt_id)
-    }
-
-    /// Wait for a receipt confirmation from the server.
-    ///
-    /// This method blocks until the server sends a RECEIPT or ERROR frame with
-    /// the matching receipt-id, or until the timeout expires.
-    ///
-    /// # Parameters
-    /// - `receipt_id`: the receipt ID returned by `send_frame_with_receipt()`.
-    /// - `timeout`: maximum time to wait for the receipt.
-    ///
-    /// # Returns
-    /// `Ok(())` if the receipt was received, `Err(ConnError::FrameRejected)`
-    /// if the broker rejected the frame, or `Err(ConnError::ReceiptTimeout)` if
-    /// the timeout expired.
-    ///
-    /// # Example
-    /// ```ignore
-    /// let receipt_id = conn.send_frame_with_receipt(frame).await?;
-    /// conn.wait_for_receipt(&receipt_id, Duration::from_secs(5)).await?;
-    /// println!("Message confirmed!");
-    /// ```
-    pub async fn wait_for_receipt(
-        &self,
-        receipt_id: &str,
-        timeout: Duration,
-    ) -> Result<(), ConnError> {
-        // Get the receiver for this receipt
-        let rx = {
+        if let Err(err) = self.send_frame(frame_with_receipt).await {
+            // The frame never went out; deregister rather than leave an entry
+            // that nothing will ever answer.
             let mut receipts = self.pending_receipts.lock().await;
-            // Re-create the oneshot channel and swap out the sender
-            let (tx, rx) = oneshot::channel();
-            if let Some(old_tx) = receipts.insert(receipt_id.to_string(), tx) {
-                // Drop the old sender - this is expected if called after send_frame_with_receipt
-                drop(old_tx);
-            }
-            rx
-        };
-
-        // Wait for the receipt with timeout
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(err))) => Err(ConnError::FrameRejected(err)),
-            Ok(Err(_)) => {
-                // Channel was closed without receiving - connection likely dropped
-                Err(ConnError::Protocol(
-                    "receipt channel closed unexpectedly".into(),
-                ))
-            }
-            Err(_) => {
-                // Timeout expired - clean up the pending receipt
-                let mut receipts = self.pending_receipts.lock().await;
-                receipts.remove(receipt_id);
-                Err(ConnError::ReceiptTimeout(receipt_id.to_string()))
-            }
+            receipts.remove(&receipt_id);
+            return Err(err);
         }
+
+        Ok(ReceiptHandle {
+            receipt_id,
+            rx,
+            pending_receipts: self.pending_receipts.clone(),
+        })
     }
 
     /// Send a frame and wait for server confirmation via RECEIPT.
     ///
-    /// This is a convenience method that combines `send_frame_with_receipt()`
-    /// and `wait_for_receipt()`. Use this when you want to ensure a frame
-    /// was processed by the server before continuing.
+    /// This is a convenience method that combines
+    /// [`send_frame_with_receipt`](Connection::send_frame_with_receipt) and
+    /// [`ReceiptHandle::wait`]. Use this when you want to ensure a frame was
+    /// processed by the server before continuing.
+    ///
+    /// Any `receipt` header already present on `frame` is ignored in favour of
+    /// a generated id. Reach for `send_frame_with_receipt` directly when you
+    /// need to send several frames before awaiting any of them.
     ///
     /// # Parameters
     /// - `frame`: the frame to send.
@@ -1519,35 +1573,10 @@ impl Connection {
         frame: Frame,
         timeout: Duration,
     ) -> Result<(), ConnError> {
-        let receipt_id = Self::generate_receipt_id();
-
-        // Create the oneshot channel for notification
-        let (tx, rx) = oneshot::channel();
-
-        // Register the pending receipt before sending
-        {
-            let mut receipts = self.pending_receipts.lock().await;
-            receipts.insert(receipt_id.clone(), tx);
-        }
-
-        // Add receipt header and send the frame
-        let frame_with_receipt = frame.receipt(&receipt_id);
-        self.send_frame(frame_with_receipt).await?;
-
-        // Wait for the receipt with timeout
-        match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(err))) => Err(ConnError::FrameRejected(err)),
-            Ok(Err(_)) => Err(ConnError::Protocol(
-                "receipt channel closed unexpectedly".into(),
-            )),
-            Err(_) => {
-                // Timeout expired - clean up
-                let mut receipts = self.pending_receipts.lock().await;
-                receipts.remove(&receipt_id);
-                Err(ConnError::ReceiptTimeout(receipt_id))
-            }
-        }
+        self.send_frame_with_receipt(frame)
+            .await?
+            .wait(timeout)
+            .await
     }
 
     /// Subscribe to a destination.
@@ -1710,7 +1739,7 @@ impl Connection {
                     let mut ack_mode = "client".to_string();
                     {
                         let map = self.subscriptions.lock().await;
-                        'outer: for (_dest, vec) in map.iter() {
+                        'outer: for vec in map.values() {
                             for entry in vec.iter() {
                                 if entry.id == subscription_id {
                                     ack_mode = entry.ack.clone();
@@ -1776,7 +1805,7 @@ impl Connection {
                     let mut ack_mode = "client".to_string();
                     {
                         let map = self.subscriptions.lock().await;
-                        'outer2: for (_dest, vec) in map.iter() {
+                        'outer2: for vec in map.values() {
                             for entry in vec.iter() {
                                 if entry.id == subscription_id {
                                     ack_mode = entry.ack.clone();
@@ -1959,10 +1988,15 @@ mod tests {
         String::from_utf8(bytes).unwrap()
     }
 
+    /// Read a header from a raw frame the way a broker does: the first
+    /// occurrence wins, and the name is matched case-insensitively.
     fn header_value<'a>(frame: &'a str, name: &str) -> &'a str {
         frame
             .lines()
-            .find_map(|line| line.strip_prefix(&format!("{}:", name)))
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case(name).then_some(value)
+            })
             .unwrap()
     }
 
@@ -1997,6 +2031,102 @@ mod tests {
         });
 
         (addr, handle)
+    }
+
+    fn start_receipt_success_server(
+        response_delay: Duration,
+    ) -> (SocketAddr, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _connect = read_stomp_frame(&mut stream);
+                stream
+                    .write_all(b"CONNECTED\nversion:1.2\nheart-beat:0,0\n\n\0")
+                    .unwrap();
+                stream.flush().unwrap();
+
+                let send_frame = read_stomp_frame(&mut stream);
+                let receipt_id = header_value(&send_frame, "receipt").to_string();
+                thread::sleep(response_delay);
+                let receipt_frame = format!("RECEIPT\nreceipt-id:{}\n\n\0", receipt_id);
+                stream.write_all(receipt_frame.as_bytes()).unwrap();
+                stream.flush().unwrap();
+
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn receipt_arriving_before_the_wait_is_not_lost() {
+        // The broker answers with no delay, so the RECEIPT lands while the
+        // caller is still holding the handle. Before #82 the background task
+        // fired an orphaned sender and removed the registration, so the wait
+        // below timed out on a frame the broker had already confirmed.
+        let (addr, server) = start_receipt_success_server(Duration::ZERO);
+        let addr = addr.to_string();
+
+        let conn = Connection::connect(&addr, "guest", "guest", "0,0")
+            .await
+            .unwrap();
+
+        let handle = conn
+            .send_frame_with_receipt(
+                Frame::new("SEND")
+                    .header("destination", "/queue/fast")
+                    .set_body(b"payload".to_vec()),
+            )
+            .await
+            .unwrap();
+
+        // Let the response arrive and be dispatched before anyone awaits it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        handle
+            .wait(Duration::from_secs(2))
+            .await
+            .expect("RECEIPT delivered before the wait began must still resolve it");
+
+        conn.close().await;
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn caller_supplied_receipt_header_is_replaced_not_appended() {
+        // The stub echoes back the first receipt header it reads. If a
+        // caller-set header survived, the broker would answer with that id
+        // while the client tracked the generated one, and the wait would time
+        // out. Mixed case, since header lookup is case-insensitive.
+        let (addr, server) = start_receipt_success_server(Duration::ZERO);
+        let addr = addr.to_string();
+
+        let conn = Connection::connect(&addr, "guest", "guest", "0,0")
+            .await
+            .unwrap();
+
+        let handle = conn
+            .send_frame_with_receipt(
+                Frame::new("SEND")
+                    .header("destination", "/queue/test")
+                    .header("Receipt", "caller-set")
+                    .set_body(b"payload".to_vec()),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(handle.receipt_id(), "caller-set");
+
+        handle
+            .wait(Duration::from_secs(2))
+            .await
+            .expect("generated receipt id must be the only one on the wire");
+
+        conn.close().await;
+        server.join().unwrap();
     }
 
     #[tokio::test]
@@ -2057,7 +2187,7 @@ mod tests {
             .await
             .unwrap();
 
-        let receipt_id = conn
+        let handle = conn
             .send_frame_with_receipt(
                 Frame::new("SEND")
                     .header("destination", "/queue/forbidden")
@@ -2066,9 +2196,8 @@ mod tests {
             .await
             .unwrap();
 
-        let result = conn
-            .wait_for_receipt(&receipt_id, Duration::from_secs(2))
-            .await;
+        let receipt_id = handle.receipt_id().to_string();
+        let result = handle.wait(Duration::from_secs(2)).await;
 
         match result {
             Err(ConnError::FrameRejected(err)) => {

@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Fast RECEIPT could be lost between `send_frame_with_receipt` and `wait_for_receipt` ([#82])
+  - `send_frame_with_receipt` registered a sender whose receiver it dropped immediately. A RECEIPT arriving before `wait_for_receipt` ran was delivered to that orphaned receiver and its registration removed, so the subsequent wait blocked for its full timeout and returned `ConnError::ReceiptTimeout` for a frame the broker had accepted. Most likely against a localhost or LAN broker.
+  - The confirmation receiver is now owned by the caller from the moment the frame is queued, so the response cannot arrive before there is somewhere to put it
+- `send_frame_with_receipt` no longer leaves a stale registration behind when the send itself fails
+- A caller-supplied `receipt` header silently broke `send_frame_with_receipt` and `send_frame_confirmed`
+  - `Frame::header` appends rather than overwrites, so a hand-set id put two `receipt` headers on the wire. Brokers honour the first, while the client tracked the generated id, so the confirmation never matched and the wait always timed out.
+  - Caller-supplied `receipt` headers are now replaced by the generated one, matched case-insensitively to agree with header lookup
+
+### Changed
+
+- **Breaking**: `Connection::send_frame_with_receipt` returns `ReceiptHandle` instead of `String`. Await the confirmation with `handle.wait(timeout)` and read the generated id with `handle.receipt_id()`.
+- **Breaking**: `Connection::wait_for_receipt` is removed, superseded by `ReceiptHandle::wait`
+  - Before: `let id = conn.send_frame_with_receipt(f).await?; conn.wait_for_receipt(&id, t).await?;`
+  - After: `let h = conn.send_frame_with_receipt(f).await?; h.wait(t).await?;`
+  - Sending several frames before awaiting any still works — each handle is independent
+- `send_frame_confirmed` is now a thin wrapper over `send_frame_with_receipt` + `ReceiptHandle::wait`, rather than duplicating the registration and timeout logic
+
+### Documentation
+
+- README's receipt examples no longer set a `receipt` header by hand. Both `send_frame_with_receipt` and `send_frame_confirmed` add a generated one, and because `Frame::header` appends rather than overwrites, a hand-set id produced a frame with two `receipt` headers; brokers honour the first, so the confirmation never matched and the wait always timed out.
+
 ## [0.4.2] - 2026-06-24
 
 ### Added
@@ -203,3 +226,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#70]: https://github.com/iridiumdesign/iridium-stomp/pull/70
 [#72]: https://github.com/iridiumdesign/iridium-stomp/pull/72
 [#73]: https://github.com/iridiumdesign/iridium-stomp/pull/73
+[#82]: https://github.com/iridiumdesign/iridium-stomp/issues/82
