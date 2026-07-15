@@ -151,8 +151,11 @@ pub async fn run(cli: &Cli) -> Result<(), (String, u8)> {
         println!("{}", s.generate_summary());
     }
 
-    // Close connection
-    conn.close().await;
+    // Close connection. The terminal has already been restored by this point,
+    // so a warning here reaches the user's shell rather than a raw-mode screen.
+    if let Err(e) = conn.close().await {
+        eprintln!("Warning: broker did not confirm the disconnect: {}", e);
+    }
 
     result
 }

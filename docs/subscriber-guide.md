@@ -285,7 +285,7 @@ tokio::select! {
     }
 }
 
-conn.close().await;
+conn.close().await?;
 ```
 
 ---

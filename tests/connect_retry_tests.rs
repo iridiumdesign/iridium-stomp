@@ -68,7 +68,7 @@ async fn connect_succeeds_after_broker_starts_late() {
         elapsed
     );
 
-    conn.unwrap().close().await;
+    let _ = conn.unwrap().close().await;
     server.join().unwrap();
 }
 
@@ -293,6 +293,6 @@ async fn connect_retry_makes_multiple_attempts() {
         attempts
     );
 
-    conn.unwrap().close().await;
+    let _ = conn.unwrap().close().await;
     server.join().unwrap();
 }

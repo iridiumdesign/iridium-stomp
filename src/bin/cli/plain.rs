@@ -139,7 +139,9 @@ pub async fn run(cli: &Cli) -> Result<(), (String, u8)> {
                     let s = state.lock().await;
                     println!("{}", s.generate_summary());
                 }
-                conn.close().await;
+                if let Err(e) = conn.close().await {
+                    eprintln!("Warning: broker did not confirm the disconnect: {}", e);
+                }
                 break;
             }
             CommandResult::Info(msg) => {

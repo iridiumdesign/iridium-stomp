@@ -88,6 +88,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    conn.close().await;
+    conn.close().await?;
     Ok(())
 }

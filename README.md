@@ -54,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     conn.send("/queue/test", "hello from iridium-stomp").await?;
 
-    conn.close().await;
+    conn.close().await?;
     Ok(())
 }
 ```
@@ -80,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Received: {}", frame);
     }
 
-    conn.close().await;
+    conn.close().await?;
     Ok(())
 }
 ```

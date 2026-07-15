@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `Connection::close` performs the STOMP 1.2 shutdown sequence ([#81])
+  - It now sends a DISCONNECT frame carrying a `receipt` header, waits for the broker's RECEIPT, and only then stops the background task and closes the socket. Previously the broker saw a bare TCP FIN and could not distinguish a graceful exit from a crashed client, so anything it does on protocol-level disconnect — transactional rollback, durable subscription cleanup, audit logging — may not have run.
+  - A confirmed close also proves that everything previously sent on the connection reached the broker. Frames are written in the order submitted and the broker answers the DISCONNECT only after processing what came before, so awaiting the receipt drains the outbound queue. This closes a gap where a frame submitted immediately before `close` could be abandoned at the shutdown signal — reachable from the CLI by issuing `send` and then `quit`.
+- `ConnectOptions::disconnect_timeout` bounds that wait, defaulting to `Connection::DEFAULT_DISCONNECT_TIMEOUT` (5 seconds) ([#81])
+
+### Changed
+
+- **Breaking**: `Connection::close` returns `Result<(), ConnError>` instead of `()`. The connection is torn down either way; the result reports only whether the shutdown was clean. `Err(ConnError::ReceiptTimeout)` means the broker never confirmed within the disconnect timeout — it does not mean the connection is still open. Callers with nothing to do about that can discard it with `let _ = conn.close().await;`.
+
 ### Fixed
 
 - `Connection::close` did not terminate the background task; it reconnected indefinitely ([#96])
@@ -237,6 +248,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [#70]: https://github.com/iridiumdesign/iridium-stomp/pull/70
 [#72]: https://github.com/iridiumdesign/iridium-stomp/pull/72
 [#73]: https://github.com/iridiumdesign/iridium-stomp/pull/73
+[#81]: https://github.com/iridiumdesign/iridium-stomp/issues/81
 [#82]: https://github.com/iridiumdesign/iridium-stomp/issues/82
 [#91]: https://github.com/iridiumdesign/iridium-stomp/issues/91
 [#96]: https://github.com/iridiumdesign/iridium-stomp/issues/96

@@ -16,6 +16,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     conn.send("/queue/test", "hello from iridium-stomp").await?;
 
     println!("Message sent");
-    conn.close().await;
+    conn.close().await?;
     Ok(())
 }

@@ -51,6 +51,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sub.unsubscribe().await?;
 
     // close the connection
-    conn.close().await;
+    conn.close().await?;
     Ok(())
 }
