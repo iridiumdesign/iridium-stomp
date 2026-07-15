@@ -364,6 +364,9 @@ stomp -s /queue/orders -s /queue/notifications
 
 # Enable TUI mode for live monitoring
 stomp --tui -a 127.0.0.1:61613 -s /topic/events
+
+# Send one message and exit; the exit code says whether the broker took it
+stomp -a 127.0.0.1:61613 --send /queue/test 'hello'
 ```
 
 ### TUI Mode

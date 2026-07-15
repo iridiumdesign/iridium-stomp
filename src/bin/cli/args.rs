@@ -32,4 +32,22 @@ pub struct Cli {
     /// Show session summary on exit
     #[arg(long)]
     pub summary: bool,
+
+    /// Send one message, then exit without starting the interactive client.
+    ///
+    /// The message is sent with a receipt request, so the exit code reflects
+    /// whether the broker accepted it: 0 confirmed, 4 rejected, 3 no answer
+    /// within --timeout.
+    #[arg(
+        long,
+        num_args = 2,
+        value_names = ["DESTINATION", "BODY"],
+        conflicts_with_all = ["tui", "subscribe", "summary"],
+    )]
+    pub send: Option<Vec<String>>,
+
+    /// Seconds to wait for the broker during a --send, covering both the
+    /// connection and the receipt
+    #[arg(long, default_value_t = 5, requires = "send", value_name = "SECONDS")]
+    pub timeout: u64,
 }

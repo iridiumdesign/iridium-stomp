@@ -33,6 +33,8 @@ cargo run --features cli --bin stomp -- --help
 | `-s, --subscribe` | *(none)* | Destination to subscribe to on connect (repeatable) |
 | `--tui` | off | Enable TUI mode |
 | `--summary` | off | Print session summary on exit |
+| `--send <DESTINATION> <BODY>` | *(none)* | Send one message and exit, without starting the interactive client |
+| `--timeout <SECONDS>` | `5` | How long a `--send` waits on the broker, covering both the connection and the receipt |
 
 ```bash
 # Connect with defaults
@@ -45,6 +47,41 @@ stomp -a broker.example.com:61613 -l myuser -p mypass \
 # TUI mode with faster heartbeats
 stomp --tui --heartbeat 5000,5000 -s /queue/tasks
 ```
+
+---
+
+## One-shot send
+
+`stomp` is an interactive client; `--send` is its non-interactive side path.
+It connects, publishes one message, disconnects, and exits — no REPL, no pipe
+tricks:
+
+```bash
+stomp -a broker.example.com:61613 --send /queue/orders 'hello'
+```
+
+The message is sent with a receipt request and the tool waits for the broker's
+answer, so the exit code is worth testing:
+
+```bash
+if stomp --send /queue/orders "$payload"; then
+    echo "the broker has it"
+fi
+```
+
+| Exit | Meaning |
+|------|---------|
+| 0 | The broker confirmed the message |
+| 1 | Could not reach the broker within `--timeout` |
+| 3 | The broker did not answer within `--timeout`, or the destination was malformed |
+| 4 | The broker rejected the message (permissions, unknown destination) |
+
+`--timeout` bounds the whole operation. It matters more than it looks: a normal
+`Connection` retries an unreachable broker indefinitely, which is right for a
+long-lived service and wrong for a script, so `--send` gives up instead.
+
+`--send` cannot be combined with `--tui`, `-s/--subscribe`, or `--summary`;
+those belong to the interactive client.
 
 ---
 
@@ -197,4 +234,4 @@ The `--summary` flag prints the session summary automatically on exit.
 | 0 | SUCCESS | Normal exit |
 | 1 | NETWORK_ERROR | Connection refused, timeout, or network failure |
 | 2 | AUTH_ERROR | Authentication failed (bad credentials) |
-| 3 | PROTOCOL_ERROR | Unexpected server response or protocol violation |
+| 3 | PROTOCOL_ERROR | Unexpected server response, protocol violation, or a `--send` the broker never answered |

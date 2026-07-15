@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `stomp --send <DESTINATION> <BODY>` sends one message and exits, without starting the interactive client ([#93])
+  - The CLI previously scripted only by closing stdin and driving the REPL through a pipe, which could not report whether the broker accepted the message.
+  - The message carries a receipt request and the tool waits for the answer, so the exit code is meaningful: 0 confirmed, 4 rejected (`FRAME_REJECTED`, which no CLI path could previously reach because nothing requested a receipt), 3 unanswered, 1 unreachable.
+  - `--timeout <SECONDS>` (default 5) bounds the whole operation. It also bounds the connection, which matters more than it appears: `Connection::connect` retries an unreachable broker indefinitely (see [#68]), so without this a `--send` at a dead broker would never return — as `stomp -a <dead> < /dev/null` still does not today.
+  - `--send` conflicts with `--tui`, `--subscribe`, and `--summary`, which belong to the interactive client.
+
 - `Connection::close` performs the STOMP 1.2 shutdown sequence ([#81])
   - It now sends a DISCONNECT frame carrying a `receipt` header, waits for the broker's RECEIPT, and only then stops the background task and closes the socket. Previously the broker saw a bare TCP FIN and could not distinguish a graceful exit from a crashed client, so anything it does on protocol-level disconnect — transactional rollback, durable subscription cleanup, audit logging — may not have run.
   - A confirmed close also proves that everything previously sent on the connection reached the broker. Frames are written in the order submitted and the broker answers the DISCONNECT only after processing what came before, so awaiting the receipt drains the outbound queue. This closes a gap where a frame submitted immediately before `close` could be abandoned at the shutdown signal — reachable from the CLI by issuing `send` and then `quit`.
@@ -253,6 +259,8 @@ Every breaking change in this release is listed here, with its migration.
 [#72]: https://github.com/iridiumdesign/iridium-stomp/pull/72
 [#73]: https://github.com/iridiumdesign/iridium-stomp/pull/73
 [#81]: https://github.com/iridiumdesign/iridium-stomp/issues/81
+[#68]: https://github.com/iridiumdesign/iridium-stomp/issues/68
 [#82]: https://github.com/iridiumdesign/iridium-stomp/issues/82
 [#91]: https://github.com/iridiumdesign/iridium-stomp/issues/91
+[#93]: https://github.com/iridiumdesign/iridium-stomp/issues/93
 [#96]: https://github.com/iridiumdesign/iridium-stomp/issues/96
