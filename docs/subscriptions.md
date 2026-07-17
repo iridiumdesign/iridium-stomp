@@ -17,10 +17,15 @@ iridium-stomp provides three ways to subscribe to a destination:
 
 The simplest form. No extra headers or options.
 
-```rust
+```rust,no_run
+# use iridium_stomp::Connection;
+# async fn wrapper(conn: Connection) -> Result<(), Box<dyn std::error::Error>> {
 use iridium_stomp::AckMode;
 
 let sub = conn.subscribe("/queue/orders", AckMode::Auto).await?;
+# let _ = sub;
+# Ok(())
+# }
 ```
 
 ### `subscribe_with_options(destination, ack, options)`
@@ -28,7 +33,9 @@ let sub = conn.subscribe("/queue/orders", AckMode::Auto).await?;
 Accepts a `SubscriptionOptions` struct for typed configuration. Use this
 when you need broker-specific headers, such as a durable subscription name.
 
-```rust
+```rust,no_run
+# use iridium_stomp::Connection;
+# async fn wrapper(conn: Connection) -> Result<(), Box<dyn std::error::Error>> {
 use iridium_stomp::{AckMode, SubscriptionOptions};
 
 let opts = SubscriptionOptions {
@@ -41,6 +48,9 @@ let opts = SubscriptionOptions {
 let sub = conn
     .subscribe_with_options("/topic/my-topic", AckMode::Client, opts)
     .await?;
+# let _ = sub;
+# Ok(())
+# }
 ```
 
 ### `subscribe_with_headers(destination, ack, extra_headers)`
@@ -49,7 +59,9 @@ Low-level convenience that forwards arbitrary header pairs on the
 SUBSCRIBE frame. Equivalent to `subscribe_with_options` with only the
 `headers` field set.
 
-```rust
+```rust,no_run
+# use iridium_stomp::Connection;
+# async fn wrapper(conn: Connection) -> Result<(), Box<dyn std::error::Error>> {
 use iridium_stomp::AckMode;
 
 let headers = vec![
@@ -58,6 +70,9 @@ let headers = vec![
 let sub = conn
     .subscribe_with_headers("/topic/events", AckMode::Client, headers)
     .await?;
+# let _ = sub;
+# Ok(())
+# }
 ```
 
 ---
