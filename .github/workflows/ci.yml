@@ -99,6 +99,10 @@ jobs:
           override: true
 
       - name: Run Rust smoke test
+        # stomp_smoke skips itself unless RUN_STOMP_SMOKE is set, so without
+        # this the job spun up RabbitMQ and then ran a test that no-op'd.
+        env:
+          RUN_STOMP_SMOKE: "1"
         run: |
           cargo test --test stomp_smoke -- --nocapture
 
@@ -167,15 +171,20 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
           override: true
 
-      - name: Run unit tests
+      # `--lib` alone left every tests/*.rs integration file unrun, and the CLI
+      # lives behind the `cli` feature. `--lib --tests --features cli` covers the
+      # library unit tests and every integration file (including cli_oneshot) in
+      # one pass. The broker-dependent stomp_smoke self-skips unless
+      # RUN_STOMP_SMOKE is set, so it is a no-op here and runs in the smoke job.
+      - name: Run unit and integration tests
         run: |
-          cargo test --lib --verbose
+          cargo test --lib --tests --features cli --verbose
 
-      # The CLI lives behind the `cli` feature, so `--lib` never builds it and
-      # its tests would otherwise be written but never run.
-      - name: Run CLI tests
+      # Doc examples were never compiled by CI, so API drift silently rotted
+      # them. Compile and run them now (broker-touching examples are `no_run`).
+      - name: Run doc tests
         run: |
-          cargo test --test cli_oneshot --features cli --verbose
+          cargo test --doc --features cli --verbose
 
   build-examples:
     name: Build examples
