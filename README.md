@@ -429,14 +429,22 @@ Disconnecting...
 
 ## Running a Local Broker
 
-Examples and integration tests require a STOMP broker. Start RabbitMQ with the
-STOMP plugin:
+The examples, the CLI, and the integration tests need a STOMP broker. The
+included `docker-compose.yml` starts RabbitMQ with the STOMP plugin enabled
+(the first run builds the image):
 
 ```bash
 docker compose up -d
 ```
 
-Stop the broker:
+STOMP then listens on `127.0.0.1:61613` with `guest`/`guest`, and the
+management UI is at <http://localhost:15672>. Point the CLI at it:
+
+```bash
+stomp -a 127.0.0.1:61613 -s /queue/test
+```
+
+Stop and remove the broker:
 
 ```bash
 docker compose down

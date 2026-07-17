@@ -1,0 +1,18 @@
+# Local STOMP broker for the examples, the CLI, and the integration tests.
+#
+#   docker compose up -d     # start (first run builds the image)
+#   docker compose down      # stop and remove
+#
+# Builds the same RabbitMQ + STOMP image CI uses. STOMP listens on 61613 with
+# guest/guest; the management UI is at http://localhost:15672.
+services:
+  broker:
+    build: .github/docker/rabbitmq-stomp
+    container_name: iridium-rabbitmq
+    ports:
+      - "61613:61613" # STOMP
+      - "5672:5672" # AMQP
+      - "15672:15672" # management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
