@@ -54,8 +54,13 @@ Every breaking change in this release is listed here, with its migration.
   - It was the only `with_`-prefixed builder on the type, and the only one in the public API; `accept_version`, `client_id`, `host`, `header`, and `disconnect_timeout` are all unprefixed, as is the convention for Rust builders. Renamed now because 0.5.0 is already a breaking release.
   - Migration: drop the `with_` prefix at the call site.
 - `send_frame_confirmed` is now a thin wrapper over `send_frame_with_receipt` + `ReceiptHandle::wait`, rather than duplicating the registration and timeout logic ([#82])
+- Dropping a `Subscription` now sends a best-effort UNSUBSCRIBE and prunes the subscription locally, instead of silently leaving it registered and streaming — and being replayed on reconnect ([#83]). `Subscription::unsubscribe` remains the explicit form that reports whether the frame was queued; `Subscription::into_receiver` hands the stream to the caller and suppresses the drop-time UNSUBSCRIBE. This aligns behaviour with what the subscriptions guide already described.
 
 ### Fixed
+
+- MESSAGE dispatch pruned dead subscriptions inconsistently across its two delivery paths ([#83])
+  - The subscription-id path always kept an entry even after its receiver was dropped, so a discarded subscription leaked and kept being replayed on reconnect. The destination path did the opposite and removed an entry on *any* send failure, including a merely full channel — so a slow-but-alive consumer could have its subscription silently dropped.
+  - Both paths now share one rule: a full channel (slow consumer) is kept and the message is dropped; only a closed channel (the receiving `Subscription` was dropped) is pruned. Emptied destination entries are removed too. This is also the backstop that reaps a dropped subscription whose best-effort `Drop` could not take the registry lock.
 
 - `Connection::close` did not terminate the background task; it reconnected indefinitely ([#96])
   - Every closed connection left a task re-establishing a broker session every 30s for the life of the process, so a long-running service accumulated them. From the broker's side this looked like sessions and reconnects with no client that owned them.
@@ -275,6 +280,7 @@ Every breaking change in this release is listed here, with its migration.
 [#81]: https://github.com/iridiumdesign/iridium-stomp/issues/81
 [#68]: https://github.com/iridiumdesign/iridium-stomp/issues/68
 [#82]: https://github.com/iridiumdesign/iridium-stomp/issues/82
+[#83]: https://github.com/iridiumdesign/iridium-stomp/issues/83
 [#91]: https://github.com/iridiumdesign/iridium-stomp/issues/91
 [#93]: https://github.com/iridiumdesign/iridium-stomp/issues/93
 [#96]: https://github.com/iridiumdesign/iridium-stomp/issues/96

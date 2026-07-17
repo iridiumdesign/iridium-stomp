@@ -126,7 +126,17 @@ This means:
 
 ## Unsubscribe
 
-To stop receiving messages, drop the `Subscription` handle or call
-`unsubscribe`. The library sends an UNSUBSCRIBE frame and removes the
-subscription from its internal tracking so it will not be resubscribed
-on reconnect.
+To stop receiving messages, call `Subscription::unsubscribe` or simply drop
+the handle. Either way the library sends an UNSUBSCRIBE frame and removes the
+subscription from its internal tracking so it will not be resubscribed on
+reconnect.
+
+`unsubscribe` is the explicit form and reports whether the frame was queued.
+Dropping the handle does the same on a best-effort basis — it cannot report an
+error, and in the rare case the outbound channel is momentarily unavailable the
+frame may not be sent, though the subscription is still pruned locally so it is
+never resubscribed.
+
+One exception: if you took the raw receiver with `into_receiver`, you now own
+the stream and dropping it sends nothing. Unsubscribe explicitly with
+`Connection::unsubscribe` and the subscription id if you need to stop it.
