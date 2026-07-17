@@ -399,7 +399,7 @@ pub struct ConnectOptions {
     /// [`Connection::connect_with_options`] gives up. When `None` (the
     /// default), an unreachable broker is retried indefinitely with backoff.
     /// When set, the whole operation is bounded and, on expiry, the last
-    /// I/O error encountered is returned.
+    /// error encountered is returned.
     pub connect_timeout: Option<Duration>,
 }
 
@@ -484,12 +484,12 @@ impl ConnectOptions {
     /// misconfigured address: without a bound it hangs forever. Set this to cap
     /// the whole operation.
     ///
-    /// When the timeout expires, `connect_with_options` returns the last
-    /// [`ConnError::Io`] it encountered (or a synthesized
-    /// [`std::io::ErrorKind::TimedOut`] if the first attempt had not yet
-    /// produced one). A `ConnError::ServerRejected` still fails immediately,
-    /// before the bound is consulted, because retrying bad credentials is
-    /// pointless.
+    /// When the timeout expires, `connect_with_options` returns the last error
+    /// it encountered — a [`ConnError::Io`], or a [`ConnError::Protocol`] such
+    /// as a broker that closed the socket mid-handshake — or a synthesized
+    /// [`std::io::ErrorKind::TimedOut`] if no attempt had produced one yet. A
+    /// `ConnError::ServerRejected` still fails immediately, before the bound is
+    /// consulted, because retrying bad credentials is pointless.
     ///
     /// # Example
     ///
@@ -940,7 +940,7 @@ impl Connection {
         // using the same strategy as reconnection. Only ServerRejected
         // (authentication failure) fails immediately.
         //
-        // `last_err` remembers the most recent I/O failure so that, if a
+        // `last_err` remembers the most recent failure so that, if a
         // `connect_timeout` bound elapses, the caller gets that error rather
         // than a bare "timed out". It is written by the retry arms and read
         // only after the attempt future below has been dropped.
@@ -1025,7 +1025,7 @@ impl Connection {
             Some(timeout) => match tokio::time::timeout(timeout, attempt).await {
                 Ok(result) => result?,
                 Err(_elapsed) => {
-                    // The bound elapsed. Hand back the last I/O error seen, or
+                    // The bound elapsed. Hand back the last error seen, or
                     // synthesize a timeout if the very first attempt was still
                     // in flight and had not recorded one yet.
                     return Err(last_err.unwrap_or_else(|| {
@@ -2266,6 +2266,40 @@ mod tests {
             "connect should have given up near the 200ms bound, took {:?}",
             elapsed
         );
+    }
+
+    #[tokio::test]
+    async fn connect_timeout_surfaces_the_last_handshake_error() {
+        // A broker that accepts the TCP connection then closes without ever
+        // sending CONNECTED — a TLS-only port, say. The handshake fails with
+        // ConnError::Protocol ("closed before CONNECTED received"), and the
+        // bound must surface that real reason rather than a synthesized
+        // timeout.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _connect = read_stomp_frame(&mut stream);
+                // Drop the stream without answering: closed mid-handshake.
+            }
+        });
+
+        let result = Connection::connect_with_options(
+            &addr.to_string(),
+            "guest",
+            "guest",
+            "0,0",
+            ConnectOptions::default().connect_timeout(Duration::from_millis(200)),
+        )
+        .await;
+
+        let err = result.err();
+        assert!(
+            matches!(err, Some(ConnError::Protocol(_))),
+            "expected the handshake Protocol error, got {:?}",
+            err
+        );
+        handle.join().unwrap();
     }
 
     #[tokio::test]

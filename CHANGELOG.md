@@ -22,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `ConnectOptions::connect_timeout` bounds the initial connect and handshake ([#68])
   - `Connection::connect` retries an unreachable broker indefinitely with exponential backoff — the right default for a long-lived service that should wait for its broker to come up, but the wrong one for a CLI tool or one-shot script pointed at a misconfigured address, which hangs forever with no way to bail out short of wrapping the call in `tokio::time::timeout`.
-  - When set, the whole operation is bounded; on expiry `connect_with_options` returns the last `ConnError::Io` it encountered (or a synthesized `ErrorKind::TimedOut` if the first attempt had not yet produced one). A `ServerRejected` still fails immediately, before the bound, because retrying bad credentials is pointless.
+  - When set, the whole operation is bounded; on expiry `connect_with_options` returns the last error it encountered — a `ConnError::Io`, or a `ConnError::Protocol` from a broker that closed the socket mid-handshake — or a synthesized `ErrorKind::TimedOut` if no attempt had produced one yet. A `ServerRejected` still fails immediately, before the bound, because retrying bad credentials is pointless.
   - Defaults to `None`, preserving the retry-forever behaviour for existing callers.
 
 ### Changed
