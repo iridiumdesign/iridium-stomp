@@ -430,8 +430,7 @@ Disconnecting...
 ## Running a Local Broker
 
 The examples, the CLI, and the integration tests need a STOMP broker. The
-included `docker-compose.yml` starts RabbitMQ with the STOMP plugin enabled
-(the first run builds the image):
+included Docker Compose file starts RabbitMQ with the STOMP plugin enabled:
 
 ```bash
 docker compose up -d
