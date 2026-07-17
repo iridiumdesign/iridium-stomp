@@ -118,6 +118,36 @@ fn stomp(args: &[&str]) -> std::process::Output {
         .expect("failed to run the stomp binary")
 }
 
+/// Run the binary with a hard wall-clock bound, killing it if it overruns.
+///
+/// The hang-avoidance tests below guard against the binary blocking forever;
+/// `Command::output()` would itself block forever on exactly that regression and
+/// stall the whole suite. This spawns, polls, and kills a runaway child so a
+/// regression fails fast with a clear message instead. stdin is null so an
+/// interactive binary never blocks on it.
+fn run_bounded(args: &[&str], kill_after: Duration) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_stomp"))
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("failed to spawn the stomp binary");
+
+    let start = Instant::now();
+    loop {
+        if child.try_wait().expect("try_wait failed").is_some() {
+            return child.wait_with_output().expect("failed to collect output");
+        }
+        if start.elapsed() > kill_after {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("stomp did not exit within {:?}; it is hanging", kill_after);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Exit codes from `src/bin/cli/mod.rs::exit_codes`.
 const SUCCESS: i32 = 0;
 const NETWORK_ERROR: i32 = 1;
@@ -171,17 +201,18 @@ fn send_rejected_by_the_broker_exits_frame_rejected() {
 fn send_to_a_silent_broker_times_out_rather_than_hanging() {
     let (addr, _seen) = start_broker(OnSend::Silence);
 
-    let started = Instant::now();
-    let out = stomp(&[
-        "-a",
-        &addr,
-        "--send",
-        "/queue/x",
-        "payload",
-        "--timeout",
-        "1",
-    ]);
-    let elapsed = started.elapsed();
+    let out = run_bounded(
+        &[
+            "-a",
+            &addr,
+            "--send",
+            "/queue/x",
+            "payload",
+            "--timeout",
+            "1",
+        ],
+        Duration::from_secs(10),
+    );
 
     assert_eq!(
         out.status.code(),
@@ -189,28 +220,25 @@ fn send_to_a_silent_broker_times_out_rather_than_hanging() {
         "stderr: {}",
         stderr(&out)
     );
-    assert!(
-        elapsed < Duration::from_secs(10),
-        "--timeout must bound the wait (took {:?})",
-        elapsed
-    );
 }
 
 #[test]
 fn send_to_an_unreachable_broker_times_out_rather_than_retrying_forever() {
     // Connection::connect retries indefinitely (#68), so without an explicit
-    // bound in the one-shot path this would never return.
-    let started = Instant::now();
-    let out = stomp(&[
-        "-a",
-        "127.0.0.1:59999",
-        "--send",
-        "/queue/x",
-        "payload",
-        "--timeout",
-        "2",
-    ]);
-    let elapsed = started.elapsed();
+    // bound in the one-shot path this would never return. run_bounded kills a
+    // hung binary so a regression fails fast instead of stalling the suite.
+    let out = run_bounded(
+        &[
+            "-a",
+            "127.0.0.1:59999",
+            "--send",
+            "/queue/x",
+            "payload",
+            "--timeout",
+            "2",
+        ],
+        Duration::from_secs(15),
+    );
 
     assert_eq!(
         out.status.code(),
@@ -218,10 +246,23 @@ fn send_to_an_unreachable_broker_times_out_rather_than_retrying_forever() {
         "stderr: {}",
         stderr(&out)
     );
-    assert!(
-        elapsed < Duration::from_secs(15),
-        "a dead broker must fail fast, not retry forever (took {:?})",
-        elapsed
+}
+
+#[test]
+fn interactive_at_an_unreachable_broker_times_out_rather_than_hanging() {
+    // #101: the interactive client now shares the connect bound, so a dead
+    // broker exits NETWORK_ERROR instead of hanging forever. run_bounded kills
+    // it if it regresses to hanging, so the suite can't stall.
+    let out = run_bounded(
+        &["-a", "127.0.0.1:59998", "--timeout", "1"],
+        Duration::from_secs(10),
+    );
+
+    assert_eq!(
+        out.status.code(),
+        Some(NETWORK_ERROR),
+        "stderr: {}",
+        stderr(&out)
     );
 }
 

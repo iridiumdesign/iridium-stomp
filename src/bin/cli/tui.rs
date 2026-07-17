@@ -1,4 +1,5 @@
 use crossterm::{
+    cursor::Show,
     event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -19,7 +20,7 @@ use tokio::sync::mpsc;
 
 use super::args::Cli;
 use super::commands::{CommandResult, execute_command};
-use super::state::{SharedState, new_shared_state};
+use super::state::{SharedState, char_wrap, new_shared_state, truncate_str};
 
 /// TUI Application
 pub struct App {
@@ -50,8 +51,11 @@ pub async fn run(cli: &Cli) -> Result<(), (String, u8)> {
     // Create heartbeat notification channel
     let (hb_tx, mut hb_rx) = mpsc::channel::<()>(16);
 
-    // Build connection options
-    let options = ConnectOptions::default().heartbeat_notify(hb_tx);
+    // Build connection options. Bound the connect so an unreachable broker
+    // fails fast instead of retrying forever (#101).
+    let options = ConnectOptions::default()
+        .heartbeat_notify(hb_tx)
+        .connect_timeout(std::time::Duration::from_secs(cli.timeout));
 
     let conn = Connection::connect_with_options(
         &cli.address,
@@ -124,6 +128,17 @@ pub async fn run(cli: &Cli) -> Result<(), (String, u8)> {
             }
         }
     });
+
+    // Restore the terminal even if a panic unwinds past the normal teardown
+    // below, so a crash never strands the user in raw mode / the alternate
+    // screen. The hook chains to the previous one so the panic message still
+    // prints — now onto a restored screen.
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+        original_hook(info);
+    }));
 
     // Setup terminal
     enable_raw_mode().map_err(|e| (format!("Failed to enable raw mode: {}", e), 1))?;
@@ -531,18 +546,17 @@ fn render_messages(f: &mut ratatui::Frame, area: Rect, state: &super::state::App
             _ => (Style::default().fg(Color::Cyan), Style::default(), 60),
         };
 
-        let dest_display = if msg.destination.len() > 20 {
-            format!("...{}", &msg.destination[msg.destination.len() - 17..])
+        // Char-safe tail: keep the last 17 characters with a leading ellipsis.
+        let dest_char_count = msg.destination.chars().count();
+        let dest_display = if dest_char_count > 20 {
+            let tail: String = msg.destination.chars().skip(dest_char_count - 17).collect();
+            format!("...{}", tail)
         } else {
             msg.destination.clone()
         };
 
-        // Truncate body for display
-        let body_display = if msg.body.len() > max_body_len {
-            format!("{}...", &msg.body[..max_body_len - 3])
-        } else {
-            msg.body.clone()
-        };
+        // Truncate body for display (char-safe; never slices a multibyte char).
+        let body_display = truncate_str(&msg.body, max_body_len);
 
         lines.push(Line::from(vec![
             Span::styled(time, Style::default().fg(Color::DarkGray)),
@@ -559,11 +573,7 @@ fn render_messages(f: &mut ratatui::Frame, area: Rect, state: &super::state::App
                     break;
                 }
                 let header_line = format!("    {}: {}", k, v);
-                let truncated = if header_line.len() > 70 {
-                    format!("{}...", &header_line[..67])
-                } else {
-                    header_line
-                };
+                let truncated = truncate_str(&header_line, 70);
                 lines.push(Line::from(vec![Span::styled(
                     truncated,
                     Style::default().fg(Color::DarkGray),
@@ -613,66 +623,50 @@ fn render_errors(f: &mut ratatui::Frame, area: Rect, state: &super::state::AppSt
 
         let time = err.timestamp.format("%H:%M:%S").to_string();
 
-        // First line: timestamp + start of error
+        // First line: timestamp + start of error. All wrapping is char-safe
+        // (char_wrap), so a multibyte error body never slices mid-character.
         let prefix_len = time.len() + 1; // "HH:MM:SS "
         let first_line_body_len = line_width.saturating_sub(prefix_len);
+        let indent = "         "; // 9 spaces to align with text after timestamp
+        let cont_width = line_width.saturating_sub(indent.len());
 
-        if err.body.len() <= first_line_body_len {
-            // Fits on one line
-            lines.push(Line::from(vec![
-                Span::styled(time, Style::default().fg(Color::DarkGray)),
-                Span::raw(" "),
-                Span::styled(&err.body, Style::default().fg(Color::Red)),
-            ]));
-        } else {
-            // Wrap across multiple lines
-            lines.push(Line::from(vec![
-                Span::styled(time, Style::default().fg(Color::DarkGray)),
-                Span::raw(" "),
-                Span::styled(
-                    &err.body[..first_line_body_len],
-                    Style::default().fg(Color::Red),
-                ),
-            ]));
+        let body_lines = char_wrap(&err.body, first_line_body_len);
+        let mut body_iter = body_lines.into_iter();
 
-            // Continuation lines (indented)
-            let indent = "         "; // 9 spaces to align with text after timestamp
-            let cont_width = line_width.saturating_sub(indent.len());
-            let mut pos = first_line_body_len;
+        // First body chunk shares the timestamp line.
+        let first_chunk = body_iter.next().unwrap_or_default();
+        lines.push(Line::from(vec![
+            Span::styled(time, Style::default().fg(Color::DarkGray)),
+            Span::raw(" "),
+            Span::styled(first_chunk, Style::default().fg(Color::Red)),
+        ]));
 
-            while pos < err.body.len() && lines.len() < visible_height {
-                let end = (pos + cont_width).min(err.body.len());
-                lines.push(Line::from(vec![
-                    Span::raw(indent),
-                    Span::styled(&err.body[pos..end], Style::default().fg(Color::Red)),
-                ]));
-                pos = end;
+        // Remaining characters wrap onto indented continuation lines. Re-wrap
+        // the tail at the (narrower) continuation width.
+        let consumed: usize = err.body.chars().take(first_line_body_len).count();
+        let tail: String = err.body.chars().skip(consumed).collect();
+        for chunk in char_wrap(&tail, cont_width) {
+            if lines.len() >= visible_height {
+                break;
             }
+            lines.push(Line::from(vec![
+                Span::raw(indent),
+                Span::styled(chunk, Style::default().fg(Color::Red)),
+            ]));
         }
 
         // Show headers if toggled
         if state.show_headers && !err.headers.is_empty() {
             for (k, v) in &err.headers {
-                if lines.len() >= visible_height {
-                    break;
-                }
                 let header_line = format!("  {}: {}", k, v);
-                // Wrap header lines too
-                if header_line.len() <= line_width {
+                for chunk in char_wrap(&header_line, line_width) {
+                    if lines.len() >= visible_height {
+                        break;
+                    }
                     lines.push(Line::from(vec![Span::styled(
-                        header_line,
+                        chunk,
                         Style::default().fg(Color::DarkGray),
                     )]));
-                } else {
-                    let mut pos = 0;
-                    while pos < header_line.len() && lines.len() < visible_height {
-                        let end = (pos + line_width).min(header_line.len());
-                        lines.push(Line::from(vec![Span::styled(
-                            header_line[pos..end].to_string(),
-                            Style::default().fg(Color::DarkGray),
-                        )]));
-                        pos = end;
-                    }
                 }
             }
         }

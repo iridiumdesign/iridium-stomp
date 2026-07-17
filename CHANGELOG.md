@@ -58,6 +58,9 @@ Every breaking change in this release is listed here, with its migration.
 
 ### Fixed
 
+- The interactive CLI and TUI hung forever against an unreachable broker ([#101]). They now apply the `--timeout` bound to the connection (via `ConnectOptions::connect_timeout`, added in [#68]), so `stomp -a <dead>` and `stomp --tui -a <dead>` exit with `NETWORK_ERROR` instead of retrying indefinitely. `--timeout` (default 5s) is no longer restricted to `--send`; raise it if you expect to wait for a broker that is still coming up.
+- The TUI and the session summary/report panicked on multibyte message bodies, headers, or broker errors. Display truncation and line-wrapping sliced strings by byte offset, so a cut landing inside a UTF-8 character (accents, emoji, CJK — ordinary payloads for a messaging client) aborted the render or the report; in the TUI that also left the terminal in raw mode. Truncation and wrapping now operate on character boundaries, and the TUI installs a panic hook that restores the terminal on any unexpected panic.
+
 - MESSAGE dispatch pruned dead subscriptions inconsistently across its two delivery paths ([#83])
   - The subscription-id path always kept an entry even after its receiver was dropped, so a discarded subscription leaked and kept being replayed on reconnect. The destination path did the opposite and removed an entry on *any* send failure, including a merely full channel — so a slow-but-alive consumer could have its subscription silently dropped.
   - Both paths now share one rule: a full channel (slow consumer) is kept and the message is dropped; only a closed channel (the receiving `Subscription` was dropped) is pruned. Emptied destination entries are removed too. This is also the backstop that reaps a dropped subscription whose best-effort `Drop` could not take the registry lock.
@@ -284,3 +287,4 @@ Every breaking change in this release is listed here, with its migration.
 [#91]: https://github.com/iridiumdesign/iridium-stomp/issues/91
 [#93]: https://github.com/iridiumdesign/iridium-stomp/issues/93
 [#96]: https://github.com/iridiumdesign/iridium-stomp/issues/96
+[#101]: https://github.com/iridiumdesign/iridium-stomp/issues/101

@@ -21,8 +21,11 @@ pub async fn run(cli: &Cli) -> Result<(), (String, u8)> {
     // Create heartbeat notification channel
     let (hb_tx, mut hb_rx) = mpsc::channel::<()>(16);
 
-    // Build connection options
-    let options = ConnectOptions::default().heartbeat_notify(hb_tx);
+    // Build connection options. Bound the connect so an unreachable broker
+    // fails fast instead of retrying forever (#101).
+    let options = ConnectOptions::default()
+        .heartbeat_notify(hb_tx)
+        .connect_timeout(std::time::Duration::from_secs(cli.timeout));
 
     let conn = Connection::connect_with_options(
         &cli.address,

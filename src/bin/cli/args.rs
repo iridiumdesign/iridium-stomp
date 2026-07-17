@@ -46,8 +46,10 @@ pub struct Cli {
     )]
     pub send: Option<Vec<String>>,
 
-    /// Seconds to wait for the broker during a --send, covering both the
-    /// connection and the receipt
-    #[arg(long, default_value_t = 5, requires = "send", value_name = "SECONDS")]
+    /// Seconds to wait for the broker connection before giving up. With --send
+    /// it also bounds the receipt wait. Without this bound an unreachable broker
+    /// would hang the client indefinitely; raise it if you expect to wait for a
+    /// broker that is still coming up.
+    #[arg(long, default_value_t = 5, value_name = "SECONDS")]
     pub timeout: u64,
 }

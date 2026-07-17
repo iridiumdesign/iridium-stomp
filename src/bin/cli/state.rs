@@ -382,15 +382,35 @@ impl AppState {
     }
 }
 
-/// Truncate a string to max_len characters, adding "..." if truncated
-fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+/// Truncate a string to at most `max_len` characters, adding "..." if it had to
+/// cut.
+///
+/// Works on `char` boundaries, never byte offsets, so it cannot panic on
+/// multibyte input (accents, emoji, CJK). A message body or broker error
+/// carrying such text used to slice mid-character and crash the render/report.
+pub(crate) fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.chars().count() <= max_len {
         s.to_string()
     } else if max_len <= 3 {
         ".".repeat(max_len)
     } else {
-        format!("{}...", &s[..max_len - 3])
+        let kept: String = s.chars().take(max_len - 3).collect();
+        format!("{}...", kept)
     }
+}
+
+/// Split `s` into pieces of at most `width` characters each, on `char`
+/// boundaries. Used to wrap long text across terminal lines without ever
+/// slicing a multibyte character.
+pub(crate) fn char_wrap(s: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let chars: Vec<char> = s.chars().collect();
+    chars
+        .chunks(width)
+        .map(|chunk| chunk.iter().collect())
+        .collect()
 }
 
 /// Thread-safe shared state
@@ -399,4 +419,36 @@ pub type SharedState = Arc<Mutex<AppState>>;
 /// Create a new shared state
 pub fn new_shared_state(host: String, user: String, heartbeat_interval_ms: u32) -> SharedState {
     Arc::new(Mutex::new(AppState::new(host, user, heartbeat_interval_ms)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{char_wrap, truncate_str};
+
+    #[test]
+    fn truncate_str_never_panics_on_multibyte() {
+        // Byte-index slicing used to panic when the cut fell inside a multibyte
+        // char. These must truncate cleanly instead.
+        assert_eq!(truncate_str("aaaaéaaaaaaaaaa", 8), "aaaaé...");
+        let out = truncate_str("hello 🌦 world weather report", 11);
+        assert!(out.ends_with("..."));
+        assert_eq!(out.chars().count(), 11);
+    }
+
+    #[test]
+    fn truncate_str_passes_short_and_handles_tiny_max() {
+        assert_eq!(truncate_str("short", 10), "short");
+        assert_eq!(truncate_str("", 5), "");
+        assert_eq!(truncate_str("hello", 3), "...");
+        assert_eq!(truncate_str("hello", 2), "..");
+    }
+
+    #[test]
+    fn char_wrap_splits_on_char_boundaries_and_reassembles() {
+        let s = "aaébbédd"; // 8 chars, multibyte in the middle
+        let chunks = char_wrap(s, 3);
+        assert_eq!(chunks, vec!["aaé", "bbé", "dd"]);
+        assert_eq!(chunks.concat(), s);
+        assert!(char_wrap("abc", 0).is_empty());
+    }
 }

@@ -171,14 +171,15 @@ jobs:
           toolchain: ${{ matrix.toolchain }}
           override: true
 
-      # `--lib` alone left every tests/*.rs integration file unrun, and the CLI
-      # lives behind the `cli` feature. `--lib --tests --features cli` covers the
-      # library unit tests and every integration file (including cli_oneshot) in
-      # one pass. The broker-dependent stomp_smoke self-skips unless
-      # RUN_STOMP_SMOKE is set, so it is a no-op here and runs in the smoke job.
+      # `--all-targets` covers the library unit tests, the binary's own unit
+      # tests (src/bin/cli/*), and every integration file (including
+      # cli_oneshot) in one pass — `--lib --tests` skipped the binary tests. The
+      # `cli` feature builds the binary at all. The broker-dependent stomp_smoke
+      # self-skips unless RUN_STOMP_SMOKE is set, so it is a no-op here and runs
+      # in the smoke job.
       - name: Run unit and integration tests
         run: |
-          cargo test --lib --tests --features cli --verbose
+          cargo test --all-targets --features cli --verbose
 
       # Doc examples were never compiled by CI, so API drift silently rotted
       # them. Compile and run them now (broker-touching examples are `no_run`).
