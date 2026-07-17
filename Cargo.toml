@@ -1,6 +1,6 @@
 [package]
 name = "iridium-stomp"
-version = "0.4.2"
+version = "0.5.0"
 edition = "2024"
 # Verified floor: edition 2024 needs 1.85, and the let-chain in connection.rs
 # needs 1.88. Library and the `cli` feature both build on 1.88.0.
