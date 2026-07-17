@@ -698,6 +698,23 @@ async fn lookup_destination_by_sub_id(
     None
 }
 
+/// Deliver a MESSAGE frame to one subscriber and report whether its entry
+/// should be kept.
+///
+/// The distinction the two delivery paths previously got wrong: a `Full`
+/// channel is a slow-but-live consumer — drop the message, keep the
+/// subscription — while a `Closed` channel means the receiving `Subscription`
+/// was dropped, so the entry is dead and must be pruned. Returning `false` only
+/// on `Closed` gives both paths one consistent rule and is the backstop that
+/// reaps a dropped subscription whose `Drop` could not take the registry lock.
+fn deliver_and_keep(entry: &SubscriptionEntry, frame: &Frame) -> bool {
+    match entry.sender.try_send(frame.clone()) {
+        Ok(()) => true,
+        Err(mpsc::error::TrySendError::Full(_)) => true,
+        Err(mpsc::error::TrySendError::Closed(_)) => false,
+    }
+}
+
 /// High-level connection object that manages a single TCP/STOMP connection.
 ///
 /// The `Connection` spawns a background task that maintains the TCP transport,
@@ -1340,23 +1357,27 @@ impl Connection {
                                             }
                                         }
 
-                                        // Deliver to subscribers.
+                                        // Deliver to subscribers. Both paths use
+                                        // `deliver_and_keep` so a dropped
+                                        // subscriber (Closed channel) is pruned
+                                        // and a slow one (Full channel) is kept,
+                                        // then any emptied destination key is
+                                        // removed.
                                         if let Some(sub_id) = sub_opt {
                                             let mut map = subscriptions.lock().await;
                                             for vec in map.values_mut() {
                                                 vec.retain(|entry| {
-                                                    if entry.id == sub_id {
-                                                        let _ = entry.sender.try_send(f.clone());
-                                                        true
-                                                    } else {
-                                                        true
-                                                    }
+                                                    entry.id != sub_id || deliver_and_keep(entry, &f)
                                                 });
                                             }
+                                            map.retain(|_, vec| !vec.is_empty());
                                         } else if let Some(dest) = dest_opt {
                                             let mut map = subscriptions.lock().await;
                                             if let Some(vec) = map.get_mut(&dest) {
-                                                vec.retain(|entry| entry.sender.try_send(f.clone()).is_ok());
+                                                vec.retain(|entry| deliver_and_keep(entry, &f));
+                                                if vec.is_empty() {
+                                                    map.remove(&dest);
+                                                }
                                             }
                                         }
                                     } else if f.command == "RECEIPT" {
@@ -1845,6 +1866,28 @@ impl Connection {
             .map_err(|_| ConnError::Protocol("send channel closed".into()))?;
 
         Ok(())
+    }
+
+    /// Best-effort UNSUBSCRIBE for use from `Subscription`'s `Drop`.
+    ///
+    /// `Drop` cannot `.await`, so this cannot use the async paths: it
+    /// `try_lock`s the registry to remove the entry and `try_send`s the
+    /// UNSUBSCRIBE frame, and silently gives up on either if it would block. A
+    /// dropped subscription whose registry removal loses the lock race is still
+    /// reaped by [`deliver_and_keep`] on the next message, since its receiver is
+    /// now closed; the frame is the only part that can be genuinely missed (when
+    /// the outbound channel is full or gone), which is acceptable for a handle
+    /// that is being discarded rather than closed explicitly.
+    pub(crate) fn unsubscribe_best_effort(&self, subscription_id: &str) {
+        if let Ok(mut map) = self.subscriptions.try_lock() {
+            for vec in map.values_mut() {
+                vec.retain(|entry| entry.id != subscription_id);
+            }
+            map.retain(|_, vec| !vec.is_empty());
+        }
+
+        let f = Frame::new("UNSUBSCRIBE").header("id", subscription_id);
+        let _ = self.outbound_tx.try_send(StompItem::Frame(f));
     }
 
     /// Acknowledge a message previously received in `client` or
@@ -2369,6 +2412,38 @@ mod tests {
             result.as_ref().err()
         );
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn deliver_and_keep_keeps_full_prunes_closed() {
+        // A full channel is a slow-but-live consumer: drop the message, keep
+        // the subscription. Fill a capacity-1 channel so the next send is Full.
+        let (tx, _rx) = mpsc::channel::<Frame>(1);
+        tx.try_send(Frame::new("MESSAGE")).unwrap();
+        let full = SubscriptionEntry {
+            id: "1".into(),
+            sender: tx,
+            ack: "auto".into(),
+            headers: vec![],
+        };
+        assert!(
+            deliver_and_keep(&full, &Frame::new("MESSAGE")),
+            "a full (slow-consumer) channel must be kept, not pruned"
+        );
+
+        // A closed channel means the receiving Subscription was dropped: prune.
+        let (tx, rx) = mpsc::channel::<Frame>(1);
+        drop(rx);
+        let closed = SubscriptionEntry {
+            id: "2".into(),
+            sender: tx,
+            ack: "auto".into(),
+            headers: vec![],
+        };
+        assert!(
+            !deliver_and_keep(&closed, &Frame::new("MESSAGE")),
+            "a closed channel (dropped receiver) must be pruned"
+        );
     }
 
     #[tokio::test]
