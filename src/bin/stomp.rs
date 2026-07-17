@@ -12,7 +12,7 @@ async fn main() -> ExitCode {
 
     // `--send` takes exactly two values, so the indexing below is what clap has
     // already guaranteed.
-    let result = if let Some(send) = cli.send.clone() {
+    let result = if let Some(send) = cli.send.as_deref() {
         cli::oneshot::run(&cli, &send[0], &send[1]).await
     } else if cli.tui {
         cli::tui::run(&cli).await
