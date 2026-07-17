@@ -1,5 +1,6 @@
 pub mod args;
 pub mod commands;
+pub mod oneshot;
 pub mod plain;
 pub mod state;
 pub mod tui;

@@ -24,3 +24,8 @@ Run unit tests
 cargo test --lib
 ```
 
+Run the CLI tests (gated behind the `cli` feature, so `--lib` never builds them)
+```
+cargo test --test cli_oneshot --features cli
+```
+
