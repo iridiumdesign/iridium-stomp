@@ -226,6 +226,32 @@ fn send_to_an_unreachable_broker_times_out_rather_than_retrying_forever() {
 }
 
 #[test]
+fn interactive_at_an_unreachable_broker_times_out_rather_than_hanging() {
+    // #101: the interactive client now shares the connect bound, so a dead
+    // broker exits NETWORK_ERROR instead of hanging forever. stdin is null so
+    // the test never blocks even if the connect somehow succeeded.
+    let started = Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_stomp"))
+        .args(["-a", "127.0.0.1:59998", "--timeout", "1"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("failed to run the stomp binary");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        out.status.code(),
+        Some(NETWORK_ERROR),
+        "stderr: {}",
+        stderr(&out)
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "interactive connect to a dead broker must fail fast (took {:?})",
+        elapsed
+    );
+}
+
+#[test]
 fn send_rejects_a_destination_that_is_not_a_path() {
     let (addr, _seen) = start_broker(OnSend::Receipt);
 
