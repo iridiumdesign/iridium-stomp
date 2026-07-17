@@ -28,7 +28,7 @@ cd stomp-subscriber
 
 ```toml
 [dependencies]
-iridium-stomp = "0.x"
+iridium-stomp = "0.5"
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 ```

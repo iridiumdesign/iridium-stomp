@@ -379,6 +379,20 @@ The `--tui` flag enables a full terminal interface with:
 - **Command history** - Up/down arrows to navigate previous commands
 - **Header toggle** - Press `Ctrl+H` to show/hide message headers
 
+<!--
+  SCREENSHOT TODO: capture the TUI (header + heartbeat, the messages pane, and
+  a broker-errors pane if you can provoke one) and save it as
+  branding/iridium-stomp-tui.png, then push to main so this absolute URL
+  resolves on GitHub, crates.io, and docs.rs (relative paths do not render on
+  crates.io — this matches the banner at the top).
+-->
+<p align="center">
+  <img
+    src="https://raw.githubusercontent.com/iridiumdesign/iridium-stomp/main/branding/iridium-stomp-tui.png"
+    alt="iridium-stomp TUI: activity, messages, and heartbeat panels"
+    width="880">
+</p>
+
 ### Plain Mode
 
 Without `--tui`, the CLI runs in plain mode with simple scrolling output:
@@ -400,16 +414,36 @@ Commands:
 Disconnecting...
 ```
 
+<!--
+  SCREENSHOT TODO: capture a plain-mode session (a subscribe, a received
+  message with headers, a send) and save it as
+  branding/iridium-stomp-cli.png, then push to main so this absolute URL
+  resolves everywhere the README is rendered.
+-->
+<p align="center">
+  <img
+    src="https://raw.githubusercontent.com/iridiumdesign/iridium-stomp/main/branding/iridium-stomp-cli.png"
+    alt="iridium-stomp plain CLI: interactive send and subscribe session"
+    width="880">
+</p>
+
 ## Running a Local Broker
 
-Examples and integration tests require a STOMP broker. Start RabbitMQ with the
-STOMP plugin:
+The examples, the CLI, and the integration tests need a STOMP broker. The
+included Docker Compose file starts RabbitMQ with the STOMP plugin enabled:
 
 ```bash
 docker compose up -d
 ```
 
-Stop the broker:
+STOMP then listens on `127.0.0.1:61613` with `guest`/`guest`, and the
+management UI is at <http://localhost:15672>. Point the CLI at it:
+
+```bash
+stomp -a 127.0.0.1:61613 -s /queue/test
+```
+
+Stop and remove the broker:
 
 ```bash
 docker compose down

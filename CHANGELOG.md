@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-16
+
 ### Security
 
 - The frame decoder rejected nothing on frame size, so a malicious or buggy broker could crash or exhaust any connected client. Two related fixes, both bounded by a new frame-size limit (`ConnectOptions::max_frame_size`, default 16 MiB):
@@ -252,7 +254,8 @@ Every breaking change in this release is listed here, with its migration.
 - Feature-gated CLI (`--features cli`)
 - Comprehensive test suite (150+ tests)
 
-[Unreleased]: https://github.com/iridiumdesign/iridium-stomp/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/iridiumdesign/iridium-stomp/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/iridiumdesign/iridium-stomp/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/iridiumdesign/iridium-stomp/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/iridiumdesign/iridium-stomp/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/iridiumdesign/iridium-stomp/compare/v0.3.2...v0.4.0
