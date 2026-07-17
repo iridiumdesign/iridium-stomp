@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- The frame decoder rejected nothing on frame size, so a malicious or buggy broker could crash or exhaust any connected client. Two related fixes, both bounded by a new frame-size limit (`ConnectOptions::max_frame_size`, default 16 MiB):
+  - A `content-length` near `usize::MAX` overflowed the decoder's length arithmetic (`pos + content_len + 1`) — a debug-build panic, and in release a wrap past the bounds check followed by an out-of-range slice panic. Because the decoder runs on the connection's background task, a single crafted frame took the connection down. Oversized lengths are now rejected as a protocol error, and the remaining arithmetic is checked.
+  - A large-but-not-overflowing `content-length`, or a frame that never sent its terminating NUL, made the codec buffer without limit while waiting for bytes that never came. The codec now errors once a single frame exceeds the bound.
+  - All published 0.4.x releases are affected. There is no configuration to disable the guard; raise `max_frame_size` if you legitimately exchange messages larger than 16 MiB.
+
 ### Added
+
+- `ConnectOptions::max_frame_size` bounds the largest inbound frame, defaulting to `parser::DEFAULT_MAX_FRAME_SIZE` (16 MiB). See the Security note above.
 
 - `stomp --send <DESTINATION> <BODY>` sends one message and exits, without starting the interactive client ([#93])
   - The CLI previously scripted only by closing stdin and driving the REPL through a pipe, which could not report whether the broker accepted the message.

@@ -421,3 +421,64 @@ fn parse_only_nul() {
     assert!(result.1.is_empty());
     assert!(result.2.is_none());
 }
+
+// =============================================================================
+// Denial-of-service guards (malformed content-length)
+// =============================================================================
+
+use iridium_stomp::parser::parse_frame_slice_bounded;
+
+#[test]
+fn content_length_near_usize_max_errors_without_panicking() {
+    // A broker announcing a content-length near usize::MAX must not overflow
+    // the `pos + content_len + 1` arithmetic (which panicked the decoder before
+    // this guard). It is rejected as a protocol error instead.
+    let raw = b"MESSAGE\ncontent-length:18446744073709551615\n\nX\0";
+    let result = parse_frame_slice(raw);
+    assert!(
+        result.is_err(),
+        "expected an error, got {:?}",
+        result.map(|o| o.map(|t| t.3))
+    );
+}
+
+#[test]
+fn content_length_over_the_bound_is_rejected() {
+    // A large-but-non-overflowing content-length must be rejected rather than
+    // making the caller buffer unboundedly waiting for bytes that never come.
+    let raw = b"MESSAGE\ncontent-length:4000000000\n\nX\0";
+    let result = parse_frame_slice_bounded(raw, 1024);
+    assert!(
+        result.is_err(),
+        "expected an error, got {:?}",
+        result.map(|o| o.map(|t| t.3))
+    );
+}
+
+#[test]
+fn complete_oversized_nul_body_is_rejected() {
+    // A whole NUL-terminated frame with no content-length, larger than the
+    // bound, arriving all at once must be rejected — not accepted just because
+    // it is complete. Guards the gap where only content-length was bounded.
+    let mut raw = b"MESSAGE\ndestination:/q\n\n".to_vec();
+    raw.extend_from_slice(&[b'x'; 4096]);
+    raw.push(0);
+    let result = parse_frame_slice_bounded(&raw, 1024);
+    assert!(
+        result.is_err(),
+        "expected an error, got {:?}",
+        result.map(|o| o.map(|t| t.3))
+    );
+}
+
+#[test]
+fn content_length_within_the_bound_still_parses() {
+    // The guard must not reject a legitimate frame whose length is under the
+    // bound.
+    let raw = b"MESSAGE\ncontent-length:5\n\nhello\0";
+    let parsed = parse_frame_slice_bounded(raw, 1024)
+        .expect("parse error")
+        .expect("incomplete");
+    assert_eq!(parsed.0, b"MESSAGE");
+    assert_eq!(parsed.2.as_deref(), Some(&b"hello"[..]));
+}

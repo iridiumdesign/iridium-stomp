@@ -10,6 +10,7 @@ use tokio_util::codec::Framed;
 
 use crate::codec::{StompCodec, StompItem};
 use crate::frame::Frame;
+use crate::parser::DEFAULT_MAX_FRAME_SIZE;
 
 /// Configuration for STOMP heartbeat intervals.
 ///
@@ -401,6 +402,13 @@ pub struct ConnectOptions {
     /// When set, the whole operation is bounded and, on expiry, the last
     /// error encountered is returned.
     pub connect_timeout: Option<Duration>,
+
+    /// Largest inbound frame to accept, in bytes. When `None`, the default is
+    /// [`crate::parser::DEFAULT_MAX_FRAME_SIZE`] (16 MiB). A frame larger than
+    /// this — whether via an oversized `content-length` or a body that never
+    /// terminates — is rejected as a `ConnError::Io`, so a malicious or buggy
+    /// broker cannot exhaust client memory or panic the decoder.
+    pub max_frame_size: Option<usize>,
 }
 
 impl std::fmt::Debug for ConnectOptions {
@@ -416,6 +424,7 @@ impl std::fmt::Debug for ConnectOptions {
             )
             .field("disconnect_timeout", &self.disconnect_timeout)
             .field("connect_timeout", &self.connect_timeout)
+            .field("max_frame_size", &self.max_frame_size)
             .finish()
     }
 }
@@ -499,6 +508,25 @@ impl ConnectOptions {
     /// ```
     pub fn connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout = Some(timeout);
+        self
+    }
+
+    /// Set the largest inbound frame to accept, in bytes (builder style).
+    ///
+    /// Defaults to [`crate::parser::DEFAULT_MAX_FRAME_SIZE`] (16 MiB). A frame
+    /// exceeding this — an oversized `content-length`, or a body that never
+    /// terminates — is rejected rather than buffered or allocated, so a
+    /// malicious or buggy broker cannot exhaust client memory. Raise it if you
+    /// legitimately exchange larger messages.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let options = ConnectOptions::default()
+    ///     .max_frame_size(64 * 1024 * 1024);
+    /// ```
+    pub fn max_frame_size(mut self, max_frame_size: usize) -> Self {
+        self.max_frame_size = Some(max_frame_size);
         self
     }
 
@@ -933,6 +961,7 @@ impl Connection {
         let custom_headers = options.headers;
         let heartbeat_notify_tx = options.heartbeat_tx;
         let connect_timeout = options.connect_timeout;
+        let max_frame_size = options.max_frame_size.unwrap_or(DEFAULT_MAX_FRAME_SIZE);
 
         // Perform initial connection and STOMP handshake before spawning
         // background task. Retries with exponential backoff on I/O and
@@ -964,7 +993,8 @@ impl Connection {
                         continue;
                     }
                 };
-                let mut framed = Framed::new(stream, StompCodec::new());
+                let mut framed =
+                    Framed::new(stream, StompCodec::with_max_frame_size(max_frame_size));
 
                 let connect = Self::build_connect_frame(
                     &accept_version,
@@ -1083,7 +1113,10 @@ impl Connection {
                     // Reconnection attempt
                     match TcpStream::connect(&addr).await {
                         Ok(stream) => {
-                            let mut framed = Framed::new(stream, StompCodec::new());
+                            let mut framed = Framed::new(
+                                stream,
+                                StompCodec::with_max_frame_size(max_frame_size),
+                            );
 
                             let connect = Self::build_connect_frame(
                                 &accept_version,
