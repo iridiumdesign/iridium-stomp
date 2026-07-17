@@ -265,3 +265,71 @@ fn encode_frame_then_heartbeat() {
     assert_eq!(dst[len - 2], 0x00); // NUL terminator
     assert_eq!(dst[len - 1], 0x0A); // Heartbeat LF
 }
+
+// =============================================================================
+// CRLF heartbeat and frame-size guards
+// =============================================================================
+
+#[test]
+fn decode_crlf_as_heartbeat() {
+    // STOMP 1.2 allows the EOL heartbeat to be CRLF, not only a bare LF.
+    let mut codec = StompCodec::new();
+    let mut buf = BytesMut::from(&b"\r\n"[..]);
+    let item = codec
+        .decode(&mut buf)
+        .expect("decode failed")
+        .expect("no item");
+    assert_eq!(item, StompItem::Heartbeat);
+    assert!(
+        buf.is_empty(),
+        "buffer should be empty after CRLF heartbeat"
+    );
+}
+
+#[test]
+fn lone_cr_waits_for_more_bytes() {
+    // A bare CR could be the first half of a CRLF heartbeat; the codec must wait
+    // rather than consume or misparse it.
+    let mut codec = StompCodec::new();
+    let mut buf = BytesMut::from(&b"\r"[..]);
+    let item = codec.decode(&mut buf).expect("decode failed");
+    assert!(item.is_none(), "expected Ok(None) for a lone CR");
+    assert_eq!(buf.len(), 1, "buffer should be untouched");
+}
+
+#[test]
+fn oversized_content_length_frame_errors() {
+    // A content-length beyond the codec's bound is a hard error, not a panic and
+    // not unbounded buffering.
+    let mut codec = StompCodec::with_max_frame_size(1024);
+    let mut buf = BytesMut::from(&b"MESSAGE\ncontent-length:4000000000\n\nX\0"[..]);
+    let result = codec.decode(&mut buf);
+    assert!(
+        result.is_err(),
+        "expected an error for oversized content-length"
+    );
+}
+
+#[test]
+fn never_terminated_frame_is_bounded() {
+    // A frame with no content-length that never sends its NUL must not buffer
+    // past the bound. Feed more than the max and confirm the codec errors.
+    let mut codec = StompCodec::with_max_frame_size(64);
+    let mut buf = BytesMut::new();
+    buf.extend_from_slice(b"MESSAGE\ndestination:/q\n\n");
+    buf.extend_from_slice(&[b'x'; 128]); // body, no NUL, exceeds the bound
+    let result = codec.decode(&mut buf);
+    assert!(
+        result.is_err(),
+        "expected an error once the buffer exceeds the bound"
+    );
+}
+
+#[test]
+fn content_length_overflow_frame_errors_not_panics() {
+    // The end-to-end decode path must reject a usize::MAX-ish content-length.
+    let mut codec = StompCodec::new();
+    let mut buf = BytesMut::from(&b"MESSAGE\ncontent-length:18446744073709551615\n\nX\0"[..]);
+    let result = codec.decode(&mut buf);
+    assert!(result.is_err(), "expected an error, not a panic");
+}

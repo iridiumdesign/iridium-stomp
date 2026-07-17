@@ -65,12 +65,36 @@ fn get_content_length(headers: &[(Vec<u8>, Vec<u8>)]) -> Result<Option<usize>, S
     Ok(None)
 }
 
-/// Parse a single STOMP frame from a raw byte slice.
+/// Default upper bound on a single STOMP frame, in bytes (16 MiB).
+///
+/// A frame larger than this is rejected rather than buffered or allocated. The
+/// bound exists so a malicious or buggy broker cannot exhaust client memory —
+/// or panic the decoder with an overflowing `content-length` — by announcing an
+/// enormous frame. Override per connection with
+/// [`ConnectOptions::max_frame_size`](crate::ConnectOptions::max_frame_size).
+///
+/// [`parse_frame_slice`] uses this value; [`parse_frame_slice_bounded`] takes an
+/// explicit one.
+pub const DEFAULT_MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+
+/// Parse a single STOMP frame from a raw byte slice, bounding frame size at
+/// [`DEFAULT_MAX_FRAME_SIZE`].
 ///
 /// Returns Ok(Some((command, headers, body, consumed_bytes))) when a full frame
 /// was parsed and how many bytes were consumed. Returns Ok(None) when more
 /// bytes are required. Returns Err on protocol errors.
 pub fn parse_frame_slice(input: &[u8]) -> ParseResult {
+    parse_frame_slice_bounded(input, DEFAULT_MAX_FRAME_SIZE)
+}
+
+/// Parse a single STOMP frame, rejecting any `content-length` that exceeds
+/// `max_frame_size`.
+///
+/// Identical to [`parse_frame_slice`] except the caller chooses the size bound.
+/// Rejecting an oversized `content-length` up front is what keeps the length
+/// arithmetic (`pos + content_len + 1`) from overflowing and panicking the
+/// decoder — see the `content-length` branch below.
+pub fn parse_frame_slice_bounded(input: &[u8], max_frame_size: usize) -> ParseResult {
     let mut pos = 0usize;
     let len = input.len();
 
@@ -144,8 +168,24 @@ pub fn parse_frame_slice(input: &[u8]) -> ParseResult {
     // determine body strategy
     match get_content_length(&headers) {
         Ok(Some(content_len)) => {
-            // need content_len bytes, plus terminating NUL
-            if pos + content_len + 1 > len {
+            // Reject an oversized length before any arithmetic or allocation.
+            // Without this, a broker sending `content-length:<huge>` overflows
+            // `pos + content_len + 1` below — panicking the decoder (a remote
+            // DoS) — or makes the codec buffer unboundedly waiting for bytes
+            // that never come.
+            if content_len > max_frame_size {
+                return Err(format!(
+                    "content-length {} exceeds maximum frame size {}",
+                    content_len, max_frame_size
+                ));
+            }
+            // need content_len bytes, plus terminating NUL. Checked so that an
+            // enormous caller-supplied `max_frame_size` still cannot overflow.
+            let needed = match pos.checked_add(content_len).and_then(|n| n.checked_add(1)) {
+                Some(n) => n,
+                None => return Err("content-length too large".to_string()),
+            };
+            if needed > len {
                 Ok(None)
             } else {
                 let body = input[pos..pos + content_len].to_vec();

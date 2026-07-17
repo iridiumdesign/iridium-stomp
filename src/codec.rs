@@ -3,7 +3,7 @@ use std::io;
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::frame::Frame;
-use crate::parser::{parse_frame_slice, unescape_header_value};
+use crate::parser::{DEFAULT_MAX_FRAME_SIZE, parse_frame_slice_bounded, unescape_header_value};
 
 /// Escape a STOMP 1.2 header value for wire transmission.
 ///
@@ -50,13 +50,26 @@ pub enum StompItem {
 /// - Encode `StompItem` back into bytes for the wire format and emit
 ///   `content-length` when necessary.
 pub struct StompCodec {
-    // No internal buffer: we parse directly from the provided `src` buffer
+    // No internal buffer: we parse directly from the provided `src` buffer.
+    /// Largest frame this codec will decode before returning an error, in
+    /// bytes. Bounds both an oversized `content-length` and a frame that never
+    /// terminates, so neither can exhaust memory.
+    max_frame_size: usize,
 }
 
 impl StompCodec {
-    /// Create a new `StompCodec` instance.
+    /// Create a new `StompCodec` bounding frames at
+    /// [`DEFAULT_MAX_FRAME_SIZE`].
     pub fn new() -> Self {
-        Self {}
+        Self {
+            max_frame_size: DEFAULT_MAX_FRAME_SIZE,
+        }
+    }
+
+    /// Create a `StompCodec` that rejects any frame larger than
+    /// `max_frame_size` bytes.
+    pub fn with_max_frame_size(max_frame_size: usize) -> Self {
+        Self { max_frame_size }
     }
 }
 
@@ -85,17 +98,30 @@ impl Decoder for StompCodec {
     /// - `Err(io::Error)` on protocol or data errors (invalid UTF-8, malformed
     ///   frames, missing NUL after a content-length body, etc.).
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        // Move any newly-received bytes from the provided `src` into our
-        // internal buffer. We keep a separate buffer so parsing can proceed
-        // across arbitrary chunk boundaries without relying on indexes into
-        // heartbeat: single LF
-        if let Some(&b'\n') = src.chunk().first() {
-            src.advance(1);
-            return Ok(Some(StompItem::Heartbeat));
+        // Heartbeat: a STOMP 1.2 EOL, which is a bare LF or a CRLF. We parse
+        // directly from `src` (BytesMut is contiguous, so `chunk()` is the whole
+        // buffer); there is no separate accumulation buffer.
+        match src.chunk().first() {
+            Some(b'\n') => {
+                src.advance(1);
+                return Ok(Some(StompItem::Heartbeat));
+            }
+            Some(b'\r') => match src.chunk().get(1) {
+                Some(b'\n') => {
+                    src.advance(2);
+                    return Ok(Some(StompItem::Heartbeat));
+                }
+                // A lone CR so far: wait for the next byte to tell CRLF apart
+                // from the (malformed) start of a frame.
+                None => return Ok(None),
+                // CR followed by something else: let the frame parser judge it.
+                Some(_) => {}
+            },
+            _ => {}
         }
 
         let chunk = src.chunk();
-        match parse_frame_slice(chunk) {
+        match parse_frame_slice_bounded(chunk, self.max_frame_size) {
             Ok(Some((cmd_bytes, headers, body, consumed))) => {
                 // advance src by consumed
                 src.advance(consumed);
@@ -149,7 +175,20 @@ impl Decoder for StompCodec {
                 };
                 Ok(Some(StompItem::Frame(frame)))
             }
-            Ok(None) => Ok(None),
+            Ok(None) => {
+                // Incomplete frame. If we have already buffered the maximum and
+                // still cannot parse a whole frame, the frame is oversized (or
+                // never NUL-terminated) — bound it here rather than buffering
+                // without limit. The content-length path is bounded inside the
+                // parser; this covers the NUL-terminated body that never ends.
+                if src.len() > self.max_frame_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("frame exceeds maximum frame size {}", self.max_frame_size),
+                    ));
+                }
+                Ok(None)
+            }
             Err(e) => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("parse error: {}", e),
