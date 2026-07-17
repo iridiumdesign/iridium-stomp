@@ -120,6 +120,12 @@ pub fn parse_frame_slice_bounded(input: &[u8], max_frame_size: usize) -> ParseRe
         // No newline found: if there's a NUL in the remaining bytes, treat
         // this as a bare NUL-terminated body with empty command/headers.
         if let Some(nul_rel) = input[pos..].iter().position(|&b| b == 0) {
+            if nul_rel > max_frame_size {
+                return Err(format!(
+                    "frame body {} exceeds maximum frame size {}",
+                    nul_rel, max_frame_size
+                ));
+            }
             let body = input[pos..pos + nul_rel].to_vec();
             pos += nul_rel + 1;
             if pos < len && input[pos] == b'\n' {
@@ -207,6 +213,12 @@ pub fn parse_frame_slice_bounded(input: &[u8], max_frame_size: usize) -> ParseRe
             // NUL-terminated body: find NUL
             match input[pos..].iter().position(|&b| b == 0) {
                 Some(nul_rel) => {
+                    if nul_rel > max_frame_size {
+                        return Err(format!(
+                            "frame body {} exceeds maximum frame size {}",
+                            nul_rel, max_frame_size
+                        ));
+                    }
                     let body = input[pos..pos + nul_rel].to_vec();
                     pos += nul_rel + 1;
                     // optional trailing LF

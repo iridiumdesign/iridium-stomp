@@ -123,6 +123,21 @@ impl Decoder for StompCodec {
         let chunk = src.chunk();
         match parse_frame_slice_bounded(chunk, self.max_frame_size) {
             Ok(Some((cmd_bytes, headers, body, consumed))) => {
+                // Enforce the bound on a *complete* frame too, not only on the
+                // incomplete (`Ok(None)`) path. A whole oversized frame can
+                // arrive in one read — its body bounded inside the parser, but
+                // large headers or framing could still push the total over the
+                // limit — so reject on total wire size here as the authoritative
+                // guard.
+                if consumed > self.max_frame_size {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "frame size {} exceeds maximum frame size {}",
+                            consumed, self.max_frame_size
+                        ),
+                    ));
+                }
                 // advance src by consumed
                 src.advance(consumed);
 

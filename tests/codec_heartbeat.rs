@@ -333,3 +333,20 @@ fn content_length_overflow_frame_errors_not_panics() {
     let result = codec.decode(&mut buf);
     assert!(result.is_err(), "expected an error, not a panic");
 }
+
+#[test]
+fn complete_oversized_frame_rejected_in_one_read() {
+    // A *complete* NUL-terminated frame (no content-length) larger than the
+    // bound, delivered whole in a single decode call, must be rejected — the
+    // guard cannot depend on the frame being incomplete.
+    let mut codec = StompCodec::with_max_frame_size(64);
+    let mut buf = BytesMut::new();
+    buf.extend_from_slice(b"MESSAGE\ndestination:/q\n\n");
+    buf.extend_from_slice(&[b'x'; 128]);
+    buf.extend_from_slice(&[0]); // NUL terminator present: the frame IS complete
+    let result = codec.decode(&mut buf);
+    assert!(
+        result.is_err(),
+        "a complete-but-oversized frame must be rejected"
+    );
+}

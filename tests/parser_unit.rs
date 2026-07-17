@@ -451,7 +451,23 @@ fn content_length_over_the_bound_is_rejected() {
     assert!(
         result.is_err(),
         "expected an error, got {:?}",
-        result.is_ok()
+        result.map(|o| o.map(|t| t.3))
+    );
+}
+
+#[test]
+fn complete_oversized_nul_body_is_rejected() {
+    // A whole NUL-terminated frame with no content-length, larger than the
+    // bound, arriving all at once must be rejected — not accepted just because
+    // it is complete. Guards the gap where only content-length was bounded.
+    let mut raw = b"MESSAGE\ndestination:/q\n\n".to_vec();
+    raw.extend_from_slice(&[b'x'; 4096]);
+    raw.push(0);
+    let result = parse_frame_slice_bounded(&raw, 1024);
+    assert!(
+        result.is_err(),
+        "expected an error, got {:?}",
+        result.map(|o| o.map(|t| t.3))
     );
 }
 
