@@ -133,9 +133,14 @@ reconnect.
 
 `unsubscribe` is the explicit form and reports whether the frame was queued.
 Dropping the handle does the same on a best-effort basis — it cannot report an
-error, and in the rare case the outbound channel is momentarily unavailable the
-frame may not be sent, though the subscription is still pruned locally so it is
-never resubscribed.
+error, and because it runs from `Drop` it uses non-blocking `try_lock`/`try_send`
+rather than awaiting. If the outbound channel is momentarily unavailable the
+frame may not be sent; if the subscription registry is momentarily locked, the
+local entry is not removed right then. In that case the entry is reaped when the
+next message for it is delivered (its receiver is closed), so pruning is
+eventual rather than guaranteed at the instant of drop — until it happens, a
+reconnect in that window could briefly resubscribe it. Use the explicit
+`unsubscribe` when you need the removal to be immediate and acknowledged.
 
 One exception: if you took the raw receiver with `into_receiver`, you now own
 the stream and dropping it sends nothing. Unsubscribe explicitly with

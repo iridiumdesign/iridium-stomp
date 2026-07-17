@@ -31,16 +31,22 @@ fn start_broker() -> (String, Seen) {
             let _ = stream.flush();
         }
 
+        // TCP is a byte stream: a read may carry a partial frame or several at
+        // once. Accumulate bytes and record only complete, NUL-terminated
+        // frames so the assertions cannot see a split frame.
+        let mut acc: Vec<u8> = Vec::new();
         loop {
             match stream.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    let text = String::from_utf8_lossy(&buf[..n]).to_string();
-                    for raw in text.split('\0').filter(|f| !f.trim().is_empty()) {
-                        seen_clone
-                            .lock()
-                            .unwrap()
-                            .push(raw.trim_start().to_string());
+                    acc.extend_from_slice(&buf[..n]);
+                    while let Some(pos) = acc.iter().position(|&b| b == 0) {
+                        let frame: Vec<u8> = acc.drain(..=pos).collect();
+                        let text = String::from_utf8_lossy(&frame);
+                        let raw = text.trim_matches('\0').trim_start();
+                        if !raw.is_empty() {
+                            seen_clone.lock().unwrap().push(raw.to_string());
+                        }
                     }
                 }
             }

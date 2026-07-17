@@ -115,9 +115,11 @@ impl Subscription {
     ///
     /// This is a convenience that calls `Connection::unsubscribe` with the
     /// local subscription id and drops the receiver. It confirms nothing beyond
-    /// queuing the UNSUBSCRIBE; the returned error reports only that the frame
-    /// could not be queued. Dropping the handle instead does the same thing on a
-    /// best-effort basis (see the `Drop` impl).
+    /// queuing the UNSUBSCRIBE; the returned error means either the id was no
+    /// longer registered locally (for example the subscription had already been
+    /// abandoned after repeated broker errors) or the frame could not be queued.
+    /// Dropping the handle instead does the same thing on a best-effort basis
+    /// (see the `Drop` impl).
     pub async fn unsubscribe(mut self) -> Result<(), ConnError> {
         // Mark first so the upcoming drop does not send a second UNSUBSCRIBE.
         self.unsubscribed = true;
