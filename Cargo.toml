@@ -2,6 +2,9 @@
 name = "iridium-stomp"
 version = "0.4.2"
 edition = "2024"
+# Verified floor: edition 2024 needs 1.85, and the let-chain in connection.rs
+# needs 1.88. Library and the `cli` feature both build on 1.88.0.
+rust-version = "1.88"
 license = "MIT"
 authors = ["Brad Siegfreid <bsiegfreid@me.com>"]
 description = "Async STOMP 1.2 client for Rust"
@@ -11,8 +14,10 @@ homepage = "https://github.com/iridiumdesign/iridium-stomp"
 documentation = "https://docs.rs/iridium-stomp"
 keywords = ["stomp", "async", "messaging", "tokio", "rabbitmq"]
 categories = ["network-programming", "asynchronous"]
-# Ensure docs files are packaged and instruct docs.rs to build with all features
-include = ["src/**", "examples/**", "docs/**", "Cargo.toml", "README.md", "LICENSE"]
+# Ensure docs files are packaged and instruct docs.rs to build with all features.
+# Leading slashes anchor to the package root: an unanchored `README.md` also
+# matched `.github/scripts/README.md` and shipped it in the crate tarball.
+include = ["/src/**", "/examples/**", "/docs/**", "/Cargo.toml", "/README.md", "/LICENSE"]
 
 [package.metadata.docs.rs]
 all-features = true
