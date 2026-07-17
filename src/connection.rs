@@ -394,6 +394,13 @@ pub struct ConnectOptions {
     /// sends DISCONNECT. Defaults to
     /// [`Connection::DEFAULT_DISCONNECT_TIMEOUT`] if not set.
     pub disconnect_timeout: Option<Duration>,
+
+    /// Upper bound on the initial connect-and-handshake before
+    /// [`Connection::connect_with_options`] gives up. When `None` (the
+    /// default), an unreachable broker is retried indefinitely with backoff.
+    /// When set, the whole operation is bounded and, on expiry, the last
+    /// I/O error encountered is returned.
+    pub connect_timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for ConnectOptions {
@@ -408,6 +415,7 @@ impl std::fmt::Debug for ConnectOptions {
                 &self.heartbeat_tx.as_ref().map(|_| "Some(...)"),
             )
             .field("disconnect_timeout", &self.disconnect_timeout)
+            .field("connect_timeout", &self.connect_timeout)
             .finish()
     }
 }
@@ -464,6 +472,33 @@ impl ConnectOptions {
     /// ```
     pub fn disconnect_timeout(mut self, timeout: Duration) -> Self {
         self.disconnect_timeout = Some(timeout);
+        self
+    }
+
+    /// Bound the initial connect and STOMP handshake (builder style).
+    ///
+    /// By default [`Connection::connect_with_options`] retries an unreachable
+    /// broker indefinitely with exponential backoff, which is the right choice
+    /// for a long-lived service that should wait for its broker to come up. It
+    /// is the wrong choice for a CLI tool or one-shot script pointed at a
+    /// misconfigured address: without a bound it hangs forever. Set this to cap
+    /// the whole operation.
+    ///
+    /// When the timeout expires, `connect_with_options` returns the last
+    /// [`ConnError::Io`] it encountered (or a synthesized
+    /// [`std::io::ErrorKind::TimedOut`] if the first attempt had not yet
+    /// produced one). A `ConnError::ServerRejected` still fails immediately,
+    /// before the bound is consulted, because retrying bad credentials is
+    /// pointless.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let options = ConnectOptions::default()
+    ///     .connect_timeout(Duration::from_secs(60));
+    /// ```
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
         self
     }
 
@@ -839,6 +874,10 @@ impl Connection {
     /// reconnection after a connection drop. This means your application can
     /// start before the broker is available and will connect once it comes up.
     ///
+    /// This retry is unbounded by default. Set
+    /// [`ConnectOptions::connect_timeout`] to cap it — useful for CLI tools and
+    /// one-shot scripts that must not hang forever on a misconfigured address.
+    ///
     /// # Errors
     ///
     /// Returns an error immediately (no retry) if:
@@ -893,81 +932,111 @@ impl Connection {
         let client_id = options.client_id;
         let custom_headers = options.headers;
         let heartbeat_notify_tx = options.heartbeat_tx;
+        let connect_timeout = options.connect_timeout;
 
         // Perform initial connection and STOMP handshake before spawning
         // background task. Retries with exponential backoff on I/O and
         // protocol errors (broker unreachable or crashing mid-handshake)
         // using the same strategy as reconnection. Only ServerRejected
         // (authentication failure) fails immediately.
+        //
+        // `last_err` remembers the most recent I/O failure so that, if a
+        // `connect_timeout` bound elapses, the caller gets that error rather
+        // than a bare "timed out". It is written by the retry arms and read
+        // only after the attempt future below has been dropped.
         let mut backoff_secs: u64 = 1;
-        let (framed, send_interval, recv_interval) = loop {
-            let stream = match TcpStream::connect(&addr).await {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(
-                        addr = %addr,
-                        error = %e,
-                        backoff_secs,
-                        "initial connect failed, retrying in {}s",
-                        backoff_secs,
-                    );
-                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                    backoff_secs = (backoff_secs * 2).min(30);
-                    continue;
-                }
-            };
-            let mut framed = Framed::new(stream, StompCodec::new());
+        let mut last_err: Option<ConnError> = None;
+        let attempt = async {
+            loop {
+                let stream = match TcpStream::connect(&addr).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(
+                            addr = %addr,
+                            error = %e,
+                            backoff_secs,
+                            "initial connect failed, retrying in {}s",
+                            backoff_secs,
+                        );
+                        last_err = Some(ConnError::Io(e));
+                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = (backoff_secs * 2).min(30);
+                        continue;
+                    }
+                };
+                let mut framed = Framed::new(stream, StompCodec::new());
 
-            let connect = Self::build_connect_frame(
-                &accept_version,
-                &host,
-                &login,
-                &passcode,
-                &client_hb,
-                &client_id,
-                &custom_headers,
-            );
-
-            if let Err(e) = framed.send(StompItem::Frame(connect)).await {
-                tracing::warn!(
-                    addr = %addr,
-                    error = %e,
-                    backoff_secs,
-                    "failed to send CONNECT frame, retrying in {}s",
-                    backoff_secs,
+                let connect = Self::build_connect_frame(
+                    &accept_version,
+                    &host,
+                    &login,
+                    &passcode,
+                    &client_hb,
+                    &client_id,
+                    &custom_headers,
                 );
-                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                backoff_secs = (backoff_secs * 2).min(30);
-                continue;
-            }
 
-            match Self::await_connected_response(&mut framed).await {
-                Ok(server_hb) => {
-                    tracing::info!(addr = %addr, "connected to broker");
-                    let (cx, cy) = parse_heartbeat_header(&client_hb);
-                    let (sx, sy) = parse_heartbeat_header(&server_hb);
-                    let (si, ri) = negotiate_heartbeats(cx, cy, sx, sy);
-                    break (framed, si, ri);
-                }
-                // Auth errors fail immediately — bad config should not be retried
-                Err(e @ ConnError::ServerRejected(_)) => {
-                    return Err(e);
-                }
-                // I/O and protocol errors during handshake (e.g., broker
-                // crashed or closed mid-handshake) — retry with backoff
-                Err(e) => {
+                if let Err(e) = framed.send(StompItem::Frame(connect)).await {
                     tracing::warn!(
                         addr = %addr,
                         error = %e,
                         backoff_secs,
-                        "handshake failed, retrying in {}s",
+                        "failed to send CONNECT frame, retrying in {}s",
                         backoff_secs,
                     );
+                    last_err = Some(ConnError::Io(e));
                     tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
                     backoff_secs = (backoff_secs * 2).min(30);
                     continue;
                 }
+
+                match Self::await_connected_response(&mut framed).await {
+                    Ok(server_hb) => {
+                        tracing::info!(addr = %addr, "connected to broker");
+                        let (cx, cy) = parse_heartbeat_header(&client_hb);
+                        let (sx, sy) = parse_heartbeat_header(&server_hb);
+                        let (si, ri) = negotiate_heartbeats(cx, cy, sx, sy);
+                        return Ok::<_, ConnError>((framed, si, ri));
+                    }
+                    // Auth errors fail immediately — bad config should not be retried
+                    Err(e @ ConnError::ServerRejected(_)) => {
+                        return Err(e);
+                    }
+                    // I/O and protocol errors during handshake (e.g., broker
+                    // crashed or closed mid-handshake) — retry with backoff
+                    Err(e) => {
+                        tracing::warn!(
+                            addr = %addr,
+                            error = %e,
+                            backoff_secs,
+                            "handshake failed, retrying in {}s",
+                            backoff_secs,
+                        );
+                        last_err = Some(e);
+                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = (backoff_secs * 2).min(30);
+                        continue;
+                    }
+                }
             }
+        };
+
+        let (framed, send_interval, recv_interval) = match connect_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, attempt).await {
+                Ok(result) => result?,
+                Err(_elapsed) => {
+                    // The bound elapsed. Hand back the last I/O error seen, or
+                    // synthesize a timeout if the very first attempt was still
+                    // in flight and had not recorded one yet.
+                    return Err(last_err.unwrap_or_else(|| {
+                        ConnError::Io(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!("connect to {} timed out after {:?}", addr, timeout),
+                        ))
+                    }));
+                }
+            },
+            None => attempt.await?,
         };
 
         // Now spawn background task for ongoing I/O and reconnection.
@@ -2159,6 +2228,80 @@ mod tests {
         });
 
         (addr, handle)
+    }
+
+    #[tokio::test]
+    async fn connect_timeout_bounds_an_unreachable_broker() {
+        // Bind, then drop the listener so the port is closed. A connect there
+        // is refused immediately, and without a bound the retry loop would back
+        // off and try again forever (#68). The bound must cut it short and hand
+        // back the last I/O error it saw, not hang.
+        let addr = {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap()
+        };
+
+        let start = std::time::Instant::now();
+        let result = Connection::connect_with_options(
+            &addr.to_string(),
+            "guest",
+            "guest",
+            "0,0",
+            ConnectOptions::default().connect_timeout(Duration::from_millis(200)),
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        // `Connection` is not `Debug`, so inspect the error side only.
+        let err = result.err();
+        assert!(
+            matches!(err, Some(ConnError::Io(_))),
+            "expected an Io error, got {:?}",
+            err
+        );
+        // The first refusal is instant; the bound fires during the 1s backoff
+        // sleep that follows, well under a second.
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "connect should have given up near the 200ms bound, took {:?}",
+            elapsed
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_timeout_does_not_disturb_a_reachable_broker() {
+        // A generous bound must not interfere with a broker that answers
+        // promptly: the connection still succeeds.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _connect = read_stomp_frame(&mut stream);
+                stream
+                    .write_all(b"CONNECTED\nversion:1.2\nheart-beat:0,0\n\n\0")
+                    .unwrap();
+                stream.flush().unwrap();
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        let result = Connection::connect_with_options(
+            &addr.to_string(),
+            "guest",
+            "guest",
+            "0,0",
+            ConnectOptions::default()
+                .connect_timeout(Duration::from_secs(5))
+                .disconnect_timeout(Duration::from_millis(50)),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "expected a connection, got error {:?}",
+            result.as_ref().err()
+        );
+        handle.join().unwrap();
     }
 
     #[tokio::test]

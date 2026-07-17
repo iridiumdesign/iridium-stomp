@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - A confirmed close also proves that everything previously sent on the connection reached the broker. Frames are written in the order submitted and the broker answers the DISCONNECT only after processing what came before, so awaiting the receipt drains the outbound queue. This closes a gap where a frame submitted immediately before `close` could be abandoned at the shutdown signal — reachable from the CLI by issuing `send` and then `quit`.
 - `ConnectOptions::disconnect_timeout` bounds that wait, defaulting to `Connection::DEFAULT_DISCONNECT_TIMEOUT` (5 seconds) ([#81])
 
+- `ConnectOptions::connect_timeout` bounds the initial connect and handshake ([#68])
+  - `Connection::connect` retries an unreachable broker indefinitely with exponential backoff — the right default for a long-lived service that should wait for its broker to come up, but the wrong one for a CLI tool or one-shot script pointed at a misconfigured address, which hangs forever with no way to bail out short of wrapping the call in `tokio::time::timeout`.
+  - When set, the whole operation is bounded; on expiry `connect_with_options` returns the last `ConnError::Io` it encountered (or a synthesized `ErrorKind::TimedOut` if the first attempt had not yet produced one). A `ServerRejected` still fails immediately, before the bound, because retrying bad credentials is pointless.
+  - Defaults to `None`, preserving the retry-forever behaviour for existing callers.
+
 ### Changed
 
 Every breaking change in this release is listed here, with its migration.
