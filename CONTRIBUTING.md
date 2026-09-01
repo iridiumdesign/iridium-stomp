@@ -54,7 +54,30 @@ landed.
 
 ## Before opening a pull request
 
-The CI bar is the same one used locally. All four of these should pass:
+The CI bar is the same one used locally, and the `justfile` is the
+shortest way to clear it. `just check` runs formatting, clippy with
+warnings as errors, the tests, the doc examples, and the example
+binaries — every CI job except the broker smoke test.
+
+```sh
+cargo install --locked just   # once
+just                          # list every recipe
+just check                    # the gate
+just check-all                # the gate plus the RabbitMQ smoke test
+```
+
+`just check-all` needs a container runtime; it builds a RabbitMQ with
+STOMP baked in, runs the smoke test against it, and tears it down.
+
+The `brokers` group is there because the interesting bugs in a STOMP
+client are the places brokers disagree. `just rabbit`, `just activemq`,
+and `just artemis` each bring one up on its own STOMP port so all three
+can run at once, `just brokers` reports which are listening, and
+`just brokers-down` stops them.
+
+If you'd rather not install anything, this is the minimum by hand.
+`just check` also compiles the doc examples and the example binaries,
+which CI checks and these four commands do not:
 
 ```sh
 # Formatting
