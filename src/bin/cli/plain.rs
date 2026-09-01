@@ -280,7 +280,7 @@ mod tests {
 
     #[test]
     fn frame_rejected_uses_distinct_exit_code() {
-        let err = ConnError::FrameRejected(ServerError {
+        let err = ConnError::FrameRejected(Box::new(ServerError {
             message: "publish denied".to_string(),
             body: Some("not allowed".to_string()),
             receipt_id: Some("receipt-1".to_string()),
@@ -288,7 +288,7 @@ mod tests {
                 .header("message", "publish denied")
                 .header("receipt-id", "receipt-1")
                 .set_body(b"not allowed".to_vec()),
-        });
+        }));
 
         let (message, code) = format_connection_error_pub(&err, "127.0.0.1:61613");
 

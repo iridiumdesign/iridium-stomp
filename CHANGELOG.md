@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING — `ConnError::ServerRejected` and `ConnError::FrameRejected` now hold `Box<ServerError>` instead of `ServerError`.** `ServerError` is 144 bytes (it carries the whole ERROR `Frame`), which made `ConnError` 152 bytes and every `Result<_, ConnError>` in the crate that size — paid on the success path too, and copied up the stack at each `?`. Boxing drops `Result<(), ConnError>` from 152 bytes to 32. Reading is unaffected, since `Box<ServerError>` derefs: `err.message`, `err.body`, and `err.receipt_id` compile unchanged. Constructing needs `Box::new(...)`, and destructuring through the variant in a pattern no longer matches. This also clears `clippy::result_large_err`, which began failing CI when clippy 0.1.98 tightened the lint (#112)
+
 ## [0.5.0] - 2026-07-16
 
 ### Security

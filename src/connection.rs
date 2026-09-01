@@ -161,12 +161,12 @@ pub enum ConnError {
     /// to the CONNECT frame. Common causes include invalid credentials,
     /// unauthorized access, or broker configuration issues.
     #[error("server rejected connection: {0}")]
-    ServerRejected(ServerError),
+    ServerRejected(Box<ServerError>),
     /// A frame that requested a receipt was rejected by the broker via
     /// an ERROR frame with a matching receipt-id. The connection may
     /// still be usable depending on broker behavior.
     #[error("frame rejected: {0}")]
-    FrameRejected(ServerError),
+    FrameRejected(Box<ServerError>),
 }
 
 /// Represents an ERROR frame received from the STOMP server.
@@ -807,7 +807,7 @@ impl ReceiptHandle {
 
         match tokio::time::timeout(timeout, rx).await {
             Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(err))) => Err(ConnError::FrameRejected(err)),
+            Ok(Ok(Err(err))) => Err(ConnError::FrameRejected(Box::new(err))),
             Ok(Err(_)) => {
                 // Sender dropped without a response - connection likely gone.
                 Err(ConnError::Protocol(
@@ -1583,7 +1583,9 @@ impl Connection {
                         return Ok(server_hb);
                     } else if f.command == "ERROR" {
                         // Server rejected connection (e.g., invalid credentials)
-                        return Err(ConnError::ServerRejected(ServerError::from_frame(f)));
+                        return Err(ConnError::ServerRejected(Box::new(
+                            ServerError::from_frame(f),
+                        )));
                     }
                     // Ignore other frames during CONNECT phase
                 }

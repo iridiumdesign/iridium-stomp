@@ -105,7 +105,7 @@ fn conn_error_server_rejected_display() {
         .header("message", "authentication failed")
         .set_body(b"Invalid credentials".to_vec());
     let server_err = ServerError::from_frame(frame);
-    let conn_err = ConnError::ServerRejected(server_err);
+    let conn_err = ConnError::ServerRejected(Box::new(server_err));
 
     let display = format!("{}", conn_err);
     assert!(display.contains("server rejected"));
@@ -118,7 +118,7 @@ fn conn_error_server_rejected_debug() {
 
     let frame = Frame::new("ERROR").header("message", "access denied");
     let server_err = ServerError::from_frame(frame);
-    let conn_err = ConnError::ServerRejected(server_err);
+    let conn_err = ConnError::ServerRejected(Box::new(server_err));
 
     let debug = format!("{:?}", conn_err);
     assert!(debug.contains("ServerRejected"));
@@ -133,7 +133,7 @@ fn conn_error_server_rejected_extract_error() {
         .header("message", "not authorized")
         .set_body(b"You do not have permission".to_vec());
     let server_err = ServerError::from_frame(frame);
-    let conn_err = ConnError::ServerRejected(server_err);
+    let conn_err = ConnError::ServerRejected(Box::new(server_err));
 
     // Extract the inner ServerError via pattern matching
     match conn_err {
@@ -153,7 +153,7 @@ fn conn_error_server_rejected_preserves_frame() {
         .header("message", "error")
         .header("custom-header", "custom-value");
     let server_err = ServerError::from_frame(frame);
-    let conn_err = ConnError::ServerRejected(server_err);
+    let conn_err = ConnError::ServerRejected(Box::new(server_err));
 
     // Verify we can access the original frame through the error
     match conn_err {
