@@ -59,7 +59,9 @@ fn messages(subscription: &str, destination: &str, first: usize, count: usize) -
 
 /// A broker that answers CONNECT, asks the client for a heartbeat every
 /// 100ms, records what it receives, writes whatever `script` returns for each
-/// frame, and then answers any `receipt` header with a RECEIPT.
+/// frame, and then answers any `receipt` header with a RECEIPT. A SEND to
+/// `/control/drop` makes it close the socket and wait for the client to
+/// reconnect; `script` and `Seen` span connections.
 fn start_broker(mut script: impl FnMut(&str) -> Vec<u8> + Send + 'static) -> (String, Seen) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
@@ -67,48 +69,57 @@ fn start_broker(mut script: impl FnMut(&str) -> Vec<u8> + Send + 'static) -> (St
     let seen_clone = seen.clone();
 
     thread::spawn(move || {
-        let Ok((mut stream, _)) = listener.accept() else {
-            return;
-        };
-        let mut buf = [0u8; 4096];
+        'accept: loop {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
 
-        if stream.read(&mut buf).is_ok() {
-            let _ = stream.write_all(b"CONNECTED\nversion:1.2\nheart-beat:0,100\n\n\0");
-            let _ = stream.flush();
-        }
-
-        // TCP is a byte stream: accumulate and act only on complete,
-        // NUL-terminated frames. Newlines between frames are heartbeats.
-        let mut acc: Vec<u8> = Vec::new();
-        loop {
-            match stream.read(&mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => acc.extend_from_slice(&buf[..n]),
-            }
-            loop {
-                let eols = acc
-                    .iter()
-                    .take_while(|&&b| b == b'\n' || b == b'\r')
-                    .count();
-                let beats = acc[..eols].iter().filter(|&&b| b == b'\n').count();
-                seen_clone.heartbeats.fetch_add(beats, Ordering::SeqCst);
-                acc.drain(..eols);
-
-                let Some(pos) = acc.iter().position(|&b| b == 0) else {
-                    break;
-                };
-                let frame: Vec<u8> = acc.drain(..=pos).collect();
-                let raw = String::from_utf8_lossy(&frame[..pos]).to_string();
-                seen_clone.frames.lock().unwrap().push(raw.clone());
-
-                let mut reply = script(&raw);
-                if let Some(id) = header(&raw, "receipt") {
-                    reply.extend_from_slice(format!("RECEIPT\nreceipt-id:{id}\n\n\0").as_bytes());
-                }
-                if stream.write_all(&reply).is_err() {
-                    return;
-                }
+            if stream.read(&mut buf).is_ok() {
+                let _ = stream.write_all(b"CONNECTED\nversion:1.2\nheart-beat:0,100\n\n\0");
                 let _ = stream.flush();
+            }
+
+            // TCP is a byte stream: accumulate and act only on complete,
+            // NUL-terminated frames. Newlines between frames are heartbeats.
+            let mut acc: Vec<u8> = Vec::new();
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => continue 'accept,
+                    Ok(n) => acc.extend_from_slice(&buf[..n]),
+                }
+                loop {
+                    let eols = acc
+                        .iter()
+                        .take_while(|&&b| b == b'\n' || b == b'\r')
+                        .count();
+                    let beats = acc[..eols].iter().filter(|&&b| b == b'\n').count();
+                    seen_clone.heartbeats.fetch_add(beats, Ordering::SeqCst);
+                    acc.drain(..eols);
+
+                    let Some(pos) = acc.iter().position(|&b| b == 0) else {
+                        break;
+                    };
+                    let frame: Vec<u8> = acc.drain(..=pos).collect();
+                    let raw = String::from_utf8_lossy(&frame[..pos]).to_string();
+                    seen_clone.frames.lock().unwrap().push(raw.clone());
+
+                    if header(&raw, "destination") == Some("/control/drop") {
+                        let _ = stream.shutdown(std::net::Shutdown::Both);
+                        continue 'accept;
+                    }
+
+                    let mut reply = script(&raw);
+                    if let Some(id) = header(&raw, "receipt") {
+                        reply.extend_from_slice(
+                            format!("RECEIPT\nreceipt-id:{id}\n\n\0").as_bytes(),
+                        );
+                    }
+                    if stream.write_all(&reply).is_err() {
+                        continue 'accept;
+                    }
+                    let _ = stream.flush();
+                }
             }
         }
     });
@@ -422,4 +433,125 @@ async fn dropped_subscription_with_parked_frames_is_pruned() {
 #[tokio::test]
 async fn closed_receiver_with_parked_frames_is_pruned() {
     parked_frames_are_discarded(true).await;
+}
+
+// ============================================================================
+// Reconnect, unsubscribe, and the wake list
+// ============================================================================
+
+/// Park a burst of ten behind a capacity-1 channel, consume message 0, have
+/// the broker drop the connection, and return what the consumer sees next.
+/// On the resubscribe the broker sends `redelivered` and then message 100.
+async fn after_reconnect(ack: AckMode, redelivered: std::ops::Range<usize>) -> Vec<String> {
+    let mut subscribes = 0;
+    let (addr, _seen) = start_broker(move |raw| {
+        if !raw.starts_with("SUBSCRIBE") {
+            return Vec::new();
+        }
+        let id = header(raw, "id").unwrap();
+        subscribes += 1;
+        if subscribes == 1 {
+            messages(id, "/queue/t", 0, 10)
+        } else {
+            let mut out = messages(id, "/queue/t", redelivered.start, redelivered.len());
+            out.extend(messages(id, "/queue/t", 100, 1));
+            out
+        }
+    });
+    let conn = connect(&addr).await;
+    let opts = SubscriptionOptions::default().channel_capacity(1);
+    let mut sub = conn
+        .subscribe_with_options("/queue/t", ack, opts)
+        .await
+        .unwrap();
+
+    let frame = next_id(&mut sub, 0).await;
+    if ack != AckMode::Auto {
+        sub.ack(frame.get_header("message-id").unwrap())
+            .await
+            .unwrap();
+    }
+    // A round trip, so the burst has all arrived and the freed slot has been
+    // refilled: message 1 is in the channel, 2..=9 are parked.
+    conn.send_frame_confirmed(send_to("/queue/out"), Duration::from_secs(2))
+        .await
+        .unwrap();
+    conn.send_frame(send_to("/control/drop")).await.unwrap();
+
+    // Do not read again until the new session is up, so nothing drains
+    // in between.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    conn.send_frame_confirmed(send_to("/queue/out"), Duration::from_secs(10))
+        .await
+        .expect("the connection must come back");
+
+    let mut ids = Vec::new();
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(5), sub.next())
+            .await
+            .expect("stalled after reconnect")
+            .expect("subscription ended early");
+        let id = frame.get_header("message-id").unwrap().to_string();
+        let last = id == "100";
+        ids.push(id);
+        if last {
+            return ids;
+        }
+    }
+}
+
+#[tokio::test]
+async fn reconnect_discards_parked_frames_the_broker_redelivers() {
+    // Message 0 was acked, so the broker redelivers 1..=9. Message 1 was
+    // already in the subscription's channel, which the library cannot take
+    // back, so it is seen twice; the parked 2..=9 must not be.
+    let ids = after_reconnect(AckMode::ClientIndividual, 1..10).await;
+    let mut expected = vec!["1".to_string()];
+    expected.extend((1..10).map(|n| n.to_string()));
+    expected.push("100".to_string());
+    assert_eq!(ids, expected);
+}
+
+#[tokio::test]
+async fn reconnect_keeps_parked_frames_in_auto_mode() {
+    // In auto mode the broker considers 0..=9 delivered and sends none of
+    // them again, so the parked ones are the only copies.
+    let ids = after_reconnect(AckMode::Auto, 0..0).await;
+    let mut expected: Vec<String> = (1..10).map(|n| n.to_string()).collect();
+    expected.push("100".to_string());
+    assert_eq!(ids, expected);
+}
+
+#[tokio::test]
+async fn unsubscribe_releases_a_parked_subscription() {
+    let (addr, _seen) = start_broker(|raw| match header(raw, "id") {
+        Some(id) if raw.starts_with("SUBSCRIBE") => messages(id, "/queue/t", 0, 40),
+        _ => Vec::new(),
+    });
+    let conn = connect(&addr).await;
+    let opts = SubscriptionOptions::default().channel_capacity(1);
+    let sub = conn
+        .subscribe_with_options("/queue/t", AckMode::Auto, opts)
+        .await
+        .unwrap();
+    let id = sub.id().to_string();
+    // Keep the receiver, and never read it: the channel stays full.
+    let mut rx = sub.into_receiver();
+    conn.send_frame_confirmed(send_to("/queue/out"), Duration::from_secs(2))
+        .await
+        .unwrap();
+
+    conn.unsubscribe(&id).await.unwrap();
+    conn.send_frame_confirmed(send_to("/queue/out"), Duration::from_secs(2))
+        .await
+        .unwrap();
+
+    // The registry entry held one sender and the wake list another. With both
+    // gone the channel is closed, although it is still full.
+    assert!(
+        rx.is_closed(),
+        "the background task must not keep a sender for an unsubscribed subscription"
+    );
+    assert_eq!(rx.recv().await.unwrap().get_header("message-id"), Some("0"));
+    assert!(rx.recv().await.is_none(), "parked frames go with the entry");
 }

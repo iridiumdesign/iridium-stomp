@@ -794,6 +794,19 @@ async fn parked_capacity(parked: &[(String, mpsc::Sender<Frame>)]) -> String {
     future::select_all(waits).await.0
 }
 
+/// Drop wake-list items whose subscription no longer has anything parked or is
+/// no longer registered. Entries leave the registry from outside the I/O loop
+/// too (`unsubscribe`, a dropped `Subscription`), and a wake-list item whose
+/// channel stays full would otherwise never resolve, holding its sender — and
+/// so the channel — open for the life of the task.
+fn prune_parked(parked: &mut Vec<(String, mpsc::Sender<Frame>)>, map: &Subscriptions) {
+    parked.retain(|(id, _)| {
+        map.values()
+            .flatten()
+            .any(|entry| entry.id == *id && !entry.overflow.queue.is_empty())
+    });
+}
+
 /// Forward a frame to the connection-wide inbound channel without awaiting.
 /// A slow or absent `next_frame()` reader costs frames, never the I/O loop.
 fn forward_inbound(in_tx: &mpsc::Sender<Frame>, frame: Frame) {
@@ -1208,8 +1221,9 @@ impl Connection {
             const SUBSCRIPTION_ERROR_THRESHOLD: u32 = 3;
             // Subscriptions with frames parked in their overflow queue, by id,
             // each with a sender to wait on for capacity. Only a wake list: the
-            // queues themselves live on the entries in `subscriptions`, so a
-            // stale item here is harmless and is dropped at the next wake.
+            // queues themselves live on the entries in `subscriptions`, and the
+            // list is pruned against that registry (`prune_parked`) before
+            // every wait so a removed subscription does not linger here.
             let mut parked: Vec<(String, mpsc::Sender<Frame>)> = Vec::new();
 
             loop {
@@ -1311,6 +1325,22 @@ impl Connection {
                     p.clear();
                 }
 
+                // The same goes for parked frames. In the client ack modes the
+                // broker redelivers what was never acknowledged, and an ack for
+                // the old copy would name a message this session does not
+                // know, so discard them. In `auto` mode the broker considers
+                // them delivered and will not send them again, so keep them.
+                {
+                    let mut map = subscriptions.lock().await;
+                    for entry in map.values_mut().flatten() {
+                        if entry.ack != "auto" && !entry.overflow.queue.is_empty() {
+                            entry.overflow.queue.clear();
+                            entry.overflow.warned = false;
+                        }
+                    }
+                    prune_parked(&mut parked, &map);
+                }
+
                 // Resubscribe any existing subscriptions after reconnect.
                 // We snapshot the subscription entries while holding the lock
                 // and then issue SUBSCRIBE frames using the sink.
@@ -1366,6 +1396,10 @@ impl Connection {
                 let mut shutting_down = false;
 
                 'conn: loop {
+                    if !parked.is_empty() {
+                        let map = subscriptions.lock().await;
+                        prune_parked(&mut parked, &map);
+                    }
                     tokio::select! {
                         _ = shutdown_sub.recv() => { let _ = sink.close().await; shutting_down = true; break 'conn; }
                         maybe = out_rx.recv() => {
@@ -1463,9 +1497,13 @@ impl Connection {
                                         // `delivered` records whether any
                                         // subscription took the frame.
                                         let mut delivered = false;
+                                        let mut pruned: Vec<String> = Vec::new();
                                         let mut deliver = |entry: &mut SubscriptionEntry, dest: &str| {
                                             let keep = deliver_and_keep(entry, dest, &f);
                                             delivered |= keep;
+                                            if !keep {
+                                                pruned.push(entry.id.clone());
+                                            }
                                             if keep
                                                 && !entry.overflow.queue.is_empty()
                                                 && !parked.iter().any(|(id, _)| *id == entry.id)
@@ -1489,6 +1527,16 @@ impl Connection {
                                                 if vec.is_empty() {
                                                     map.remove(&dest);
                                                 }
+                                            }
+                                        }
+
+                                        // Nothing can ack for a pruned
+                                        // subscription: forget what was
+                                        // pending for it, this frame included.
+                                        if !pruned.is_empty() {
+                                            let mut p = pending_clone.lock().await;
+                                            for id in &pruned {
+                                                p.remove(id);
                                             }
                                         }
 
@@ -1586,21 +1634,23 @@ impl Connection {
                         // A parked subscription has room again (or its
                         // receiver is gone): move what fits into its channel.
                         sub_id = parked_capacity(&parked) => {
-                            let mut still_parked = false;
-                            let mut map = subscriptions.lock().await;
-                            for vec in map.values_mut() {
-                                vec.retain_mut(|entry| {
-                                    if entry.id != sub_id {
-                                        return true;
-                                    }
-                                    let keep = drain_overflow(entry);
-                                    still_parked = keep && !entry.overflow.queue.is_empty();
-                                    keep
-                                });
+                            let mut closed = false;
+                            {
+                                let mut map = subscriptions.lock().await;
+                                for vec in map.values_mut() {
+                                    vec.retain_mut(|entry| {
+                                        if entry.id != sub_id {
+                                            return true;
+                                        }
+                                        closed = !drain_overflow(entry);
+                                        !closed
+                                    });
+                                }
+                                map.retain(|_, vec| !vec.is_empty());
+                                prune_parked(&mut parked, &map);
                             }
-                            map.retain(|_, vec| !vec.is_empty());
-                            if !still_parked {
-                                parked.retain(|(id, _)| *id != sub_id);
+                            if closed {
+                                pending_clone.lock().await.remove(&sub_id);
                             }
                         }
                         _ = hb_tick.tick() => {
@@ -2653,6 +2703,59 @@ mod tests {
             !deliver_and_keep(&mut closed, "/queue/t", &msg(0)),
             "a closed channel (dropped receiver) must be pruned"
         );
+    }
+
+    #[tokio::test]
+    async fn message_for_a_closed_subscription_leaves_nothing_pending() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _connect = read_stomp_frame(&mut stream);
+            stream
+                .write_all(b"CONNECTED\nversion:1.2\nheart-beat:0,0\n\n\0")
+                .unwrap();
+
+            let subscribe = read_stomp_frame(&mut stream);
+            let sub_id = header_value(&subscribe, "id").to_string();
+            // By the time the SEND arrives the client has dropped the receiver.
+            let send = read_stomp_frame(&mut stream);
+            let receipt_id = header_value(&send, "receipt");
+            let reply = format!(
+                "MESSAGE\nsubscription:{sub_id}\nmessage-id:m1\ndestination:/queue/t\n\n\0\
+                 RECEIPT\nreceipt-id:{receipt_id}\n\n\0"
+            );
+            stream.write_all(reply.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(100));
+        });
+
+        let conn = connect_for_test(&addr).await;
+        let sub = conn
+            .subscribe("/queue/t", AckMode::ClientIndividual)
+            .await
+            .unwrap();
+        // The entry stays registered; only the closed channel gives it away.
+        drop(sub.into_receiver());
+
+        conn.send_frame_confirmed(
+            Frame::new("SEND").header("destination", "/queue/out"),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            conn.subscriptions.lock().await.is_empty(),
+            "the closed subscription must be pruned"
+        );
+        assert!(
+            conn.pending.lock().await.is_empty(),
+            "a pruned subscription must not leave a pending message behind"
+        );
+
+        let _ = conn.close().await;
+        server.join().unwrap();
     }
 
     #[tokio::test]
