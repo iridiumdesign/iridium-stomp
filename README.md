@@ -310,9 +310,11 @@ handshake and protocol failures are retried with exponential backoff.
   without checking connection stability (they do not trigger a backoff reset).
 
 Subscriptions are re-established automatically. In the `client` and
-`client-individual` ack modes the broker redelivers whatever was not
-acknowledged, so a message that was already in a subscription's channel at
-the moment of the reconnect is seen twice; consumers should be idempotent.
+`client-individual` ack modes, where the destination keeps unacknowledged
+messages for the subscriber (a queue, or a durable topic subscription), the
+broker redelivers them, so a message that was already in a subscription's
+channel at the moment of the reconnect is seen twice; consumers should be
+idempotent.
 See [what a consumer sees across a reconnect](docs/subscriber-guide.md#what-a-consumer-sees-across-a-reconnect)
 for each ack mode.
 

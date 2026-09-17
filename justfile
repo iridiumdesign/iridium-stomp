@@ -4,9 +4,12 @@
 # `just check` passes locally, CI passes too; if the two ever disagree,
 # the workflow is the authority and this file is the bug.
 #
-# The one thing this cannot mirror is CI's smoke job, which stands up a
-# RabbitMQ with STOMP baked in. `just smoke` does that here, and it
-# needs a container runtime — see the `brokers` group.
+# Two CI jobs are not in `just check`. The smoke job stands up a
+# RabbitMQ with STOMP baked in; `just smoke` does that here, and it
+# needs a container runtime — see the `brokers` group. The
+# minimal-versions job needs a nightly toolchain and is allowed to fail
+# in CI, because it informs rather than gates; `just minimal-versions`
+# runs it here, and it is worth doing before a release.
 
 # The floor in Cargo.toml. Named once here so `just msrv` and the
 # rust-version field cannot drift apart silently.
@@ -128,7 +131,7 @@ minimal-versions:
     export CARGO_TARGET_DIR="$PWD/target/minimal-versions"
     cd "$tmp"
     cargo +nightly update -Z direct-minimal-versions
-    cargo +{{ MSRV }} build --all-features
+    cargo +{{ MSRV }} build --all-features --all-targets
     cargo +{{ MSRV }} test --all-features
 
 [doc('The gate: everything CI runs except the broker smoke test.')]

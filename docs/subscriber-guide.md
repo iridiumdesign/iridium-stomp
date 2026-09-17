@@ -141,18 +141,26 @@ period with no messages.
 ### What a consumer sees across a reconnect
 
 Subscriptions are re-established automatically in every ack mode. What
-happens to messages depends on the mode:
+happens to messages depends on the mode, and on whether the destination
+keeps messages for a subscriber that is away. A queue does, and so does a
+durable topic subscription; a plain topic does not, and nothing the ack mode
+says can make it. See "What is lost on reconnect" above.
 
 - **`AckMode::Auto`.** The broker counted each message as delivered when it
-  sent it, so anything it sent while the connection was down is lost. Frames
-  that had already reached the library are still delivered: those in the
-  subscription's channel, and those parked behind it for a slow consumer.
-- **`AckMode::Client` and `AckMode::ClientIndividual`.** The broker redelivers
-  everything that was not acknowledged. The library forgets its pending ACKs
+  sent it, and will not send it again. A message it had sent that never
+  reached the library is lost. Messages it had not yet sent are the
+  destination's business: a queue holds them for the resubscribe, a plain
+  topic does not. Frames that had already reached the library are still
+  delivered: those in the subscription's channel, and those parked behind it
+  for a slow consumer.
+- **`AckMode::Client` and `AckMode::ClientIndividual`.** Where the
+  destination keeps them, the broker redelivers the messages that were not
+  acknowledged. The library forgets its pending ACKs
   and discards the frames it had parked for a slow consumer, precisely
   because they are coming again. It cannot take back a frame that was already
-  in the subscription's channel, so that frame is seen **twice**: once from
-  the channel, then again redelivered. Acknowledging the first copy does
+  in the subscription's channel, so on such a destination that frame is seen
+  **twice**: once from the channel, then again redelivered. On a plain topic
+  it is seen once, and whatever was not yet in the channel is gone. Acknowledging the first copy does
   nothing useful, because its id belongs to the old session; the ACK is still
   sent, and the broker ignores it or answers with an ERROR on
   `conn.next_frame()`. Acknowledge the redelivered copy, and make message

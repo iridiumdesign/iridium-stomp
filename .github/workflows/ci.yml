@@ -219,7 +219,7 @@ jobs:
 
       - name: Build and test on the MSRV
         run: |
-          cargo +1.88 build --all-features
+          cargo +1.88 build --all-features --all-targets
           cargo +1.88 test --all-features
 
   build-examples:
