@@ -80,6 +80,7 @@ fn test_subscription_options_broker_specific_headers() {
             ("selector".to_string(), "priority > 5".to_string()),
             ("activemq.noLocal".to_string(), "true".to_string()),
         ],
+        ..Default::default()
     };
 
     assert_eq!(
@@ -120,6 +121,7 @@ fn test_subscription_options_ergonomics() {
     // Clone should preserve all fields
     let opts = SubscriptionOptions {
         headers: vec![("key".to_string(), "value".to_string())],
+        ..Default::default()
     };
 
     let cloned = opts.clone();
@@ -276,6 +278,7 @@ fn test_durable_subscription_example_compiles() {
         //         ("activemq.subscriptionName".into(), "my-durable-sub".into()),
         //         ("selector".into(), "priority > 5".into()),
         //     ],
+        //     ..Default::default()
         // };
         //
         // let sub = conn.subscribe_with_options(

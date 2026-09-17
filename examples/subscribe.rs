@@ -21,7 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // headers. On brokers where the durable queue is declared
     // administratively, such as RabbitMQ, name it as the destination and no
     // extra headers are needed.
-    let opts = SubscriptionOptions { headers: vec![] };
+    let opts = SubscriptionOptions::default();
 
     let mut sub = conn
         .subscribe_with_options("/queue/example-durable", AckMode::Client, opts)

@@ -239,6 +239,7 @@ let sub_opts = SubscriptionOptions {
     headers: vec![
         ("activemq.subscriptionName".into(), "my-durable-sub".into()),
     ],
+    ..Default::default()
 };
 
 // Subscribe to multiple durable topics
@@ -253,6 +254,7 @@ for (dest, sub_name) in &topics {
         headers: vec![
             ("activemq.subscriptionName".into(), (*sub_name).into()),
         ],
+        ..Default::default()
         };
     subs.push(conn.subscribe_with_options(dest, AckMode::ClientIndividual, sub_opts).await?);
 }
@@ -296,6 +298,10 @@ conn.close().await?;
 only yields `MESSAGE` frames routed to that subscription. Broker ERRORs go to a
 separate channel and are only visible via `conn.next_frame()`, which returns a
 `ReceivedFrame` enum.
+
+That channel is best effort: it holds 32 frames, the library never waits on
+it, and a frame that finds it full is dropped with a warning in the log. An
+application that needs every ERROR must keep reading `next_frame()`.
 
 To catch them, run a separate task alongside your subscriber loop:
 

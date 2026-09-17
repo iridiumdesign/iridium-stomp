@@ -43,6 +43,7 @@ let opts = SubscriptionOptions {
         "activemq.subscriptionName".to_string(),
         "my-durable-sub".to_string(),
     )],
+    ..Default::default()
 };
 
 let sub = conn
@@ -82,8 +83,37 @@ let sub = conn
 | Field | Type | Purpose |
 |-------|------|---------|
 | `headers` | `Vec<(String, String)>` | Extra headers included on the SUBSCRIBE frame (e.g., broker-specific durable subscription names). |
+| `channel_capacity` | `Option<usize>` | Frames the subscription's channel holds. `None` means `SubscriptionOptions::DEFAULT_CHANNEL_CAPACITY` (16), which is also what `subscribe` and `subscribe_with_headers` use. |
+| `overflow_limit` | `Option<usize>` | Most messages that may be parked behind a full channel before the subscription is failed. `None` means `SubscriptionOptions::DEFAULT_OVERFLOW_LIMIT` (1024), which is also what `subscribe` and `subscribe_with_headers` use. `Some(0)` allows no parking. |
 
 Headers are preserved internally and replayed on reconnect.
+
+A full channel does not lose messages. While a consumer is behind, the
+connection parks further messages for that subscription and moves them into
+the channel, in order, as room appears; other subscriptions, heartbeats and
+receipts carry on meanwhile.
+
+Parking is bounded by `overflow_limit`. A message that would take the parked
+queue past it means the consumer is treated as stalled, and the subscription
+is **failed** rather than left to grow until the process runs out of memory:
+
+- The library sends UNSUBSCRIBE and forgets the subscription; it is not
+  resubscribed after a reconnect.
+- The parked messages, and the one that tripped the limit, are discarded.
+  With `AckMode::Client` and `AckMode::ClientIndividual` none of them was
+  acknowledged, so the broker redelivers them to the next subscriber. With
+  `AckMode::Auto` the broker already counts them delivered, and they are
+  lost.
+- The `Subscription` stream yields what was already in its channel and then
+  ends (`None`), so a `while let Some(..)` loop stops instead of hanging.
+- `conn.next_frame()` yields a synthetic ERROR with `x-overflow: true` and
+  the `destination` and `subscription` headers, and the failure is logged
+  with `tracing::error!`.
+
+Before that point the library logs a `tracing::warn!` when a subscription
+starts parking and each time the parked depth doubles (the channel capacity,
+twice that, and so on). In the client ack modes the broker's flow control
+normally keeps the queue far below the default limit.
 
 STOMP has no durable-subscription concept of its own, so durability is
 whatever the broker defines it to be. On ActiveMQ that is a header such as
@@ -130,6 +160,10 @@ To stop receiving messages, call `Subscription::unsubscribe` or simply drop
 the handle. Either way the library sends an UNSUBSCRIBE frame and removes the
 subscription from its internal tracking so it will not be resubscribed on
 reconnect.
+
+Messages of an `AckMode::Client` or `AckMode::ClientIndividual` subscription
+that were delivered but not yet acknowledged are forgotten locally at that
+point. They are not lost: the broker redelivers them to the next subscriber.
 
 `unsubscribe` is the explicit form and reports whether the frame was queued.
 Dropping the handle does the same on a best-effort basis — it cannot report an

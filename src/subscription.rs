@@ -24,6 +24,7 @@ use tokio::sync::mpsc;
 ///         "activemq.subscriptionName".to_string(),
 ///         "my-durable-sub".to_string(),
 ///     )],
+///     ..Default::default()
 /// };
 /// ```
 ///
@@ -34,6 +35,75 @@ use tokio::sync::mpsc;
 pub struct SubscriptionOptions {
     /// Extra headers to include on the SUBSCRIBE frame.
     pub headers: Vec<(String, String)>,
+    /// Capacity of the channel between the connection's background task and
+    /// this subscription's receiver, in frames. `None` (the default) means
+    /// [`DEFAULT_CHANNEL_CAPACITY`](Self::DEFAULT_CHANNEL_CAPACITY); zero is
+    /// treated as one.
+    ///
+    /// When the channel is full, further messages are parked inside the
+    /// connection and moved into the channel, in order, as the consumer frees
+    /// room, so a consumer that is merely slow loses nothing. A larger
+    /// capacity only means fewer frames take the detour. How much may be
+    /// parked is set by [`overflow_limit`](Self::overflow_limit).
+    pub channel_capacity: Option<usize>,
+    /// Most messages that may be parked for this subscription behind a full
+    /// channel. `None` (the default) means
+    /// [`DEFAULT_OVERFLOW_LIMIT`](Self::DEFAULT_OVERFLOW_LIMIT). It counts
+    /// parked frames only, not those in the channel, and applies in every ack
+    /// mode. Zero means no parking: the first message to find the channel full
+    /// trips the limit.
+    ///
+    /// A message that would take the parked queue past the limit fails the
+    /// subscription, because a consumer that far behind is treated as stalled
+    /// and the alternative is to grow until the process runs out of memory.
+    /// The library then:
+    ///
+    /// - logs the failure with `tracing::error!`;
+    /// - sends UNSUBSCRIBE and forgets the subscription, so it is not
+    ///   resubscribed after a reconnect;
+    /// - discards the parked messages and the one that tripped the limit. In
+    ///   the `client` and `client-individual` ack modes none of them was
+    ///   acknowledged, so the broker redelivers them to the next subscriber.
+    ///   In `auto` mode the broker already counts them delivered and they are
+    ///   lost;
+    /// - ends the [`Subscription`] stream: it yields what was already in its
+    ///   channel and then `None`;
+    /// - puts a synthetic ERROR frame on [`Connection::next_frame`] carrying
+    ///   `x-overflow: true` and the `destination` and `subscription` headers.
+    ///
+    /// In the client ack modes the broker's flow control normally keeps the
+    /// queue far below the default.
+    pub overflow_limit: Option<usize>,
+}
+
+impl SubscriptionOptions {
+    /// Channel capacity used when `channel_capacity` is `None`, and by
+    /// `Connection::subscribe` and `Connection::subscribe_with_headers`.
+    pub const DEFAULT_CHANNEL_CAPACITY: usize = 16;
+
+    /// Overflow limit used when `overflow_limit` is `None`, and by
+    /// `Connection::subscribe` and `Connection::subscribe_with_headers`.
+    pub const DEFAULT_OVERFLOW_LIMIT: usize = 1024;
+
+    /// Set extra headers to include on the SUBSCRIBE frame.
+    pub fn headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    /// Set the capacity of the subscription's channel. See
+    /// [`channel_capacity`](Self::channel_capacity).
+    pub fn channel_capacity(mut self, capacity: usize) -> Self {
+        self.channel_capacity = Some(capacity);
+        self
+    }
+
+    /// Set how many messages may be parked behind a full channel before the
+    /// subscription is failed. See [`overflow_limit`](Self::overflow_limit).
+    pub fn overflow_limit(mut self, limit: usize) -> Self {
+        self.overflow_limit = Some(limit);
+        self
+    }
 }
 
 /// A lightweight handle returned from `Connection::subscribe` that packages the

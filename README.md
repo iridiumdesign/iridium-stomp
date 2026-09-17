@@ -162,6 +162,7 @@ let options = SubscriptionOptions {
         ("activemq.subscriptionName".into(), "my-durable-sub".into()),
         ("selector".into(), "priority > 5".into()),
     ],
+    ..Default::default()
 };
 
 let sub = conn.subscribe_with_options("/topic/events", AckMode::Client, options).await?;
