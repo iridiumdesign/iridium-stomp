@@ -555,3 +555,200 @@ async fn unsubscribe_releases_a_parked_subscription() {
     assert_eq!(rx.recv().await.unwrap().get_header("message-id"), Some("0"));
     assert!(rx.recv().await.is_none(), "parked frames go with the entry");
 }
+
+// ============================================================================
+// The overflow limit
+// ============================================================================
+
+/// The next frame on `next_frame()` must be the overflow notice for `sub_id`.
+async fn expect_overflow_error(conn: &Connection, sub_id: &str, destination: &str) {
+    let received = tokio::time::timeout(Duration::from_secs(2), conn.next_frame())
+        .await
+        .expect("an overflowed subscription must be reported on next_frame()");
+    match received {
+        Some(ReceivedFrame::Error(err)) => {
+            assert_eq!(err.frame.get_header("x-overflow"), Some("true"));
+            assert_eq!(err.frame.get_header("subscription"), Some(sub_id));
+            assert_eq!(err.frame.get_header("destination"), Some(destination));
+        }
+        other => panic!("expected the x-overflow ERROR, got {other:?}"),
+    }
+}
+
+/// Nothing further may be waiting on `next_frame()`.
+async fn expect_inbound_quiet(conn: &Connection) {
+    let stray = tokio::time::timeout(Duration::from_millis(200), conn.next_frame()).await;
+    assert!(
+        stray.is_err(),
+        "unexpected frame on next_frame(): {stray:?}"
+    );
+}
+
+/// Wait for the broker to have seen an UNSUBSCRIBE for `sub_id`.
+async fn expect_unsubscribe(seen: &Seen, sub_id: &str) {
+    for _ in 0..100 {
+        let found = seen
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|f| f.starts_with("UNSUBSCRIBE") && header(f, "id") == Some(sub_id));
+        if found {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("the broker never saw UNSUBSCRIBE for subscription {sub_id}");
+}
+
+#[tokio::test]
+async fn stalled_consumer_fails_the_subscription_at_the_overflow_limit() {
+    let (addr, seen) = start_broker(|raw| match header(raw, "id") {
+        Some(id) if raw.starts_with("SUBSCRIBE") => messages(id, "/queue/t", 0, 500),
+        _ => Vec::new(),
+    });
+    let conn = connect(&addr).await;
+    let opts = SubscriptionOptions::default()
+        .channel_capacity(2)
+        .overflow_limit(5);
+    let sub = conn
+        .subscribe_with_options("/queue/t", AckMode::Auto, opts)
+        .await
+        .unwrap();
+    let id = sub.id().to_string();
+    // Held, and never read while the burst arrives.
+    let mut rx = sub.into_receiver();
+
+    // The whole burst was read off the socket and the connection is healthy.
+    conn.send_frame_confirmed(send_to("/queue/out"), Duration::from_secs(2))
+        .await
+        .expect("RECEIPT must arrive after a subscription overflows");
+
+    expect_unsubscribe(&seen, &id).await;
+
+    // The consumer gets what was already in its channel, then the end.
+    for n in 0..2 {
+        assert_eq!(
+            rx.recv().await.unwrap().get_header("message-id"),
+            Some(n.to_string().as_str())
+        );
+    }
+    assert!(
+        rx.recv().await.is_none(),
+        "a failed subscription must end, and parked frames must be discarded"
+    );
+
+    // One notice, and none of the burst.
+    expect_overflow_error(&conn, &id, "/queue/t").await;
+    expect_inbound_quiet(&conn).await;
+}
+
+#[tokio::test]
+async fn overflowing_subscription_does_not_disturb_another() {
+    let (addr, seen) = start_broker(|raw| match header(raw, "destination") {
+        Some("/queue/stalled") if raw.starts_with("SUBSCRIBE") => {
+            messages(header(raw, "id").unwrap(), "/queue/stalled", 0, 100)
+        }
+        Some("/queue/live") if raw.starts_with("SUBSCRIBE") => {
+            messages(header(raw, "id").unwrap(), "/queue/live", 0, 100)
+        }
+        _ => Vec::new(),
+    });
+    let conn = connect(&addr).await;
+
+    let opts = SubscriptionOptions::default()
+        .channel_capacity(1)
+        .overflow_limit(2);
+    let stalled = conn
+        .subscribe_with_options("/queue/stalled", AckMode::ClientIndividual, opts)
+        .await
+        .unwrap();
+    let stalled_id = stalled.id().to_string();
+    let _held = stalled.into_receiver();
+
+    let mut live = conn
+        .subscribe("/queue/live", AckMode::ClientIndividual)
+        .await
+        .unwrap();
+    for n in 0..100 {
+        let frame = next_id(&mut live, n).await;
+        live.ack(frame.get_header("message-id").unwrap())
+            .await
+            .unwrap();
+    }
+
+    expect_unsubscribe(&seen, &stalled_id).await;
+    expect_overflow_error(&conn, &stalled_id, "/queue/stalled").await;
+    expect_inbound_quiet(&conn).await;
+    conn.send_frame_confirmed(send_to("/queue/out"), Duration::from_secs(2))
+        .await
+        .unwrap();
+    assert_eq!(seen.count("ACK"), 100);
+}
+
+#[tokio::test]
+async fn overflow_limit_defaults_to_1024() {
+    assert_eq!(SubscriptionOptions::DEFAULT_OVERFLOW_LIMIT, 1024);
+
+    // The default channel holds 16, so 16 + 1024 messages fit exactly.
+    const FITS: usize =
+        SubscriptionOptions::DEFAULT_CHANNEL_CAPACITY + SubscriptionOptions::DEFAULT_OVERFLOW_LIMIT;
+    let mut sub_id = String::new();
+    let (addr, _seen) = start_broker(move |raw| {
+        if raw.starts_with("SUBSCRIBE") {
+            sub_id = header(raw, "id").unwrap().to_string();
+            messages(&sub_id, "/queue/t", 0, FITS)
+        } else if header(raw, "destination") == Some("/control/one-more") {
+            messages(&sub_id, "/queue/t", FITS, 1)
+        } else {
+            Vec::new()
+        }
+    });
+    let conn = connect(&addr).await;
+    let sub = conn.subscribe("/queue/t", AckMode::Auto).await.unwrap();
+    let id = sub.id().to_string();
+    let mut rx = sub.into_receiver();
+
+    conn.send_frame_confirmed(send_to("/queue/out"), Duration::from_secs(5))
+        .await
+        .unwrap();
+    expect_inbound_quiet(&conn).await;
+    assert!(!rx.is_closed(), "at the limit is not past it");
+
+    conn.send_frame_confirmed(send_to("/control/one-more"), Duration::from_secs(2))
+        .await
+        .unwrap();
+    expect_overflow_error(&conn, &id, "/queue/t").await;
+
+    let mut count = 0;
+    while rx.recv().await.is_some() {
+        count += 1;
+    }
+    assert_eq!(count, SubscriptionOptions::DEFAULT_CHANNEL_CAPACITY);
+}
+
+#[tokio::test]
+async fn overflow_limit_of_zero_allows_no_parking() {
+    let (addr, seen) = start_broker(|raw| match header(raw, "id") {
+        Some(id) if raw.starts_with("SUBSCRIBE") => messages(id, "/queue/t", 0, 2),
+        _ => Vec::new(),
+    });
+    let conn = connect(&addr).await;
+    let opts = SubscriptionOptions {
+        channel_capacity: Some(1),
+        overflow_limit: Some(0),
+        ..Default::default()
+    };
+    let sub = conn
+        .subscribe_with_options("/queue/t", AckMode::Auto, opts)
+        .await
+        .unwrap();
+    let id = sub.id().to_string();
+    let mut rx = sub.into_receiver();
+
+    // The second message finds the channel full, and that is already too many.
+    expect_overflow_error(&conn, &id, "/queue/t").await;
+    expect_unsubscribe(&seen, &id).await;
+    assert_eq!(rx.recv().await.unwrap().get_header("message-id"), Some("0"));
+    assert!(rx.recv().await.is_none());
+}
