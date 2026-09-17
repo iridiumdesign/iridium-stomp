@@ -97,12 +97,8 @@ let conn = Connection::connect_with_options(
     options,
 ).await?;
 
-let opts = SubscriptionOptions {
-    headers: vec![
-        ("activemq.subscriptionName".to_string(), "my-durable-sub".to_string()),
-    ],
-    ..Default::default()
-};
+let opts = SubscriptionOptions::new()
+    .header("activemq.subscriptionName", "my-durable-sub");
 
 let sub = conn
     .subscribe_with_options("/topic/my-topic", AckMode::Client, opts)

@@ -274,7 +274,7 @@ fn pattern_match_frame() {
             assert_eq!(f.command, "MESSAGE");
             assert_eq!(f.get_header("destination"), Some("/queue/test"));
         }
-        ReceivedFrame::Error(_) => panic!("Expected Frame, got Error"),
+        other => panic!("Expected Frame, got {:?}", other),
     }
 }
 
@@ -292,6 +292,7 @@ fn pattern_match_error() {
             assert_eq!(e.message, "authentication failed");
             assert_eq!(e.body, Some("Bad credentials".to_string()));
         }
+        other => panic!("Expected Error, got {:?}", other),
     }
 }
 

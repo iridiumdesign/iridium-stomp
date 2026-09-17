@@ -212,6 +212,7 @@ pub(crate) type PendingReceipts = HashMap<String, oneshot::Sender<Result<(), Ser
 
 /// Errors returned by `Connection` operations.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum ConnError {
     /// I/O-level error
     #[error("io error: {0}")]
@@ -244,9 +245,10 @@ pub enum ConnError {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```no_run
 /// use iridium_stomp::ReceivedFrame;
 ///
+/// # async fn example(conn: iridium_stomp::Connection) {
 /// while let Some(received) = conn.next_frame().await {
 ///     match received {
 ///         ReceivedFrame::Frame(frame) => {
@@ -259,10 +261,14 @@ pub enum ConnError {
 ///             }
 ///             break;
 ///         }
+///         // `ReceivedFrame` is non-exhaustive.
+///         _ => {}
 ///     }
 /// }
+/// # }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ServerError {
     /// The error message from the `message` header.
     pub message: String,
@@ -325,9 +331,10 @@ impl std::error::Error for ServerError {}
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```no_run
 /// use iridium_stomp::ReceivedFrame;
 ///
+/// # async fn example(conn: iridium_stomp::Connection) {
 /// match conn.next_frame().await {
 ///     Some(ReceivedFrame::Frame(frame)) => {
 ///         println!("Got frame: {}", frame.command);
@@ -335,12 +342,16 @@ impl std::error::Error for ServerError {}
 ///     Some(ReceivedFrame::Error(err)) => {
 ///         eprintln!("Server error: {}", err);
 ///     }
+///     // `ReceivedFrame` is non-exhaustive.
+///     Some(_) => {}
 ///     None => {
 ///         println!("Connection closed");
 ///     }
 /// }
+/// # }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ReceivedFrame {
     /// A normal STOMP frame (MESSAGE, RECEIPT, etc.)
     Frame(Frame),
@@ -378,6 +389,7 @@ impl ReceivedFrame {
 
 /// Subscription acknowledgement modes as defined by STOMP 1.2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AckMode {
     /// Server considers the message delivered as soon as it is sent (no
     /// explicit acknowledgement required from the client).
@@ -438,6 +450,7 @@ impl AckMode {
 /// ).await?;
 /// ```
 #[derive(Clone, Default)]
+#[non_exhaustive]
 pub struct ConnectOptions {
     /// STOMP version(s) to accept (e.g., "1.2" or "1.0,1.1,1.2").
     /// Defaults to "1.2" if not set.
@@ -927,6 +940,9 @@ pub struct Connection {
     shutdown_tx: broadcast::Sender<()>,
     /// Map of destination -> list of (subscription id, sender) for dispatching
     /// inbound MESSAGE frames to subscribers.
+    ///
+    /// Lock rule: never hold this and `pending` at the same time. Read what
+    /// you need, release, then take the other (#124).
     subscriptions: Arc<Mutex<Subscriptions>>,
     /// Monotonic counter used to allocate subscription ids.
     sub_id_counter: Arc<AtomicU64>,
@@ -937,6 +953,8 @@ pub struct Connection {
     /// all messages previously delivered for `S` up to and including `M`.
     /// For `client-individual` the ACK/NACK applies only to the single
     /// message.
+    ///
+    /// Lock rule: never hold this and `subscriptions` at the same time.
     pending: Arc<Mutex<PendingMap>>,
     /// Pending receipt confirmations.
     ///
@@ -1595,12 +1613,21 @@ impl Connection {
                                                 // Destination-based delivery: add the message to
                                                 // the pending queue for each matching
                                                 // subscription on that destination.
-                                                let map = subscriptions.lock().await;
-                                                if let Some(vec) = map.get(dest) {
+                                                // Collect the ids and let go
+                                                // of the registry before taking
+                                                // `pending`: the two locks are
+                                                // never held together.
+                                                let ids: Vec<String> = {
+                                                    let map = subscriptions.lock().await;
+                                                    map.get(dest)
+                                                        .map(|vec| vec.iter().map(|entry| entry.id.clone()).collect())
+                                                        .unwrap_or_default()
+                                                };
+                                                if !ids.is_empty() {
                                                     let mut p = pending_clone.lock().await;
-                                                    for entry in vec.iter() {
+                                                    for id in ids {
                                                         let q = p
-                                                            .entry(entry.id.clone())
+                                                            .entry(id)
                                                             .or_insert_with(VecDeque::new);
                                                         q.push_back((msg_id.clone(), f.clone()));
                                                     }
@@ -1678,8 +1705,8 @@ impl Connection {
                                         // only under ids it found registered,
                                         // so a live subscription's queue is
                                         // never swept. The registry lock is
-                                        // released first: `ack` takes the two
-                                        // locks in the other order.
+                                        // released first: the two locks are
+                                        // never held together.
                                         if let Some(live) = live {
                                             let mut p = pending_clone.lock().await;
                                             if !p.is_empty() {
@@ -2114,21 +2141,15 @@ impl Connection {
             .await
     }
 
-    /// Subscribe to a destination.
-    ///
-    /// Parameters
-    /// - `destination`: the STOMP destination to subscribe to (e.g. "/queue/foo").
-    /// - `ack`: acknowledgement mode to request from the server.
-    ///
-    /// Returns a tuple `(subscription_id, receiver)` where `subscription_id` is
-    /// the opaque id assigned locally for this subscription and `receiver` is a
-    /// `mpsc::Receiver<Frame>` which will yield incoming MESSAGE frames for the
-    /// destination. The caller should read from the receiver to handle messages.
     /// Subscribe to a destination using optional extra headers.
     ///
     /// This variant accepts additional headers which are stored locally and
     /// re-sent on reconnect. Use `subscribe` as a convenience wrapper when no
     /// extra headers are needed.
+    ///
+    /// Returns a [`Subscription`](crate::Subscription): a `Stream` of the
+    /// MESSAGE frames delivered to it, which also carries the subscription id
+    /// and the `ack`/`nack`/`unsubscribe` helpers.
     pub async fn subscribe_with_headers(
         &self,
         destination: &str,
@@ -2195,7 +2216,12 @@ impl Connection {
         ))
     }
 
-    /// Convenience wrapper without extra headers.
+    /// Subscribe to a destination (e.g. "/queue/foo") with the given ack mode
+    /// and no extra headers.
+    ///
+    /// Returns a [`Subscription`](crate::Subscription): a `Stream` of the
+    /// MESSAGE frames delivered to it, which also carries the subscription id
+    /// and the `ack`/`nack`/`unsubscribe` helpers.
     pub async fn subscribe(
         &self,
         destination: &str,
@@ -2214,6 +2240,10 @@ impl Connection {
     /// `SubscriptionOptions.channel_capacity` sizes the subscription's channel
     /// and `SubscriptionOptions.overflow_limit` bounds what may be parked
     /// behind it.
+    ///
+    /// Returns a [`Subscription`](crate::Subscription): a `Stream` of the
+    /// MESSAGE frames delivered to it, which also carries the subscription id
+    /// and the `ack`/`nack`/`unsubscribe` helpers.
     pub async fn subscribe_with_options(
         &self,
         destination: &str,
@@ -2328,24 +2358,25 @@ impl Connection {
     pub async fn ack(&self, subscription_id: &str, message_id: &str) -> Result<(), ConnError> {
         // Remove from the local pending queue according to subscription ack mode.
         let mut removed_any = false;
+        // Determine ack mode for this subscription (default to client). Read
+        // and released before `pending` is taken: the two locks are never
+        // held together.
+        let mut ack_mode = "client".to_string();
+        {
+            let map = self.subscriptions.lock().await;
+            'outer: for vec in map.values() {
+                for entry in vec.iter() {
+                    if entry.id == subscription_id {
+                        ack_mode = entry.ack.clone();
+                        break 'outer;
+                    }
+                }
+            }
+        }
         {
             let mut p = self.pending.lock().await;
             if let Some(queue) = p.get_mut(subscription_id) {
                 if let Some(pos) = queue.iter().position(|(mid, _)| mid == message_id) {
-                    // Determine ack mode for this subscription (default to client).
-                    let mut ack_mode = "client".to_string();
-                    {
-                        let map = self.subscriptions.lock().await;
-                        'outer: for vec in map.values() {
-                            for entry in vec.iter() {
-                                if entry.id == subscription_id {
-                                    ack_mode = entry.ack.clone();
-                                    break 'outer;
-                                }
-                            }
-                        }
-                    }
-
                     if ack_mode == "client" {
                         // cumulative: remove up to and including pos
                         for _ in 0..=pos {
@@ -2395,23 +2426,23 @@ impl Connection {
     pub async fn nack(&self, subscription_id: &str, message_id: &str) -> Result<(), ConnError> {
         // Mirror ack removal semantics for pending map.
         let mut removed_any = false;
+        // As in `ack`: read the mode, release, then take `pending`.
+        let mut ack_mode = "client".to_string();
+        {
+            let map = self.subscriptions.lock().await;
+            'outer2: for vec in map.values() {
+                for entry in vec.iter() {
+                    if entry.id == subscription_id {
+                        ack_mode = entry.ack.clone();
+                        break 'outer2;
+                    }
+                }
+            }
+        }
         {
             let mut p = self.pending.lock().await;
             if let Some(queue) = p.get_mut(subscription_id) {
                 if let Some(pos) = queue.iter().position(|(mid, _)| mid == message_id) {
-                    let mut ack_mode = "client".to_string();
-                    {
-                        let map = self.subscriptions.lock().await;
-                        'outer2: for vec in map.values() {
-                            for entry in vec.iter() {
-                                if entry.id == subscription_id {
-                                    ack_mode = entry.ack.clone();
-                                    break 'outer2;
-                                }
-                            }
-                        }
-                    }
-
                     if ack_mode == "client" {
                         for _ in 0..=pos {
                             queue.pop_front();
@@ -2524,9 +2555,10 @@ impl Connection {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```no_run
     /// use iridium_stomp::ReceivedFrame;
     ///
+    /// # async fn example(conn: iridium_stomp::Connection) {
     /// while let Some(received) = conn.next_frame().await {
     ///     match received {
     ///         ReceivedFrame::Frame(frame) => {
@@ -2536,8 +2568,11 @@ impl Connection {
     ///             eprintln!("Server error: {}", err);
     ///             break;
     ///         }
+    ///         // `ReceivedFrame` is non-exhaustive.
+    ///         _ => {}
     ///     }
     /// }
+    /// # }
     /// ```
     pub async fn next_frame(&self) -> Option<ReceivedFrame> {
         let mut rx = self.inbound_rx.lock().await;
