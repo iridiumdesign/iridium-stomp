@@ -1616,11 +1616,22 @@ impl Connection {
                                                 // Collect the ids and let go
                                                 // of the registry before taking
                                                 // `pending`: the two locks are
-                                                // never held together.
+                                                // never held together. Only
+                                                // subscriptions that acknowledge:
+                                                // an `auto` one never drains a
+                                                // pending queue, whether it shares
+                                                // the destination or was added
+                                                // since `need_pending` was worked
+                                                // out.
                                                 let ids: Vec<String> = {
                                                     let map = subscriptions.lock().await;
                                                     map.get(dest)
-                                                        .map(|vec| vec.iter().map(|entry| entry.id.clone()).collect())
+                                                        .map(|vec| {
+                                                            vec.iter()
+                                                                .filter(|entry| entry.ack != "auto")
+                                                                .map(|entry| entry.id.clone())
+                                                                .collect()
+                                                        })
                                                         .unwrap_or_default()
                                                 };
                                                 if !ids.is_empty() {
