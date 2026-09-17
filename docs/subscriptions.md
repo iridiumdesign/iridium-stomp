@@ -161,6 +161,10 @@ the handle. Either way the library sends an UNSUBSCRIBE frame and removes the
 subscription from its internal tracking so it will not be resubscribed on
 reconnect.
 
+Messages of an `AckMode::Client` or `AckMode::ClientIndividual` subscription
+that were delivered but not yet acknowledged are forgotten locally at that
+point. They are not lost: the broker redelivers them to the next subscriber.
+
 `unsubscribe` is the explicit form and reports whether the frame was queued.
 Dropping the handle does the same on a best-effort basis — it cannot report an
 error, and because it runs from `Drop` it uses non-blocking `try_lock`/`try_send`

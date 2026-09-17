@@ -1495,7 +1495,21 @@ impl Connection {
                         _ = shutdown_sub.recv() => { let _ = sink.close().await; shutting_down = true; break 'conn; }
                         maybe = out_rx.recv() => {
                             match maybe {
-                                Some(item) => if sink.send(item).await.is_err() { break 'conn } else { writer_last_sent.store(current_millis(), Ordering::SeqCst); }
+                                Some(item) => {
+                                    // Nothing can ack for a subscription once its
+                                    // UNSUBSCRIBE goes out: forget what was pending
+                                    // for it. `unsubscribe` and a dropped
+                                    // `Subscription` try this themselves; here it
+                                    // cannot be missed or raced by a MESSAGE that
+                                    // was mid-delivery.
+                                    if let StompItem::Frame(frame) = &item
+                                        && frame.command == "UNSUBSCRIBE"
+                                        && let Some(id) = frame.get_header("id")
+                                    {
+                                        pending_clone.lock().await.remove(id);
+                                    }
+                                    if sink.send(item).await.is_err() { break 'conn } else { writer_last_sent.store(current_millis(), Ordering::SeqCst); }
+                                }
                                 None => break 'conn,
                             }
                         }
@@ -2193,6 +2207,10 @@ impl Connection {
     }
 
     /// Unsubscribe a previously created subscription by its local subscription id.
+    ///
+    /// Messages of a `client` or `client-individual` subscription that were
+    /// delivered but not yet acknowledged are forgotten locally; the broker
+    /// redelivers them to the next subscriber.
     pub async fn unsubscribe(&self, subscription_id: &str) -> Result<(), ConnError> {
         let mut found = false;
         {
@@ -2215,6 +2233,10 @@ impl Connection {
         if !found {
             return Err(ConnError::Protocol("subscription id not found".into()));
         }
+
+        // Nothing can ack for it any more; the background task does the same
+        // when the UNSUBSCRIBE goes out.
+        self.pending.lock().await.remove(subscription_id);
 
         let mut f = Frame::new("UNSUBSCRIBE");
         f = f.header("id", subscription_id);
@@ -2242,6 +2264,11 @@ impl Connection {
                 vec.retain(|entry| entry.id != subscription_id);
             }
             map.retain(|_, vec| !vec.is_empty());
+        }
+        // Same for its pending queue. If the lock is busy, the background task
+        // removes the queue when it writes the UNSUBSCRIBE below.
+        if let Ok(mut pending) = self.pending.try_lock() {
+            pending.remove(subscription_id);
         }
 
         let f = Frame::new("UNSUBSCRIBE").header("id", subscription_id);
@@ -3073,6 +3100,92 @@ mod tests {
 
         let _ = conn.close().await;
         server.join().unwrap();
+    }
+
+    /// Deliver three messages to a client-individual subscription, ack none,
+    /// let go of the subscription, and check `pending` forgot them (#117).
+    async fn pending_is_forgotten(explicit_unsubscribe: bool) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _connect = read_stomp_frame(&mut stream);
+            stream
+                .write_all(b"CONNECTED\nversion:1.2\nheart-beat:0,0\n\n\0")
+                .unwrap();
+
+            let subscribe = read_stomp_frame(&mut stream);
+            let sub_id = header_value(&subscribe, "id").to_string();
+            let mut burst = String::new();
+            for n in 0..3 {
+                burst.push_str(&format!(
+                    "MESSAGE\nsubscription:{sub_id}\nmessage-id:m{n}\ndestination:/queue/t\n\n\0"
+                ));
+            }
+            stream.write_all(burst.as_bytes()).unwrap();
+
+            // UNSUBSCRIBE, then the SEND whose receipt the client waits for.
+            loop {
+                let frame = read_stomp_frame(&mut stream);
+                if frame.starts_with("SEND") {
+                    let receipt_id = header_value(&frame, "receipt");
+                    let reply = format!("RECEIPT\nreceipt-id:{receipt_id}\n\n\0");
+                    stream.write_all(reply.as_bytes()).unwrap();
+                    stream.flush().unwrap();
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(100));
+        });
+
+        let conn = connect_for_test(&addr).await;
+        let mut sub = conn
+            .subscribe("/queue/t", AckMode::ClientIndividual)
+            .await
+            .unwrap();
+        let sub_id = sub.id().to_string();
+        for _ in 0..3 {
+            sub.next().await.unwrap();
+        }
+        assert_eq!(
+            conn.pending.lock().await.get(&sub_id).map(|q| q.len()),
+            Some(3)
+        );
+
+        if explicit_unsubscribe {
+            sub.unsubscribe().await.unwrap();
+            assert!(
+                !conn.pending.lock().await.contains_key(&sub_id),
+                "unsubscribe must forget the subscription's pending messages"
+            );
+        } else {
+            drop(sub);
+        }
+
+        // A round trip: the background task has written the UNSUBSCRIBE.
+        conn.send_frame_confirmed(
+            Frame::new("SEND").header("destination", "/queue/out"),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !conn.pending.lock().await.contains_key(&sub_id),
+            "no pending queue may outlive its subscription"
+        );
+
+        let _ = conn.close().await;
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_forgets_pending_messages() {
+        pending_is_forgotten(true).await;
+    }
+
+    #[tokio::test]
+    async fn dropping_a_subscription_forgets_pending_messages() {
+        pending_is_forgotten(false).await;
     }
 
     #[tokio::test]
