@@ -1640,10 +1640,12 @@ impl Connection {
                                         };
                                         // Ids still registered once the pass
                                         // is done, for the sweep below.
-                                        let live_ids = |map: &Subscriptions| -> Vec<String> {
+                                        // A set, so the sweep stays linear
+                                        // in the number of subscriptions.
+                                        let live_ids = |map: &Subscriptions| -> std::collections::HashSet<String> {
                                             map.values().flatten().map(|entry| entry.id.clone()).collect()
                                         };
-                                        let mut live: Option<Vec<String>> = None;
+                                        let mut live: Option<std::collections::HashSet<String>> = None;
                                         if let Some(sub_id) = sub_opt {
                                             let mut map = subscriptions.lock().await;
                                             for (dest, vec) in map.iter_mut() {
