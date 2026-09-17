@@ -299,6 +299,10 @@ only yields `MESSAGE` frames routed to that subscription. Broker ERRORs go to a
 separate channel and are only visible via `conn.next_frame()`, which returns a
 `ReceivedFrame` enum.
 
+That channel is best effort: it holds 32 frames, the library never waits on
+it, and a frame that finds it full is dropped with a warning in the log. An
+application that needs every ERROR must keep reading `next_frame()`.
+
 To catch them, run a separate task alongside your subscriber loop:
 
 ```rust

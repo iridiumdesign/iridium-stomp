@@ -145,6 +145,9 @@ pub(crate) struct Overflow {
     pub(crate) queue: VecDeque<Frame>,
     /// Most frames `queue` may hold. Zero means no parking at all.
     pub(crate) limit: usize,
+    /// Capacity the subscription's channel was created with; the first
+    /// depth at which growth is logged.
+    pub(crate) capacity: usize,
     /// Set once the first parked frame of an episode has been logged, so a
     /// consumer that stays behind is reported once rather than once per frame.
     /// Cleared when the queue drains to empty.
@@ -155,10 +158,11 @@ pub(crate) struct Overflow {
 }
 
 impl Overflow {
-    pub(crate) fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize, capacity: usize) -> Self {
         Self {
             queue: VecDeque::new(),
             limit,
+            capacity: capacity.max(1),
             warned: false,
             warn_at: 0,
         }
@@ -173,7 +177,10 @@ impl Overflow {
 
 impl Default for Overflow {
     fn default() -> Self {
-        Self::new(crate::subscription::SubscriptionOptions::DEFAULT_OVERFLOW_LIMIT)
+        Self::new(
+            crate::subscription::SubscriptionOptions::DEFAULT_OVERFLOW_LIMIT,
+            crate::subscription::SubscriptionOptions::DEFAULT_CHANNEL_CAPACITY,
+        )
     }
 }
 
@@ -800,7 +807,7 @@ fn park(entry: &mut SubscriptionEntry, destination: &str, frame: Frame) -> bool 
     let depth = entry.overflow.queue.len();
     if !entry.overflow.warned {
         entry.overflow.warned = true;
-        entry.overflow.warn_at = entry.sender.max_capacity();
+        entry.overflow.warn_at = entry.overflow.capacity;
         tracing::warn!(
             destination = %destination,
             subscription_id = %entry.id,
@@ -1610,16 +1617,12 @@ impl Connection {
                                         // `delivered` records whether any
                                         // subscription took the frame.
                                         let mut delivered = false;
-                                        let mut pruned: Vec<String> = Vec::new();
                                         // (subscription id, destination, limit)
                                         let mut overflowed: Vec<(String, String, usize)> = Vec::new();
                                         let mut deliver = |entry: &mut SubscriptionEntry, dest: &str| {
                                             let outcome = deliver_and_keep(entry, dest, &f);
                                             let keep = outcome == Delivery::Taken;
                                             delivered |= keep;
-                                            if !keep {
-                                                pruned.push(entry.id.clone());
-                                            }
                                             if outcome == Delivery::Overflowed {
                                                 overflowed.push((
                                                     entry.id.clone(),
@@ -1635,6 +1638,12 @@ impl Connection {
                                             }
                                             keep
                                         };
+                                        // Ids still registered once the pass
+                                        // is done, for the sweep below.
+                                        let live_ids = |map: &Subscriptions| -> Vec<String> {
+                                            map.values().flatten().map(|entry| entry.id.clone()).collect()
+                                        };
+                                        let mut live: Option<Vec<String>> = None;
                                         if let Some(sub_id) = sub_opt {
                                             let mut map = subscriptions.lock().await;
                                             for (dest, vec) in map.iter_mut() {
@@ -1643,6 +1652,7 @@ impl Connection {
                                                 });
                                             }
                                             map.retain(|_, vec| !vec.is_empty());
+                                            live = Some(live_ids(&map));
                                         } else if let Some(dest) = dest_opt {
                                             let mut map = subscriptions.lock().await;
                                             if let Some(vec) = map.get_mut(&dest) {
@@ -1651,15 +1661,27 @@ impl Connection {
                                                     map.remove(&dest);
                                                 }
                                             }
+                                            live = Some(live_ids(&map));
                                         }
 
-                                        // Nothing can ack for a pruned
-                                        // subscription: forget what was
-                                        // pending for it, this frame included.
-                                        if !pruned.is_empty() {
+                                        // Nothing can ack for a subscription
+                                        // that is no longer registered: forget
+                                        // what was pending for it. That covers
+                                        // an entry pruned above, this frame
+                                        // included, and a queue orphaned by a
+                                        // dropped `Subscription` whose
+                                        // best-effort cleanup lost both the
+                                        // `pending` lock and the outbound send.
+                                        // Only this task adds to `pending`, and
+                                        // only under ids it found registered,
+                                        // so a live subscription's queue is
+                                        // never swept. The registry lock is
+                                        // released first: `ack` takes the two
+                                        // locks in the other order.
+                                        if let Some(live) = live {
                                             let mut p = pending_clone.lock().await;
-                                            for id in &pruned {
-                                                p.remove(id);
+                                            if !p.is_empty() {
+                                                p.retain(|id, _| live.contains(id));
                                             }
                                         }
 
@@ -2146,7 +2168,7 @@ impl Connection {
                     sender: tx.clone(),
                     ack: ack.as_str().to_string(),
                     headers: extra_headers.clone(),
-                    overflow: Overflow::new(overflow_limit),
+                    overflow: Overflow::new(overflow_limit, capacity),
                 });
         }
 
@@ -2471,14 +2493,14 @@ impl Connection {
 
     /// Receive the next frame that did not go to a subscription.
     ///
-    /// Yields exactly these frames:
+    /// Yields these frames, best effort (see below):
     ///
     /// - a MESSAGE that matched no subscription on this connection, as
     ///   `ReceivedFrame::Frame`. A MESSAGE taken by at least one
     ///   [`Subscription`](crate::Subscription) is delivered there only and
     ///   does not appear here, and neither does one still arriving for a
     ///   subscription the library failed at its overflow limit;
-    /// - every broker ERROR frame, as `ReceivedFrame::Error`, except repeats
+    /// - broker ERROR frames, as `ReceivedFrame::Error`, except repeats
     ///   for a subscription the library has already abandoned;
     /// - the synthetic ERROR carrying `x-abandoned: true` that the library
     ///   emits when it abandons a subscription after repeated broker errors;
@@ -2491,11 +2513,12 @@ impl Connection {
     ///
     /// Returns `None` once the connection has been closed.
     ///
-    /// An application that consumes only through `Subscription` handles does
-    /// not have to call this. The channel behind it holds 32 frames and the
-    /// background task never waits on it: when it is full, the frame is
-    /// dropped and logged with `tracing::warn!`. Read it promptly if you depend
-    /// on ERROR frames.
+    /// Delivery is best effort, bounded by the channel behind this method,
+    /// which holds 32 frames. The background task never waits on it: a frame
+    /// of any kind above that finds the channel full is dropped, with a
+    /// `tracing::warn!` in the log. An application that consumes only through
+    /// `Subscription` handles does not have to call this at all; one that
+    /// needs every ERROR must keep reading it.
     ///
     /// # Example
     ///
@@ -2907,7 +2930,7 @@ mod tests {
             sender: tx,
             ack: "auto".into(),
             headers: vec![],
-            overflow: Overflow::new(2),
+            overflow: Overflow::new(2, 1),
         };
 
         // One in the channel, two parked: at the limit, not past it.
@@ -2959,7 +2982,7 @@ mod tests {
             sender: tx,
             ack: "auto".into(),
             headers: vec![],
-            overflow: Overflow::new(0),
+            overflow: Overflow::new(0, 1),
         };
         assert_eq!(
             deliver_and_keep(&mut none, "/queue/t", &msg(0)),
@@ -3186,6 +3209,77 @@ mod tests {
     #[tokio::test]
     async fn dropping_a_subscription_forgets_pending_messages() {
         pending_is_forgotten(false).await;
+    }
+
+    #[tokio::test]
+    async fn orphaned_pending_queue_is_swept_on_the_next_message() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _connect = read_stomp_frame(&mut stream);
+            stream
+                .write_all(b"CONNECTED\nversion:1.2\nheart-beat:0,0\n\n\0")
+                .unwrap();
+
+            let subscribe = read_stomp_frame(&mut stream);
+            let sub_id = header_value(&subscribe, "id").to_string();
+            // First SEND: a bare RECEIPT, so the client knows the background
+            // task is past its start-up `pending.clear()`.
+            let send = read_stomp_frame(&mut stream);
+            let receipt_id = header_value(&send, "receipt");
+            let reply = format!("RECEIPT\nreceipt-id:{receipt_id}\n\n\0");
+            stream.write_all(reply.as_bytes()).unwrap();
+
+            let send = read_stomp_frame(&mut stream);
+            let receipt_id = header_value(&send, "receipt");
+            let reply = format!(
+                "MESSAGE\nsubscription:{sub_id}\nmessage-id:m0\ndestination:/queue/t\n\n\0\
+                 RECEIPT\nreceipt-id:{receipt_id}\n\n\0"
+            );
+            stream.write_all(reply.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            thread::sleep(Duration::from_millis(100));
+        });
+
+        let conn = connect_for_test(&addr).await;
+        let sub = conn
+            .subscribe("/queue/t", AckMode::ClientIndividual)
+            .await
+            .unwrap();
+        conn.send_frame_confirmed(
+            Frame::new("SEND").header("destination", "/queue/out"),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+
+        // What a dropped `Subscription` leaves when its best-effort cleanup
+        // loses both the `pending` lock and the outbound send.
+        conn.pending.lock().await.insert(
+            "gone".to_string(),
+            VecDeque::from([("old".to_string(), Frame::new("MESSAGE"))]),
+        );
+
+        conn.send_frame_confirmed(
+            Frame::new("SEND").header("destination", "/queue/out"),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+
+        let p = conn.pending.lock().await;
+        assert!(!p.contains_key("gone"), "the orphan queue must be swept");
+        let live: Vec<&str> = p[sub.id()].iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(
+            live,
+            ["m0"],
+            "the live subscription's record must be intact"
+        );
+        drop(p);
+
+        let _ = conn.close().await;
+        server.join().unwrap();
     }
 
     #[tokio::test]
