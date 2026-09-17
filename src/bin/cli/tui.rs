@@ -121,7 +121,7 @@ pub async fn run(cli: &Cli) -> Result<(), (String, u8)> {
                     // Include error frame headers for context when user toggles header display
                     s.record_message("BROKER ERROR", msg, err.frame.headers.clone());
                 }
-                Some(iridium_stomp::ReceivedFrame::Frame(_)) => {
+                Some(_) => {
                     // Other frames are handled by subscription receivers
                 }
                 None => break, // Connection closed

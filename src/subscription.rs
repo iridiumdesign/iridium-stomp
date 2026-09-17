@@ -18,20 +18,18 @@ use tokio::sync::mpsc;
 /// defines for it - STOMP itself has no durable-subscription concept. For
 /// example, ActiveMQ uses `activemq.subscriptionName`:
 ///
-/// ```ignore
-/// let options = SubscriptionOptions {
-///     headers: vec![(
-///         "activemq.subscriptionName".to_string(),
-///         "my-durable-sub".to_string(),
-///     )],
-///     ..Default::default()
-/// };
+/// ```
+/// use iridium_stomp::SubscriptionOptions;
+///
+/// let options = SubscriptionOptions::new()
+///     .header("activemq.subscriptionName", "my-durable-sub");
 /// ```
 ///
 /// On brokers where a durable queue is declared administratively, such as
 /// RabbitMQ, pass that queue as the `destination` argument; nothing extra is
 /// needed here.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct SubscriptionOptions {
     /// Extra headers to include on the SUBSCRIBE frame.
     pub headers: Vec<(String, String)>,
@@ -84,6 +82,17 @@ impl SubscriptionOptions {
     /// Overflow limit used when `overflow_limit` is `None`, and by
     /// `Connection::subscribe` and `Connection::subscribe_with_headers`.
     pub const DEFAULT_OVERFLOW_LIMIT: usize = 1024;
+
+    /// Create a new `SubscriptionOptions` with default values.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add one extra header to the SUBSCRIBE frame (builder style).
+    pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((key.into(), value.into()));
+        self
+    }
 
     /// Set extra headers to include on the SUBSCRIBE frame.
     pub fn headers(mut self, headers: Vec<(String, String)>) -> Self {
