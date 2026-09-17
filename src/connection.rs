@@ -128,6 +128,20 @@ pub(crate) struct SubscriptionEntry {
     pub(crate) sender: mpsc::Sender<Frame>,
     pub(crate) ack: String,
     pub(crate) headers: Vec<(String, String)>,
+    /// Frames waiting for room in `sender`'s channel, oldest first.
+    pub(crate) overflow: Overflow,
+}
+
+/// Per-subscription overflow: MESSAGE frames that arrived while the
+/// subscription's channel was full. The I/O loop parks them here instead of
+/// dropping them or awaiting the consumer, and moves them into the channel, in
+/// order, as the consumer frees capacity.
+#[derive(Clone, Default)]
+pub(crate) struct Overflow {
+    pub(crate) queue: VecDeque<Frame>,
+    /// Set once the first parked frame has been logged, so a consumer that
+    /// stays behind is reported once rather than once per frame.
+    pub(crate) warned: bool,
 }
 
 /// Alias for the subscription dispatch map: destination -> list of
@@ -698,20 +712,98 @@ async fn lookup_destination_by_sub_id(
     None
 }
 
+/// Move parked frames into the subscriber's channel, oldest first, until the
+/// queue is empty or the channel is full again. Returns `false` when the
+/// channel is `Closed`, in which case the entry is dead and whatever is still
+/// parked goes with it.
+fn drain_overflow(entry: &mut SubscriptionEntry) -> bool {
+    while let Some(parked) = entry.overflow.queue.pop_front() {
+        match entry.sender.try_send(parked) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(parked)) => {
+                entry.overflow.queue.push_front(parked);
+                break;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                entry.overflow.queue.clear();
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Deliver a MESSAGE frame to one subscriber and report whether its entry
 /// should be kept.
 ///
 /// The distinction the two delivery paths previously got wrong: a `Full`
-/// channel is a slow-but-live consumer — drop the message, keep the
-/// subscription — while a `Closed` channel means the receiving `Subscription`
-/// was dropped, so the entry is dead and must be pruned. Returning `false` only
-/// on `Closed` gives both paths one consistent rule and is the backstop that
-/// reaps a dropped subscription whose `Drop` could not take the registry lock.
-fn deliver_and_keep(entry: &SubscriptionEntry, frame: &Frame) -> bool {
+/// channel is a slow-but-live consumer — keep the subscription, and park the
+/// message in the entry's overflow queue until the consumer catches up — while
+/// a `Closed` channel means the receiving `Subscription` was dropped, so the
+/// entry is dead and must be pruned. Returning `false` only on `Closed` gives
+/// both paths one consistent rule and is the backstop that reaps a dropped
+/// subscription whose `Drop` could not take the registry lock.
+///
+/// Order is preserved: anything already parked is offered to the channel
+/// first, and while any of it remains the new frame joins the back of the
+/// queue rather than overtaking it. Nothing here awaits, so a slow consumer
+/// cannot stall the I/O loop.
+fn deliver_and_keep(entry: &mut SubscriptionEntry, destination: &str, frame: &Frame) -> bool {
+    if !drain_overflow(entry) {
+        return false;
+    }
+    if !entry.overflow.queue.is_empty() {
+        entry.overflow.queue.push_back(frame.clone());
+        return true;
+    }
     match entry.sender.try_send(frame.clone()) {
         Ok(()) => true,
-        Err(mpsc::error::TrySendError::Full(_)) => true,
+        Err(mpsc::error::TrySendError::Full(parked)) => {
+            entry.overflow.queue.push_back(parked);
+            if !entry.overflow.warned {
+                entry.overflow.warned = true;
+                tracing::warn!(
+                    destination = %destination,
+                    subscription_id = %entry.id,
+                    queue_depth = entry.overflow.queue.len(),
+                    "subscription channel full; parking messages until the consumer catches up",
+                );
+            }
+            true
+        }
         Err(mpsc::error::TrySendError::Closed(_)) => false,
+    }
+}
+
+/// Resolve to the id of a parked subscription whose channel has room again,
+/// or whose receiver is gone. Pends forever when nothing is parked.
+///
+/// The permit is released straight away: the I/O loop is the only sender, so
+/// the capacity it proves is still there when the loop drains under the
+/// registry lock.
+async fn parked_capacity(parked: &[(String, mpsc::Sender<Frame>)]) -> String {
+    if parked.is_empty() {
+        return future::pending().await;
+    }
+    let waits = parked.iter().map(|(id, sender)| {
+        Box::pin(async move {
+            let _ = sender.reserve().await;
+            id.clone()
+        })
+    });
+    future::select_all(waits).await.0
+}
+
+/// Forward a frame to the connection-wide inbound channel without awaiting.
+/// A slow or absent `next_frame()` reader costs frames, never the I/O loop.
+fn forward_inbound(in_tx: &mpsc::Sender<Frame>, frame: Frame) {
+    if let Err(mpsc::error::TrySendError::Full(frame)) = in_tx.try_send(frame) {
+        tracing::warn!(
+            command = %frame.command,
+            destination = frame.get_header("destination").unwrap_or(""),
+            message_id = frame.get_header("message-id").unwrap_or(""),
+            "inbound channel full (next_frame() is not being read); dropping frame",
+        );
     }
 }
 
@@ -1114,6 +1206,11 @@ impl Connection {
             let mut abandoned_sub_ids: std::collections::HashSet<String> =
                 std::collections::HashSet::new();
             const SUBSCRIPTION_ERROR_THRESHOLD: u32 = 3;
+            // Subscriptions with frames parked in their overflow queue, by id,
+            // each with a sender to wait on for capacity. Only a wake list: the
+            // queues themselves live on the entries in `subscriptions`, so a
+            // stale item here is harmless and is dropped at the next wake.
+            let mut parked: Vec<(String, mpsc::Sender<Frame>)> = Vec::new();
 
             loop {
                 // Check for shutdown before attempting connection
@@ -1360,25 +1457,45 @@ impl Connection {
                                         // Deliver to subscribers. Both paths use
                                         // `deliver_and_keep` so a dropped
                                         // subscriber (Closed channel) is pruned
-                                        // and a slow one (Full channel) is kept,
-                                        // then any emptied destination key is
-                                        // removed.
+                                        // and a slow one (Full channel) is kept
+                                        // with the frame parked for it, then any
+                                        // emptied destination key is removed.
+                                        // `delivered` records whether any
+                                        // subscription took the frame.
+                                        let mut delivered = false;
+                                        let mut deliver = |entry: &mut SubscriptionEntry, dest: &str| {
+                                            let keep = deliver_and_keep(entry, dest, &f);
+                                            delivered |= keep;
+                                            if keep
+                                                && !entry.overflow.queue.is_empty()
+                                                && !parked.iter().any(|(id, _)| *id == entry.id)
+                                            {
+                                                parked.push((entry.id.clone(), entry.sender.clone()));
+                                            }
+                                            keep
+                                        };
                                         if let Some(sub_id) = sub_opt {
                                             let mut map = subscriptions.lock().await;
-                                            for vec in map.values_mut() {
-                                                vec.retain(|entry| {
-                                                    entry.id != sub_id || deliver_and_keep(entry, &f)
+                                            for (dest, vec) in map.iter_mut() {
+                                                vec.retain_mut(|entry| {
+                                                    entry.id != sub_id || deliver(entry, dest)
                                                 });
                                             }
                                             map.retain(|_, vec| !vec.is_empty());
                                         } else if let Some(dest) = dest_opt {
                                             let mut map = subscriptions.lock().await;
                                             if let Some(vec) = map.get_mut(&dest) {
-                                                vec.retain(|entry| deliver_and_keep(entry, &f));
+                                                vec.retain_mut(|entry| deliver(entry, &dest));
                                                 if vec.is_empty() {
                                                     map.remove(&dest);
                                                 }
                                             }
+                                        }
+
+                                        // A MESSAGE a subscription took is not
+                                        // also forwarded to `next_frame()`.
+                                        if delivered {
+                                            continue;
                                         }
                                     } else if f.command == "RECEIPT" {
                                         // Handle RECEIPT frame: notify any waiting callers
@@ -1455,15 +1572,35 @@ impl Connection {
                                                         .header("message", &msg)
                                                         .header("destination", &dest)
                                                         .header("x-abandoned", "true");
-                                                    let _ = in_tx.send(abandon_frame).await;
+                                                    forward_inbound(&in_tx, abandon_frame);
                                                 }
                                             }
                                         }
                                     }
 
-                                    let _ = in_tx.send(f).await;
+                                    forward_inbound(&in_tx, f);
                                 }
                                 Some(Err(_)) | None => break 'conn,
+                            }
+                        }
+                        // A parked subscription has room again (or its
+                        // receiver is gone): move what fits into its channel.
+                        sub_id = parked_capacity(&parked) => {
+                            let mut still_parked = false;
+                            let mut map = subscriptions.lock().await;
+                            for vec in map.values_mut() {
+                                vec.retain_mut(|entry| {
+                                    if entry.id != sub_id {
+                                        return true;
+                                    }
+                                    let keep = drain_overflow(entry);
+                                    still_parked = keep && !entry.overflow.queue.is_empty();
+                                    keep
+                                });
+                            }
+                            map.retain(|_, vec| !vec.is_empty());
+                            if !still_parked {
+                                parked.retain(|(id, _)| *id != sub_id);
                             }
                         }
                         _ = hb_tick.tick() => {
@@ -1772,11 +1909,29 @@ impl Connection {
         ack: AckMode,
         extra_headers: Vec<(String, String)>,
     ) -> Result<crate::subscription::Subscription, ConnError> {
+        self.subscribe_with_capacity(
+            destination,
+            ack,
+            extra_headers,
+            crate::subscription::SubscriptionOptions::DEFAULT_CHANNEL_CAPACITY,
+        )
+        .await
+    }
+
+    /// Shared body of the subscribe methods. `capacity` is the size of the
+    /// subscription's channel; zero is treated as one.
+    async fn subscribe_with_capacity(
+        &self,
+        destination: &str,
+        ack: AckMode,
+        extra_headers: Vec<(String, String)>,
+        capacity: usize,
+    ) -> Result<crate::subscription::Subscription, ConnError> {
         let id = self
             .sub_id_counter
             .fetch_add(1, Ordering::SeqCst)
             .to_string();
-        let (tx, rx) = mpsc::channel::<Frame>(16);
+        let (tx, rx) = mpsc::channel::<Frame>(capacity.max(1));
         {
             let mut map = self.subscriptions.lock().await;
             map.entry(destination.to_string())
@@ -1786,6 +1941,7 @@ impl Connection {
                     sender: tx.clone(),
                     ack: ack.as_str().to_string(),
                     headers: extra_headers.clone(),
+                    overflow: Overflow::default(),
                 });
         }
 
@@ -1826,13 +1982,17 @@ impl Connection {
     /// for automatic resubscribe after reconnect. Durable subscriptions are
     /// requested through those headers - see the module docs for
     /// [`SubscriptionOptions`](crate::subscription::SubscriptionOptions).
+    /// `SubscriptionOptions.channel_capacity` sizes the subscription's channel.
     pub async fn subscribe_with_options(
         &self,
         destination: &str,
         ack: AckMode,
         options: crate::subscription::SubscriptionOptions,
     ) -> Result<crate::subscription::Subscription, ConnError> {
-        self.subscribe_with_headers(destination, ack, options.headers)
+        let capacity = options
+            .channel_capacity
+            .unwrap_or(crate::subscription::SubscriptionOptions::DEFAULT_CHANNEL_CAPACITY);
+        self.subscribe_with_capacity(destination, ack, options.headers, capacity)
             .await
     }
 
@@ -2086,11 +2246,28 @@ impl Connection {
         self.send_transaction_frame("ABORT", transaction_id).await
     }
 
-    /// Receive the next frame from the server.
+    /// Receive the next frame that did not go to a subscription.
     ///
-    /// Returns `Some(ReceivedFrame::Frame(..))` for normal frames (MESSAGE, etc.),
-    /// `Some(ReceivedFrame::Error(..))` for ERROR frames, or `None` if the
-    /// connection has been closed.
+    /// Yields exactly these frames:
+    ///
+    /// - a MESSAGE that matched no subscription on this connection, as
+    ///   `ReceivedFrame::Frame`. A MESSAGE taken by at least one
+    ///   [`Subscription`](crate::Subscription) is delivered there only and
+    ///   does not appear here;
+    /// - every broker ERROR frame, as `ReceivedFrame::Error`, except repeats
+    ///   for a subscription the library has already abandoned;
+    /// - the synthetic ERROR carrying `x-abandoned: true` that the library
+    ///   emits when it abandons a subscription after repeated broker errors;
+    /// - any other server frame the library does not consume itself, as
+    ///   `ReceivedFrame::Frame`. RECEIPT frames are consumed and never appear.
+    ///
+    /// Returns `None` once the connection has been closed.
+    ///
+    /// An application that consumes only through `Subscription` handles does
+    /// not have to call this. The channel behind it holds 32 frames and the
+    /// background task never waits on it: when it is full, the frame is
+    /// dropped and logged with `tracing::warn!`. Read it promptly if you depend
+    /// on ERROR frames.
     ///
     /// # Example
     ///
@@ -2417,33 +2594,63 @@ mod tests {
     }
 
     #[test]
-    fn deliver_and_keep_keeps_full_prunes_closed() {
-        // A full channel is a slow-but-live consumer: drop the message, keep
-        // the subscription. Fill a capacity-1 channel so the next send is Full.
-        let (tx, _rx) = mpsc::channel::<Frame>(1);
-        tx.try_send(Frame::new("MESSAGE")).unwrap();
-        let full = SubscriptionEntry {
+    fn deliver_and_keep_parks_on_full_prunes_closed() {
+        let msg = |n: u32| Frame::new("MESSAGE").header("message-id", n.to_string());
+        let id_of = |f: Frame| f.get_header("message-id").unwrap().to_string();
+
+        // A full channel is a slow-but-live consumer: keep the subscription and
+        // park the message. Fill a capacity-1 channel so the next send is Full.
+        let (tx, mut rx) = mpsc::channel::<Frame>(1);
+        tx.try_send(msg(0)).unwrap();
+        let mut full = SubscriptionEntry {
             id: "1".into(),
             sender: tx,
             ack: "auto".into(),
             headers: vec![],
+            overflow: Overflow::default(),
         };
         assert!(
-            deliver_and_keep(&full, &Frame::new("MESSAGE")),
+            deliver_and_keep(&mut full, "/queue/t", &msg(1)),
             "a full (slow-consumer) channel must be kept, not pruned"
         );
+        assert!(deliver_and_keep(&mut full, "/queue/t", &msg(2)));
+        assert_eq!(full.overflow.queue.len(), 2, "both frames must be parked");
+        assert!(full.overflow.warned);
 
-        // A closed channel means the receiving Subscription was dropped: prune.
+        // Room for one: the oldest parked frame goes first, and a new frame
+        // queues behind what is still parked instead of overtaking it.
+        assert_eq!(id_of(rx.try_recv().unwrap()), "0");
+        assert!(deliver_and_keep(&mut full, "/queue/t", &msg(3)));
+        assert_eq!(id_of(rx.try_recv().unwrap()), "1");
+        assert!(drain_overflow(&mut full));
+        assert_eq!(id_of(rx.try_recv().unwrap()), "2");
+        assert!(drain_overflow(&mut full));
+        assert_eq!(id_of(rx.try_recv().unwrap()), "3");
+        assert!(full.overflow.queue.is_empty());
+
+        // A closed channel means the receiving Subscription was dropped: prune,
+        // and discard whatever was parked for it.
+        assert!(deliver_and_keep(&mut full, "/queue/t", &msg(4)));
+        assert!(deliver_and_keep(&mut full, "/queue/t", &msg(5)));
+        assert_eq!(full.overflow.queue.len(), 1);
+        drop(rx);
+        assert!(
+            !deliver_and_keep(&mut full, "/queue/t", &msg(6)),
+            "a closed channel (dropped receiver) must be pruned"
+        );
+        assert!(full.overflow.queue.is_empty());
+
         let (tx, rx) = mpsc::channel::<Frame>(1);
         drop(rx);
-        let closed = SubscriptionEntry {
+        let mut closed = SubscriptionEntry {
             id: "2".into(),
             sender: tx,
             ack: "auto".into(),
             headers: vec![],
+            overflow: Overflow::default(),
         };
         assert!(
-            !deliver_and_keep(&closed, &Frame::new("MESSAGE")),
+            !deliver_and_keep(&mut closed, "/queue/t", &msg(0)),
             "a closed channel (dropped receiver) must be pruned"
         );
     }
@@ -2626,6 +2833,7 @@ mod tests {
                     sender: sub_sender,
                     ack: "client".to_string(),
                     headers: Vec::new(),
+                    overflow: Overflow::default(),
                 }],
             );
         }
@@ -2705,6 +2913,7 @@ mod tests {
                     sender: sub_sender,
                     ack: "client-individual".to_string(),
                     headers: Vec::new(),
+                    overflow: Overflow::default(),
                 }],
             );
         }
@@ -3077,6 +3286,7 @@ mod tests {
                     sender,
                     ack: "auto".to_string(),
                     headers: Vec::new(),
+                    overflow: Overflow::default(),
                 }],
             );
         }

@@ -24,6 +24,7 @@ use tokio::sync::mpsc;
 ///         "activemq.subscriptionName".to_string(),
 ///         "my-durable-sub".to_string(),
 ///     )],
+///     ..Default::default()
 /// };
 /// ```
 ///
@@ -34,6 +35,39 @@ use tokio::sync::mpsc;
 pub struct SubscriptionOptions {
     /// Extra headers to include on the SUBSCRIBE frame.
     pub headers: Vec<(String, String)>,
+    /// Capacity of the channel between the connection's background task and
+    /// this subscription's receiver, in frames. `None` (the default) means
+    /// [`DEFAULT_CHANNEL_CAPACITY`](Self::DEFAULT_CHANNEL_CAPACITY); zero is
+    /// treated as one.
+    ///
+    /// This is not a limit on how far a consumer may fall behind. When the
+    /// channel is full, further messages are parked in an unbounded
+    /// per-subscription queue inside the connection and moved into the channel,
+    /// in order, as the consumer frees room, so nothing is dropped. In the
+    /// client ack modes the broker's own flow control bounds that queue; with
+    /// `AckMode::Auto` nothing does, so a consumer that never catches up grows
+    /// it without limit. A larger capacity only means fewer frames take the
+    /// detour.
+    pub channel_capacity: Option<usize>,
+}
+
+impl SubscriptionOptions {
+    /// Channel capacity used when `channel_capacity` is `None`, and by
+    /// `Connection::subscribe` and `Connection::subscribe_with_headers`.
+    pub const DEFAULT_CHANNEL_CAPACITY: usize = 16;
+
+    /// Set extra headers to include on the SUBSCRIBE frame.
+    pub fn headers(mut self, headers: Vec<(String, String)>) -> Self {
+        self.headers = headers;
+        self
+    }
+
+    /// Set the capacity of the subscription's channel. See
+    /// [`channel_capacity`](Self::channel_capacity).
+    pub fn channel_capacity(mut self, capacity: usize) -> Self {
+        self.channel_capacity = Some(capacity);
+        self
+    }
 }
 
 /// A lightweight handle returned from `Connection::subscribe` that packages the

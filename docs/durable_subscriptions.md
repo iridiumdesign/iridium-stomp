@@ -101,6 +101,7 @@ let opts = SubscriptionOptions {
     headers: vec![
         ("activemq.subscriptionName".to_string(), "my-durable-sub".to_string()),
     ],
+    ..Default::default()
 };
 
 let sub = conn

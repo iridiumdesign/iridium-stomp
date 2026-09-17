@@ -26,6 +26,7 @@ fn subscription_options_with_headers() {
             ),
             ("selector".to_string(), "priority > 5".to_string()),
         ],
+        ..Default::default()
     };
     assert_eq!(opts.headers.len(), 2);
     assert_eq!(opts.headers[0].0, "activemq.subscriptionName");
@@ -36,6 +37,7 @@ fn subscription_options_with_headers() {
 fn subscription_options_clone() {
     let original = SubscriptionOptions {
         headers: vec![("key".to_string(), "value".to_string())],
+        ..Default::default()
     };
     let cloned = original.clone();
 
@@ -46,6 +48,7 @@ fn subscription_options_clone() {
 fn subscription_options_debug() {
     let opts = SubscriptionOptions {
         headers: vec![("test".to_string(), "value".to_string())],
+        ..Default::default()
     };
     let debug_str = format!("{:?}", opts);
     assert!(debug_str.contains("SubscriptionOptions"));
@@ -64,6 +67,7 @@ fn subscription_options_full_config() {
             ("activemq.noLocal".to_string(), "true".to_string()),
             ("selector".to_string(), "type = 'important'".to_string()),
         ],
+        ..Default::default()
     };
 
     assert_eq!(opts.headers.len(), 3);
@@ -80,6 +84,7 @@ fn subscription_options_empty_header_values() {
             ("empty-value".to_string(), "".to_string()),
             ("".to_string(), "empty-key".to_string()),
         ],
+        ..Default::default()
     };
     assert_eq!(opts.headers[0].1, "");
     assert_eq!(opts.headers[1].0, "");
@@ -92,6 +97,7 @@ fn subscription_options_special_characters() {
             "selector".to_string(),
             "id > 100 AND type = 'test'".to_string(),
         )],
+        ..Default::default()
     };
     assert!(opts.headers[0].1.contains("'test'"));
 }

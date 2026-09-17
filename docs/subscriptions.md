@@ -43,6 +43,7 @@ let opts = SubscriptionOptions {
         "activemq.subscriptionName".to_string(),
         "my-durable-sub".to_string(),
     )],
+    ..Default::default()
 };
 
 let sub = conn
@@ -82,8 +83,16 @@ let sub = conn
 | Field | Type | Purpose |
 |-------|------|---------|
 | `headers` | `Vec<(String, String)>` | Extra headers included on the SUBSCRIBE frame (e.g., broker-specific durable subscription names). |
+| `channel_capacity` | `Option<usize>` | Frames the subscription's channel holds. `None` means `SubscriptionOptions::DEFAULT_CHANNEL_CAPACITY` (16), which is also what `subscribe` and `subscribe_with_headers` use. |
 
 Headers are preserved internally and replayed on reconnect.
+
+A full channel does not lose messages. While a consumer is behind, the
+connection parks further messages for that subscription in an unbounded
+queue and moves them into the channel, in order, as room appears; other
+subscriptions, heartbeats and receipts carry on meanwhile. In the client ack
+modes the broker's flow control bounds that queue. With `AckMode::Auto`
+nothing does, so a consumer that never catches up grows it without limit.
 
 STOMP has no durable-subscription concept of its own, so durability is
 whatever the broker defines it to be. On ActiveMQ that is a header such as
