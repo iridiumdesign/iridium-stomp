@@ -138,6 +138,30 @@ period with no messages.
 - Pending ACKs are cleared. If you had received a message but not yet ACK'd it,
   the broker will redeliver it.
 
+### What a consumer sees across a reconnect
+
+Subscriptions are re-established automatically in every ack mode. What
+happens to messages depends on the mode:
+
+- **`AckMode::Auto`.** The broker counted each message as delivered when it
+  sent it, so anything it sent while the connection was down is lost. Frames
+  that had already reached the library are still delivered: those in the
+  subscription's channel, and those parked behind it for a slow consumer.
+- **`AckMode::Client` and `AckMode::ClientIndividual`.** The broker redelivers
+  everything that was not acknowledged. The library forgets its pending ACKs
+  and discards the frames it had parked for a slow consumer, precisely
+  because they are coming again. It cannot take back a frame that was already
+  in the subscription's channel, so that frame is seen **twice**: once from
+  the channel, then again redelivered. Acknowledging the first copy does
+  nothing useful, because its id belongs to the old session; the ACK is still
+  sent, and the broker ignores it or answers with an ERROR on
+  `conn.next_frame()`. Acknowledge the redelivered copy, and make message
+  handling idempotent.
+
+Nothing marks the stale copy as stale today. Tagging frames with the
+connection they arrived on, so that such an ACK is never sent, is planned in
+[#118](https://github.com/iridiumdesign/iridium-stomp/issues/118).
+
 ---
 
 ## Ack modes

@@ -187,6 +187,41 @@ jobs:
         run: |
           cargo test --doc --features cli --verbose
 
+  # Cargo.toml's version requirements are only honest if something builds
+  # against their lower bounds; the lockfile never does. This resolves every
+  # direct dependency to its declared minimum and tests on the MSRV. The
+  # resolver flag (-Z direct-minimal-versions) is nightly-only and unstable,
+  # and a yanked or newly broken old release upstream can turn this red with
+  # no change here, so it informs without blocking.
+  minimal-versions:
+    name: Minimal dependency versions
+    runs-on: ubuntu-latest
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust (nightly, for the resolver flag)
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          profile: minimal
+
+      - name: Set up Rust (MSRV)
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: "1.88"
+          profile: minimal
+
+      - name: Resolve direct dependencies to their declared minimums
+        run: cargo +nightly update -Z direct-minimal-versions
+
+      - name: Build and test on the MSRV
+        run: |
+          cargo +1.88 build --all-features
+          cargo +1.88 test --all-features
+
   build-examples:
     name: Build examples
     needs: [format, clippy, unit-tests]

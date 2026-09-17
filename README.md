@@ -309,6 +309,13 @@ handshake and protocol failures are retried with exponential backoff.
 - Authentication failures during reconnection continue exponential backoff
   without checking connection stability (they do not trigger a backoff reset).
 
+Subscriptions are re-established automatically. In the `client` and
+`client-individual` ack modes the broker redelivers whatever was not
+acknowledged, so a message that was already in a subscription's channel at
+the moment of the reconnect is seen twice; consumers should be idempotent.
+See [what a consumer sees across a reconnect](docs/subscriber-guide.md#what-a-consumer-sees-across-a-reconnect)
+for each ack mode.
+
 | Scenario | Behavior |
 |----------|----------|
 | Stable connection drops after minutes | Reconnect in 1s (backoff resets) |
@@ -447,7 +454,7 @@ stomp -a 127.0.0.1:61613 -s /queue/test
 Stop and remove the broker:
 
 ```bash
-docker compose down
+docker compose down -v
 ```
 
 ## Testing
@@ -509,7 +516,7 @@ docker compose up -d
 RUN_STOMP_SMOKE=1 cargo test --test stomp_smoke
 
 # Cleanup
-docker compose down
+docker compose down -v
 ```
 
 The smoke test is skipped by default unless `RUN_STOMP_SMOKE=1` is set, since it requires an external broker.

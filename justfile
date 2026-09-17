@@ -107,6 +107,30 @@ msrv:
     rustup toolchain install {{ MSRV }} --profile minimal
     cargo +{{ MSRV }} test --all-targets {{ FEAT }}
 
+# The version requirements in Cargo.toml are a promise that nothing else
+# tests: the lockfile always has something newer. This resolves every
+# DIRECT dependency to the lowest version the manifest allows (transitive
+# ones still resolve normally) and builds and tests on the MSRV. It works
+# in a throwaway copy, so the real Cargo.lock is never touched. The
+# `-Z direct-minimal-versions` flag is nightly-only, hence the nightly
+# toolchain for the resolve and nothing else.
+
+[doc('Build and test against the lowest dependency versions Cargo.toml allows.')]
+[group('gates')]
+minimal-versions:
+    #!/usr/bin/env sh
+    set -eu
+    rustup toolchain install nightly --profile minimal
+    rustup toolchain install {{ MSRV }} --profile minimal
+    tmp=$(mktemp -d)
+    trap 'rm -rf "$tmp"' EXIT
+    rsync -a --exclude target --exclude .git ./ "$tmp"/
+    export CARGO_TARGET_DIR="$PWD/target/minimal-versions"
+    cd "$tmp"
+    cargo +nightly update -Z direct-minimal-versions
+    cargo +{{ MSRV }} build --all-features
+    cargo +{{ MSRV }} test --all-features
+
 [doc('The gate: everything CI runs except the broker smoke test.')]
 [group('gates')]
 check: fmt clippy test doc-test examples
@@ -137,12 +161,16 @@ activemq:
 artemis:
     docker compose -f artemis-stack.yaml up -d
 
-[doc('Stop every broker stack.')]
+# The stacks keep no state: no named volumes, and `-v` here removes the
+# anonymous ones an image declares for itself, so down means gone. A
+# journal that outlives its image is how #121 happened.
+
+[doc('Stop every broker stack and remove its volumes.')]
 [group('brokers')]
 brokers-down:
-    -docker compose -f docker-compose.yaml down
-    -docker compose -f activemq-stack.yaml down
-    -docker compose -f artemis-stack.yaml down
+    -docker compose -f docker-compose.yaml down -v
+    -docker compose -f activemq-stack.yaml down -v
+    -docker compose -f artemis-stack.yaml down -v
 
 [doc('Which STOMP ports are listening.')]
 [group('brokers')]

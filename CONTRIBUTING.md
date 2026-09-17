@@ -75,6 +75,16 @@ and `just artemis` each bring one up on its own STOMP port so all three
 can run at once, `just brokers` reports which are listening, and
 `just brokers-down` stops them.
 
+The broker stacks keep no state. They mount no named volumes, and
+`just brokers-down` runs `docker compose down -v`, so it removes the
+containers, the network, and any anonymous volume an image declares for
+itself: queues, journals and users are gone, and the next `up` starts
+clean. It does not remove the images. If you ran these stacks before the
+named volumes were dropped, an old one may still be lying around (a stale
+`artemis_data` owned by another uid is what stopped Artemis starting in
+#121); remove them once with
+`docker volume rm artemis_data activemq_data rabbitmq_data`.
+
 If you'd rather not install anything, this is the minimum by hand.
 `just check` also compiles the doc examples and the example binaries,
 which CI checks and these four commands do not:

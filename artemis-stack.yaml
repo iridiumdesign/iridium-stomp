@@ -10,14 +10,8 @@ services:
     ports:
       - "61615:61613"  # STOMP (offset to avoid conflict with RabbitMQ/ActiveMQ)
       - "8162:8161"    # Web console
-    volumes:
-      - artemis_data:/var/lib/artemis-instance/data
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8161/ || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
-
-volumes:
-  artemis_data:
-    name: artemis_data
