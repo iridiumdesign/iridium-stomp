@@ -29,6 +29,7 @@ pub use connection::{
 /// Re-export the `Frame` type used to construct/send and receive frames.
 pub use frame::Frame;
 pub use subscription::Subscription;
+pub use subscription::SubscriptionEnd;
 pub use subscription::SubscriptionOptions;
 
 // Expose the repository `docs/subscriptions.md` as a public rustdoc page so it
