@@ -131,3 +131,27 @@ you spend the time.
 A minimal reproduction is worth more than a description. Include the
 broker you're talking to, the crate version, and the frames involved if
 the issue is protocol-level.
+
+## Against a real broker
+
+The test suite runs against fake brokers, which is what makes it fast and
+what makes it deterministic. `tests/live_broker.rs` is the exception: it
+is skipped unless `STOMP_LIVE_ADDR` is set, and then it exercises the
+things a fake cannot vouch for — that acks take, that the broker
+redelivers after an overflow, that an idle connection outlives the
+broker's TTL, that a subscription survives the broker restarting.
+
+```sh
+just artemis
+STOMP_LIVE_ADDR=127.0.0.1:61615 STOMP_LIVE_LOGIN=admin \
+STOMP_LIVE_PASSCODE=admin STOMP_LIVE_ANYCAST=1 \
+STOMP_LIVE_RESTART_CMD='docker restart iridium-stomp-artemis-1' \
+cargo test --test live_broker -- --test-threads=1
+```
+
+`STOMP_LIVE_ANYCAST=1` is for Artemis, whose stock configuration makes a
+`/queue/...` destination multicast unless the frames say otherwise; on
+RabbitMQ and ActiveMQ Classic leave it unset. Without
+`STOMP_LIVE_RESTART_CMD` the restart test skips itself. The header of the
+file says what each test is for. Run it against all three brokers before
+a release.

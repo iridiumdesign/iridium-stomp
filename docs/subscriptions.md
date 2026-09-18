@@ -123,6 +123,45 @@ administratively and you simply subscribe to it by name as the
 
 ---
 
+## Why a subscription ended
+
+A `Subscription`'s stream ends (`sub.next()` yields `None`) for one of four
+reasons, and `sub.ended()` says which. It is `None` while the subscription is
+live, and it is set before the stream ends, so after `None` it is always
+`Some`. Frames already in the channel are yielded first.
+
+| `SubscriptionEnd` | When |
+|---|---|
+| `Abandoned { message }` | The broker has sent three ERROR frames for the destination over the life of the connection (the count is never reset); the library gave up on it and will not resubscribe. `message` is the broker's last `message` header. An ERROR with `x-abandoned: true` also goes to `next_frame()`, best effort. |
+| `Overflowed { limit }` | More than `overflow_limit` messages were parked behind the full channel and the library failed the subscription. An ERROR with `x-overflow: true` also goes to `next_frame()`, best effort. |
+| `Unsubscribed` | The application called `Connection::unsubscribe` or dropped the handle. |
+| `ConnectionClosed` | `Connection::close` was called, or the background task ended. |
+
+The `next_frame()` notices are best effort: that channel holds 32 frames,
+the library never waits on it, and a frame that finds it full is dropped
+with a warning. `ended()` is the reliable signal.
+
+A reconnect is none of these: the subscription is re-established and
+`ended()` stays `None`.
+
+```rust,ignore
+use iridium_stomp::SubscriptionEnd;
+
+while let Some(frame) = sub.next().await {
+    // ...
+}
+match sub.ended() {
+    Some(SubscriptionEnd::Abandoned { message }) => eprintln!("rejected: {message}"),
+    Some(SubscriptionEnd::Overflowed { limit }) => eprintln!("fell {limit} behind"),
+    Some(SubscriptionEnd::Unsubscribed) | Some(SubscriptionEnd::ConnectionClosed) => {}
+    _ => {} // the enum is non-exhaustive
+}
+```
+
+The raw receiver from `into_receiver` carries no `ended()`.
+
+---
+
 ## Ack modes
 
 The ack mode is set per subscription and determines how the broker tracks

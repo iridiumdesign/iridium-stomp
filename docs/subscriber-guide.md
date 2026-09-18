@@ -367,11 +367,20 @@ while let Some(frame) = merged.next().await {
 ```
 
 **Abandonment** is a specific case to watch for. If the broker sends 3
-consecutive ERROR frames for the same destination (e.g. a permissions error),
+ERROR frames for the same destination over the life of the connection (e.g.
+a permissions error; the count is never reset by a successful message),
 the library stops resubscribing that destination and sends a synthetic ERROR
-frame with an `x-abandoned: true` header to `conn.next_frame()`. The
-subscription's stream goes silent — `sub.next()` returns `None` — with no
-other indication of why. The error task above is the only way to detect this.
+frame with an `x-abandoned: true` header to `conn.next_frame()` (best
+effort: that channel holds 32 frames and a frame that finds it full is
+dropped with a warning, so `sub.ended()` is the reliable signal). The
+subscription's stream ends — `sub.next()` returns `None` — and
+`sub.ended()` then returns `SubscriptionEnd::Abandoned { message }` with the
+broker's message, so the loop that was reading it can tell. `ended()` also
+distinguishes the other ways a stream ends: `Overflowed` (the consumer fell
+past its overflow limit), `Unsubscribed` and `ConnectionClosed`. See
+[Why a subscription ended](subscriptions.md#why-a-subscription-ended). The
+error task above still sees the `x-abandoned` frame, which is the place to
+look when nothing is reading the subscription itself.
 
 ---
 

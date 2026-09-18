@@ -3,6 +3,7 @@ use crate::connection::Connection;
 use crate::frame::Frame;
 use futures::stream::Stream;
 use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 
@@ -115,6 +116,41 @@ impl SubscriptionOptions {
     }
 }
 
+/// Why a [`Subscription`] stopped yielding frames.
+///
+/// A subscription's stream ends (`next()` yields `None`) for one of these
+/// reasons, and [`Subscription::ended`] says which. The enum is
+/// `#[non_exhaustive]`: match with a wildcard arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SubscriptionEnd {
+    /// The library gave the subscription up after repeated broker ERROR
+    /// frames for its destination, so that it is not resubscribed on
+    /// reconnect. `message` is the broker's last `message` header. The same
+    /// event puts an ERROR with `x-abandoned: true` on
+    /// [`Connection::next_frame`].
+    Abandoned {
+        /// The broker's `message` header from the ERROR that tipped it over.
+        message: String,
+    },
+    /// The library failed the subscription because more than `limit`
+    /// messages were parked behind its full channel; see
+    /// [`SubscriptionOptions::overflow_limit`]. The same event puts an ERROR
+    /// with `x-overflow: true` on [`Connection::next_frame`], best effort:
+    /// that channel is bounded and never waited on, so this value is the
+    /// reliable signal.
+    Overflowed {
+        /// The `overflow_limit` that was exceeded.
+        limit: usize,
+    },
+    /// The application unsubscribed, through [`Connection::unsubscribe`] or
+    /// by dropping the handle.
+    Unsubscribed,
+    /// The connection was closed with [`Connection::close`], or its
+    /// background task ended.
+    ConnectionClosed,
+}
+
 /// A lightweight handle returned from `Connection::subscribe` that packages the
 /// subscription id, destination, and the receiving side of the subscription.
 ///
@@ -133,6 +169,10 @@ pub struct Subscription {
     ///
     /// [`into_receiver`]: Subscription::into_receiver
     unsubscribed: bool,
+    /// Written once by whoever ends the subscription, before the sending
+    /// side of `receiver` is dropped, so that `None` from `next()` always
+    /// finds this set. Shared with the connection's registry entry.
+    ended: Arc<OnceLock<SubscriptionEnd>>,
 }
 
 impl Subscription {
@@ -141,6 +181,7 @@ impl Subscription {
         destination: String,
         receiver: mpsc::Receiver<Frame>,
         conn: Connection,
+        ended: Arc<OnceLock<SubscriptionEnd>>,
     ) -> Self {
         Self {
             id,
@@ -148,7 +189,40 @@ impl Subscription {
             receiver,
             conn,
             unsubscribed: false,
+            ended,
         }
+    }
+
+    /// Why this subscription ended, or `None` while it is live.
+    ///
+    /// Set before the stream ends, so once `next()` has yielded `None` this
+    /// is always `Some`. Frames already in the channel are still yielded
+    /// first. A reconnect does not end a subscription: it is re-established
+    /// and this stays `None`.
+    ///
+    /// ```no_run
+    /// use futures::StreamExt;
+    /// use iridium_stomp::SubscriptionEnd;
+    ///
+    /// # async fn example(mut sub: iridium_stomp::Subscription) {
+    /// while let Some(frame) = sub.next().await {
+    ///     // handle the frame
+    /// }
+    /// match sub.ended() {
+    ///     Some(SubscriptionEnd::Abandoned { message }) => {
+    ///         eprintln!("broker kept rejecting the subscription: {message}");
+    ///     }
+    ///     Some(SubscriptionEnd::Overflowed { limit }) => {
+    ///         eprintln!("consumer fell more than {limit} messages behind");
+    ///     }
+    ///     Some(SubscriptionEnd::Unsubscribed) => {}
+    ///     Some(SubscriptionEnd::ConnectionClosed) => {}
+    ///     _ => {} // `SubscriptionEnd` is non-exhaustive
+    /// }
+    /// # }
+    /// ```
+    pub fn ended(&self) -> Option<SubscriptionEnd> {
+        self.ended.get().cloned()
     }
 
     /// Returns the local subscription id.
@@ -166,7 +240,8 @@ impl Subscription {
     ///
     /// The subscription stays active: the caller now owns the stream, so `Drop`
     /// does not send an UNSUBSCRIBE. Call [`Connection::unsubscribe`] with the
-    /// id if you later want to stop it.
+    /// id if you later want to stop it. The raw receiver carries no
+    /// [`ended`](Self::ended): once it yields `None` there is no saying why.
     ///
     /// [`Connection::unsubscribe`]: crate::Connection::unsubscribe
     pub fn into_receiver(mut self) -> mpsc::Receiver<Frame> {

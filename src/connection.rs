@@ -1,7 +1,7 @@
 use futures::{SinkExt, StreamExt, future};
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use thiserror::Error;
 use tokio::net::TcpStream;
@@ -11,6 +11,7 @@ use tokio_util::codec::Framed;
 use crate::codec::{StompCodec, StompItem};
 use crate::frame::Frame;
 use crate::parser::DEFAULT_MAX_FRAME_SIZE;
+use crate::subscription::SubscriptionEnd;
 
 /// Configuration for STOMP heartbeat intervals.
 ///
@@ -130,6 +131,16 @@ pub(crate) struct SubscriptionEntry {
     pub(crate) headers: Vec<(String, String)>,
     /// Frames waiting for room in `sender`'s channel, oldest first.
     pub(crate) overflow: Overflow,
+    /// Why the subscription ended, shared with its `Subscription` handle.
+    /// Whoever removes the entry sets this first, then lets `sender` drop:
+    /// the handle reads it after `next()` yields `None`.
+    pub(crate) ended: Arc<OnceLock<SubscriptionEnd>>,
+}
+
+/// Record why `entry` is about to go. A second reason is ignored: the first
+/// one to end the subscription is the one the handle reports.
+fn end_subscription(entry: &SubscriptionEntry, end: SubscriptionEnd) {
+    let _ = entry.ended.set(end);
 }
 
 /// Per-subscription overflow: MESSAGE frames that arrived while the
@@ -1408,7 +1419,12 @@ impl Connection {
                                     "reconnect: failed to send CONNECT frame, retrying in {}s",
                                     backoff_secs,
                                 );
-                                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                                tokio::select! {
+                                    biased;
+                                    // A close() during the backoff must not wait it out.
+                                    _ = shutdown_sub.recv() => break,
+                                    _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
+                                }
                                 backoff_secs = (backoff_secs * 2).min(30);
                                 continue;
                             }
@@ -1431,7 +1447,12 @@ impl Connection {
                                         "reconnect: handshake failed, retrying in {}s",
                                         backoff_secs,
                                     );
-                                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                                    tokio::select! {
+                                        biased;
+                                        // A close() during the backoff must not wait it out.
+                                        _ = shutdown_sub.recv() => break,
+                                        _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
+                                    }
                                     backoff_secs = (backoff_secs * 2).min(30);
                                     continue;
                                 }
@@ -1445,7 +1466,12 @@ impl Connection {
                                 "reconnect: broker unreachable, retrying in {}s",
                                 backoff_secs,
                             );
-                            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                            tokio::select! {
+                                biased;
+                                // A close() during the backoff must not wait it out.
+                                _ = shutdown_sub.recv() => break,
+                                _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
+                            }
                             backoff_secs = (backoff_secs * 2).min(30);
                             continue;
                         }
@@ -1693,6 +1719,13 @@ impl Connection {
                                             let keep = outcome == Delivery::Taken;
                                             delivered |= keep;
                                             if outcome == Delivery::Overflowed {
+                                                // Before `retain` drops the entry.
+                                                end_subscription(
+                                                    entry,
+                                                    SubscriptionEnd::Overflowed {
+                                                        limit: entry.overflow.limit,
+                                                    },
+                                                );
                                                 overflowed.push((
                                                     entry.id.clone(),
                                                     dest.to_string(),
@@ -1851,6 +1884,22 @@ impl Connection {
                                             if count >= SUBSCRIPTION_ERROR_THRESHOLD {
                                                 // Remove the subscription from auto-resubscribe
                                                 let mut map = subscriptions.lock().await;
+                                                // Tell the handles first; removing
+                                                // the entries drops their senders.
+                                                if let Some(entries) = map.get(&dest) {
+                                                    let message = f
+                                                        .get_header("message")
+                                                        .unwrap_or("")
+                                                        .to_string();
+                                                    for entry in entries {
+                                                        end_subscription(
+                                                            entry,
+                                                            SubscriptionEnd::Abandoned {
+                                                                message: message.clone(),
+                                                            },
+                                                        );
+                                                    }
+                                                }
                                                 if map.remove(&dest).is_some() {
                                                     // Track the subscription ID as abandoned
                                                     if let Some(id) = sub_id {
@@ -1941,8 +1990,23 @@ impl Connection {
                         backoff_secs,
                     );
                 }
-                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                tokio::select! {
+                    biased;
+                    // A close() during the backoff must not wait it out.
+                    _ = shutdown_sub.recv() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
+                }
             }
+
+            // The task is done: every subscription still registered ends
+            // here. Tell the handles, then drop the entries (and with them the
+            // senders) so `next()` yields `None`. In that order, so a handle
+            // that sees `None` never finds `ended()` unset.
+            let mut map = subscriptions_clone.lock().await;
+            for entry in map.values().flatten() {
+                end_subscription(entry, SubscriptionEnd::ConnectionClosed);
+            }
+            map.clear();
         });
 
         Ok(Connection {
@@ -2224,6 +2288,7 @@ impl Connection {
             .fetch_add(1, Ordering::SeqCst)
             .to_string();
         let (tx, rx) = mpsc::channel::<Frame>(capacity.max(1));
+        let ended = Arc::new(OnceLock::new());
         {
             let mut map = self.subscriptions.lock().await;
             map.entry(destination.to_string())
@@ -2234,6 +2299,7 @@ impl Connection {
                     ack,
                     headers: extra_headers.clone(),
                     overflow: Overflow::new(overflow_limit, capacity),
+                    ended: ended.clone(),
                 });
         }
 
@@ -2255,6 +2321,7 @@ impl Connection {
             destination.to_string(),
             rx,
             self.clone(),
+            ended,
         ))
     }
 
@@ -2314,6 +2381,7 @@ impl Connection {
             let mut remove_keys: Vec<String> = Vec::new();
             for (dest, vec) in map.iter_mut() {
                 if let Some(pos) = vec.iter().position(|entry| entry.id == subscription_id) {
+                    end_subscription(&vec[pos], SubscriptionEnd::Unsubscribed);
                     vec.remove(pos);
                     found = true;
                 }
@@ -2357,7 +2425,12 @@ impl Connection {
     pub(crate) fn unsubscribe_best_effort(&self, subscription_id: &str) {
         if let Ok(mut map) = self.subscriptions.try_lock() {
             for vec in map.values_mut() {
-                vec.retain(|entry| entry.id != subscription_id);
+                vec.retain(|entry| {
+                    if entry.id == subscription_id {
+                        end_subscription(entry, SubscriptionEnd::Unsubscribed);
+                    }
+                    entry.id != subscription_id
+                });
             }
             map.retain(|_, vec| !vec.is_empty());
         }
@@ -2947,6 +3020,7 @@ mod tests {
             ack: AckMode::Auto,
             headers: vec![],
             overflow: Overflow::default(),
+            ended: Arc::new(OnceLock::new()),
         };
         assert_eq!(
             deliver_and_keep(&mut full, "/queue/t", &msg(1)),
@@ -3001,6 +3075,7 @@ mod tests {
             ack: AckMode::Auto,
             headers: vec![],
             overflow: Overflow::default(),
+            ended: Arc::new(OnceLock::new()),
         };
         assert_eq!(
             deliver_and_keep(&mut closed, "/queue/t", &msg(0)),
@@ -3019,6 +3094,7 @@ mod tests {
             ack: AckMode::Auto,
             headers: vec![],
             overflow: Overflow::new(2, 1),
+            ended: Arc::new(OnceLock::new()),
         };
 
         // One in the channel, two parked: at the limit, not past it.
@@ -3071,6 +3147,7 @@ mod tests {
             ack: AckMode::Auto,
             headers: vec![],
             overflow: Overflow::new(0, 1),
+            ended: Arc::new(OnceLock::new()),
         };
         assert_eq!(
             deliver_and_keep(&mut none, "/queue/t", &msg(0)),
@@ -3622,6 +3699,7 @@ mod tests {
                     ack: AckMode::Client,
                     headers: Vec::new(),
                     overflow: Overflow::default(),
+                    ended: Arc::new(OnceLock::new()),
                 }],
             );
         }
@@ -3705,6 +3783,7 @@ mod tests {
                     ack: AckMode::ClientIndividual,
                     headers: Vec::new(),
                     overflow: Overflow::default(),
+                    ended: Arc::new(OnceLock::new()),
                 }],
             );
         }
@@ -4082,6 +4161,7 @@ mod tests {
                     ack: AckMode::Auto,
                     headers: Vec::new(),
                     overflow: Overflow::default(),
+                    ended: Arc::new(OnceLock::new()),
                 }],
             );
         }
