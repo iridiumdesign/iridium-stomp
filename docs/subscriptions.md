@@ -132,10 +132,14 @@ live, and it is set before the stream ends, so after `None` it is always
 
 | `SubscriptionEnd` | When |
 |---|---|
-| `Abandoned { message }` | The broker has sent three ERROR frames for the destination over the life of the connection (the count is never reset); the library gave up on it and will not resubscribe. `message` is the broker's last `message` header. An ERROR with `x-abandoned: true` also goes to `next_frame()`. |
-| `Overflowed { limit }` | More than `overflow_limit` messages were parked behind the full channel and the library failed the subscription. An ERROR with `x-overflow: true` also goes to `next_frame()`. |
+| `Abandoned { message }` | The broker has sent three ERROR frames for the destination over the life of the connection (the count is never reset); the library gave up on it and will not resubscribe. `message` is the broker's last `message` header. An ERROR with `x-abandoned: true` also goes to `next_frame()`, best effort. |
+| `Overflowed { limit }` | More than `overflow_limit` messages were parked behind the full channel and the library failed the subscription. An ERROR with `x-overflow: true` also goes to `next_frame()`, best effort. |
 | `Unsubscribed` | The application called `Connection::unsubscribe` or dropped the handle. |
 | `ConnectionClosed` | `Connection::close` was called, or the background task ended. |
+
+The `next_frame()` notices are best effort: that channel holds 32 frames,
+the library never waits on it, and a frame that finds it full is dropped
+with a warning. `ended()` is the reliable signal.
 
 A reconnect is none of these: the subscription is re-established and
 `ended()` stays `None`.

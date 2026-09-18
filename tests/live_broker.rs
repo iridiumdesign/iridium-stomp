@@ -6,9 +6,11 @@
 //! STOMP_LIVE_PASSCODE=guest cargo test --test live_broker -- --test-threads=1
 //! ```
 //!
-//! - `STOMP_LIVE_ANYCAST=1` adds `destination-type: ANYCAST` and
-//!   `subscription-type: ANYCAST`, which Artemis needs for `/queue/...`
-//!   to be a queue rather than a multicast address. Without it a
+//! - `STOMP_LIVE_ANYCAST=1` adds `destination-type: ANYCAST` to every
+//!   SEND and `subscription-type: ANYCAST` to every SUBSCRIBE, which is
+//!   what Artemis needs for `/queue/...` to be a queue rather than a
+//!   multicast address (each header belongs to its own frame; Artemis
+//!   ignores either on the other). Without it a
 //!   subscription's messages vanish with the subscription, and the
 //!   redelivery checks here prove nothing.
 //! - `STOMP_LIVE_RESTART_CMD`, if set, is run (`sh -c`) in the middle of

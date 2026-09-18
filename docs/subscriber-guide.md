@@ -370,7 +370,9 @@ while let Some(frame) = merged.next().await {
 ERROR frames for the same destination over the life of the connection (e.g.
 a permissions error; the count is never reset by a successful message),
 the library stops resubscribing that destination and sends a synthetic ERROR
-frame with an `x-abandoned: true` header to `conn.next_frame()`. The
+frame with an `x-abandoned: true` header to `conn.next_frame()` (best
+effort: that channel holds 32 frames and a frame that finds it full is
+dropped with a warning, so `sub.ended()` is the reliable signal). The
 subscription's stream ends — `sub.next()` returns `None` — and
 `sub.ended()` then returns `SubscriptionEnd::Abandoned { message }` with the
 broker's message, so the loop that was reading it can tell. `ended()` also

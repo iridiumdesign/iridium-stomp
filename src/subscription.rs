@@ -136,7 +136,9 @@ pub enum SubscriptionEnd {
     /// The library failed the subscription because more than `limit`
     /// messages were parked behind its full channel; see
     /// [`SubscriptionOptions::overflow_limit`]. The same event puts an ERROR
-    /// with `x-overflow: true` on [`Connection::next_frame`].
+    /// with `x-overflow: true` on [`Connection::next_frame`], best effort:
+    /// that channel is bounded and never waited on, so this value is the
+    /// reliable signal.
     Overflowed {
         /// The `overflow_limit` that was exceeded.
         limit: usize,
