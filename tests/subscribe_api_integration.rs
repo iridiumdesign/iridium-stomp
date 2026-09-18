@@ -71,17 +71,10 @@ fn test_stream_api_usage_pattern() {
 #[test]
 fn test_subscription_options_broker_specific_headers() {
     // ActiveMQ durable subscription pattern
-    let opts = SubscriptionOptions {
-        headers: vec![
-            (
-                "activemq.subscriptionName".to_string(),
-                "my-durable-sub".to_string(),
-            ),
-            ("selector".to_string(), "priority > 5".to_string()),
-            ("activemq.noLocal".to_string(), "true".to_string()),
-        ],
-        ..Default::default()
-    };
+    let opts = SubscriptionOptions::new()
+        .header("activemq.subscriptionName", "my-durable-sub")
+        .header("selector", "priority > 5")
+        .header("activemq.noLocal", "true");
 
     assert_eq!(
         opts.headers.len(),
@@ -119,10 +112,7 @@ fn test_subscription_options_ergonomics() {
     assert!(default_opts.headers.is_empty());
 
     // Clone should preserve all fields
-    let opts = SubscriptionOptions {
-        headers: vec![("key".to_string(), "value".to_string())],
-        ..Default::default()
-    };
+    let opts = SubscriptionOptions::new().header("key", "value");
 
     let cloned = opts.clone();
     assert_eq!(opts.headers, cloned.headers);
@@ -138,7 +128,7 @@ fn test_subscribe_with_options_api_exists() {
     async fn validate_api() {
         // Pseudo-code showing the API signature
         // let conn = Connection::connect(...).await?;
-        // let opts = SubscriptionOptions { ... };
+        // let opts = SubscriptionOptions::new().header(...);
         // let subscription = conn.subscribe_with_options(
         //     "/topic/events",
         //     AckMode::Client,
@@ -273,13 +263,9 @@ fn test_durable_subscription_example_compiles() {
     async fn durable_example() {
         // This is adapted from the README durable subscription example
 
-        // let opts = SubscriptionOptions {
-        //     headers: vec![
-        //         ("activemq.subscriptionName".into(), "my-durable-sub".into()),
-        //         ("selector".into(), "priority > 5".into()),
-        //     ],
-        //     ..Default::default()
-        // };
+        // let opts = SubscriptionOptions::new()
+        //     .header("activemq.subscriptionName", "my-durable-sub")
+        //     .header("selector", "priority > 5");
         //
         // let sub = conn.subscribe_with_options(
         //     "/topic/events",

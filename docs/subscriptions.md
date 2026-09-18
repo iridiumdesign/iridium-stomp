@@ -38,13 +38,8 @@ when you need broker-specific headers, such as a durable subscription name.
 # async fn wrapper(conn: Connection) -> Result<(), Box<dyn std::error::Error>> {
 use iridium_stomp::{AckMode, SubscriptionOptions};
 
-let opts = SubscriptionOptions {
-    headers: vec![(
-        "activemq.subscriptionName".to_string(),
-        "my-durable-sub".to_string(),
-    )],
-    ..Default::default()
-};
+let opts = SubscriptionOptions::new()
+    .header("activemq.subscriptionName", "my-durable-sub");
 
 let sub = conn
     .subscribe_with_options("/topic/my-topic", AckMode::Client, opts)
@@ -85,6 +80,11 @@ let sub = conn
 | `headers` | `Vec<(String, String)>` | Extra headers included on the SUBSCRIBE frame (e.g., broker-specific durable subscription names). |
 | `channel_capacity` | `Option<usize>` | Frames the subscription's channel holds. `None` means `SubscriptionOptions::DEFAULT_CHANNEL_CAPACITY` (16), which is also what `subscribe` and `subscribe_with_headers` use. |
 | `overflow_limit` | `Option<usize>` | Most messages that may be parked behind a full channel before the subscription is failed. `None` means `SubscriptionOptions::DEFAULT_OVERFLOW_LIMIT` (1024), which is also what `subscribe` and `subscribe_with_headers` use. `Some(0)` allows no parking. |
+
+The struct is `#[non_exhaustive]`, so build it with
+`SubscriptionOptions::new()` (or `default()`) and the builder methods
+`header(key, value)`, `headers(vec)`, `channel_capacity(n)` and
+`overflow_limit(n)` rather than with a struct literal.
 
 Headers are preserved internally and replayed on reconnect.
 

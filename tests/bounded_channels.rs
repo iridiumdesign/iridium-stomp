@@ -354,10 +354,7 @@ async fn channel_capacity_is_configurable() {
     assert_eq!(large.into_receiver().max_capacity(), 64);
 
     // Zero would panic in tokio; it is treated as one.
-    let opts = SubscriptionOptions {
-        channel_capacity: Some(0),
-        ..Default::default()
-    };
+    let opts = SubscriptionOptions::default().channel_capacity(0);
     let zero = conn
         .subscribe_with_options("/queue/c", AckMode::Auto, opts)
         .await
@@ -734,11 +731,9 @@ async fn overflow_limit_of_zero_allows_no_parking() {
         _ => Vec::new(),
     });
     let conn = connect(&addr).await;
-    let opts = SubscriptionOptions {
-        channel_capacity: Some(1),
-        overflow_limit: Some(0),
-        ..Default::default()
-    };
+    let opts = SubscriptionOptions::default()
+        .channel_capacity(1)
+        .overflow_limit(0);
     let sub = conn
         .subscribe_with_options("/queue/t", AckMode::Auto, opts)
         .await
@@ -751,4 +746,70 @@ async fn overflow_limit_of_zero_allows_no_parking() {
     expect_unsubscribe(&seen, &id).await;
     assert_eq!(rx.recv().await.unwrap().get_header("message-id"), Some("0"));
     assert!(rx.recv().await.is_none());
+}
+
+// ============================================================================
+// #124: `subscriptions` and `pending` are never held together
+// ============================================================================
+
+/// `count` MESSAGE frames with no `subscription` header, which the library
+/// routes by destination.
+fn headerless_messages(destination: &str, count: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for n in 0..count {
+        out.extend_from_slice(
+            format!("MESSAGE\nmessage-id:{n}\ndestination:{destination}\n\n{n}\0").as_bytes(),
+        );
+    }
+    out
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn acking_while_messages_arrive_by_destination_does_not_deadlock() {
+    // The background task records each header-less MESSAGE as pending while
+    // application tasks ack earlier ones. Both sides need the registry and the
+    // pending map; taken nested in opposite orders they deadlock.
+    const BURST: usize = 3000;
+    let (addr, seen) = start_broker(|raw| {
+        if raw.starts_with("SUBSCRIBE") {
+            headerless_messages("/queue/t", BURST)
+        } else {
+            Vec::new()
+        }
+    });
+    let conn = connect(&addr).await;
+    let opts = SubscriptionOptions::default().overflow_limit(BURST);
+    let mut sub = conn
+        .subscribe_with_options("/queue/t", AckMode::ClientIndividual, opts)
+        .await
+        .unwrap();
+    let sub_id = sub.id().to_string();
+
+    let (ids_tx, mut ids_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let acker = {
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            while let Some(id) = ids_rx.recv().await {
+                conn.ack(&sub_id, &id).await.unwrap();
+            }
+        })
+    };
+
+    let run = async {
+        for n in 0..BURST {
+            let frame = next_id(&mut sub, n).await;
+            ids_tx
+                .send(frame.get_header("message-id").unwrap().to_string())
+                .unwrap();
+        }
+        drop(ids_tx);
+        acker.await.unwrap();
+        conn.send_frame_confirmed(send_to("/queue/out"), Duration::from_secs(5))
+            .await
+            .unwrap();
+    };
+    tokio::time::timeout(Duration::from_secs(30), run)
+        .await
+        .expect("ack() and destination-routed delivery must not deadlock");
+    assert_eq!(seen.count("ACK"), BURST);
 }

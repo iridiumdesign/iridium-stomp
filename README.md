@@ -157,13 +157,9 @@ For broker-specific headers (durable subscriptions, selectors, etc.):
 use iridium_stomp::SubscriptionOptions;
 use iridium_stomp::AckMode;
 
-let options = SubscriptionOptions {
-    headers: vec![
-        ("activemq.subscriptionName".into(), "my-durable-sub".into()),
-        ("selector".into(), "priority > 5".into()),
-    ],
-    ..Default::default()
-};
+let options = SubscriptionOptions::new()
+    .header("activemq.subscriptionName", "my-durable-sub")
+    .header("selector", "priority > 5");
 
 let sub = conn.subscribe_with_options("/topic/events", AckMode::Client, options).await?;
 ```
@@ -275,6 +271,8 @@ while let Some(received) = conn.next_frame().await {
             }
             break;
         }
+        // `ReceivedFrame` is non-exhaustive: keep a wildcard arm.
+        _ => {}
     }
 }
 ```

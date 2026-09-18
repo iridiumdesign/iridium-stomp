@@ -93,7 +93,7 @@ pub async fn run(cli: &Cli) -> Result<(), (String, u8)> {
                     print!("> ");
                     let _ = io::stdout().flush();
                 }
-                Some(iridium_stomp::ReceivedFrame::Frame(_)) => {
+                Some(_) => {
                     // Other frames are handled by subscription receivers
                 }
                 None => break, // Connection closed
@@ -270,6 +270,12 @@ pub fn format_connection_error_pub(err: &ConnError, address: &str) -> (String, u
             format!("Receipt timeout: {}", id),
             super::exit_codes::PROTOCOL_ERROR,
         ),
+        // `ConnError` is non-exhaustive: a kind added later still gets a
+        // message and a non-zero exit.
+        other => (
+            format!("Connection failed: {}", other),
+            super::exit_codes::PROTOCOL_ERROR,
+        ),
     }
 }
 
@@ -280,15 +286,12 @@ mod tests {
 
     #[test]
     fn frame_rejected_uses_distinct_exit_code() {
-        let err = ConnError::FrameRejected(Box::new(ServerError {
-            message: "publish denied".to_string(),
-            body: Some("not allowed".to_string()),
-            receipt_id: Some("receipt-1".to_string()),
-            frame: Frame::new("ERROR")
+        let err = ConnError::FrameRejected(Box::new(ServerError::from_frame(
+            Frame::new("ERROR")
                 .header("message", "publish denied")
                 .header("receipt-id", "receipt-1")
                 .set_body(b"not allowed".to_vec()),
-        }));
+        )));
 
         let (message, code) = format_connection_error_pub(&err, "127.0.0.1:61613");
 

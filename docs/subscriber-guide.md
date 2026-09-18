@@ -267,12 +267,8 @@ let conn = Connection::connect_with_options(
     options,
 ).await?;
 
-let sub_opts = SubscriptionOptions {
-    headers: vec![
-        ("activemq.subscriptionName".into(), "my-durable-sub".into()),
-    ],
-    ..Default::default()
-};
+let sub_opts = SubscriptionOptions::new()
+    .header("activemq.subscriptionName", "my-durable-sub");
 
 // Subscribe to multiple durable topics
 let topics = vec![
@@ -282,12 +278,8 @@ let topics = vec![
 
 let mut subs = Vec::new();
 for (dest, sub_name) in &topics {
-    let sub_opts = SubscriptionOptions {
-        headers: vec![
-            ("activemq.subscriptionName".into(), (*sub_name).into()),
-        ],
-        ..Default::default()
-        };
+    let sub_opts = SubscriptionOptions::new()
+        .header("activemq.subscriptionName", *sub_name);
     subs.push(conn.subscribe_with_options(dest, AckMode::ClientIndividual, sub_opts).await?);
 }
 
