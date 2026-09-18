@@ -1419,7 +1419,12 @@ impl Connection {
                                     "reconnect: failed to send CONNECT frame, retrying in {}s",
                                     backoff_secs,
                                 );
-                                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                                tokio::select! {
+                                    biased;
+                                    // A close() during the backoff must not wait it out.
+                                    _ = shutdown_sub.recv() => break,
+                                    _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
+                                }
                                 backoff_secs = (backoff_secs * 2).min(30);
                                 continue;
                             }
@@ -1442,7 +1447,12 @@ impl Connection {
                                         "reconnect: handshake failed, retrying in {}s",
                                         backoff_secs,
                                     );
-                                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                                    tokio::select! {
+                                        biased;
+                                        // A close() during the backoff must not wait it out.
+                                        _ = shutdown_sub.recv() => break,
+                                        _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
+                                    }
                                     backoff_secs = (backoff_secs * 2).min(30);
                                     continue;
                                 }
@@ -1456,7 +1466,12 @@ impl Connection {
                                 "reconnect: broker unreachable, retrying in {}s",
                                 backoff_secs,
                             );
-                            tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                            tokio::select! {
+                                biased;
+                                // A close() during the backoff must not wait it out.
+                                _ = shutdown_sub.recv() => break,
+                                _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
+                            }
                             backoff_secs = (backoff_secs * 2).min(30);
                             continue;
                         }
@@ -1975,7 +1990,12 @@ impl Connection {
                         backoff_secs,
                     );
                 }
-                tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                tokio::select! {
+                    biased;
+                    // A close() during the backoff must not wait it out.
+                    _ = shutdown_sub.recv() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
+                }
             }
 
             // The task is done: every subscription still registered ends

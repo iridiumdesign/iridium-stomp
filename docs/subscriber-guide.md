@@ -367,7 +367,8 @@ while let Some(frame) = merged.next().await {
 ```
 
 **Abandonment** is a specific case to watch for. If the broker sends 3
-consecutive ERROR frames for the same destination (e.g. a permissions error),
+ERROR frames for the same destination over the life of the connection (e.g.
+a permissions error; the count is never reset by a successful message),
 the library stops resubscribing that destination and sends a synthetic ERROR
 frame with an `x-abandoned: true` header to `conn.next_frame()`. The
 subscription's stream ends — `sub.next()` returns `None` — and

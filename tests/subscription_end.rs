@@ -235,3 +235,54 @@ async fn live_across_a_reconnect() {
     }
     assert_eq!(sub.ended(), None, "a reconnect is not an end");
 }
+
+/// `close()` during a reconnect backoff must not wait the backoff out.
+/// The broker accepts once, drops the socket on request, and then stops
+/// listening, so every reconnect attempt is refused and the backoff
+/// grows. Closing in the middle of a sleep still ends the subscription
+/// promptly.
+#[tokio::test]
+async fn close_during_reconnect_backoff_ends_the_subscription_promptly() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        if stream.read(&mut buf).is_ok() {
+            let _ = stream.write_all(b"CONNECTED\nversion:1.2\nheart-beat:0,0\n\n\0");
+            let _ = stream.flush();
+        }
+        // Read until the drop request, then close the socket and stop
+        // listening: the listener goes out of scope with this thread.
+        let mut acc = Vec::new();
+        loop {
+            let n = match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            acc.extend_from_slice(&buf[..n]);
+            if String::from_utf8_lossy(&acc).contains("/control/drop") {
+                return;
+            }
+        }
+    });
+
+    let conn = connect(&addr).await;
+    let mut sub = conn.subscribe("/queue/t", AckMode::Auto).await.unwrap();
+    conn.send_frame(send_to("/control/drop")).await.unwrap();
+
+    // Let the reconnect fail a few times: the backoff is 1 s, 2 s, 4 s,
+    // so by now the task is inside a sleep of several seconds.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    // close() itself waits for a DISCONNECT receipt that cannot come while
+    // the broker is away, up to its disconnect timeout; that is its own
+    // matter. What must not happen is the stream living on after it.
+    let _ = conn.close().await;
+    let ended = tokio::time::timeout(Duration::from_secs(3), sub.next()).await;
+    assert!(
+        matches!(ended, Ok(None)),
+        "the subscription must end within 3 s of close(), not after the backoff"
+    );
+    assert_eq!(sub.ended(), Some(SubscriptionEnd::ConnectionClosed));
+}
