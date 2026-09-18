@@ -135,6 +135,22 @@ message delivery. See also the
 | `AckMode::Client` | Client must ACK. Acknowledging a message implicitly acknowledges all prior messages on that subscription (cumulative). |
 | `AckMode::ClientIndividual` | Client must ACK each message independently. |
 
+### Acknowledging
+
+Use `Subscription::ack_frame(&frame)` and `nack_frame(&frame)` (or the
+`Connection` methods of the same names, which also take the subscription
+id). They read the id from the MESSAGE: its `ack` header, which is what
+STOMP 1.2 requires in an ACK, or its `message-id` when the broker sent no
+`ack` header (STOMP 1.0/1.1). A frame with neither gives
+`ConnError::MissingAckId`.
+
+`ack(id)` and `nack(id)` accept either header's value. For a message still
+outstanding the library sends the `ack` header's value whichever was given;
+an id it does not know is sent as given. The distinction is not academic:
+RabbitMQ and Artemis put the same value in both headers, but ActiveMQ
+Classic does not, and it silently ignores an ACK that carries the
+`message-id`, then redelivers the message.
+
 ---
 
 ## Resubscribe on reconnect
