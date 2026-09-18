@@ -72,12 +72,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let sub_id = frame.headers.iter()
                     .find(|(k, _)| k.to_lowercase() == "subscription")
                     .map(|(_, v)| v.clone());
-                let msg_id = frame.headers.iter()
-                    .find(|(k, _)| k.to_lowercase() == "message-id")
-                    .map(|(_, v)| v.clone());
 
-                if let (Some(sub_id), Some(msg_id)) = (sub_id, msg_id)
-                    && let Err(e) = conn.ack(&sub_id, &msg_id).await
+                // Acknowledge by frame, so the right header (`ack` on STOMP
+                // 1.2, `message-id` on 1.1) is chosen for us.
+                if let Some(sub_id) = sub_id
+                    && let Err(e) = conn.ack_frame(&sub_id, &frame).await
                 {
                     eprintln!("ACK failed: {}", e);
                 }

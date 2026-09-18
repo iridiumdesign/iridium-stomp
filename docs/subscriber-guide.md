@@ -199,20 +199,27 @@ while let Some(frame) = merged.next().await {
     let body = std::str::from_utf8(&frame.body).unwrap_or("<binary>");
     println!("Message: {}", body);
 
-    // conn.ack() requires both subscription-id and message-id.
-    // Both are present as headers on every MESSAGE frame.
-    let sub_id = frame.headers.iter()
-        .find(|(k, _)| k.to_lowercase() == "subscription")
-        .map(|(_, v)| v.clone());
-    let msg_id = frame.headers.iter()
-        .find(|(k, _)| k.to_lowercase() == "message-id")
-        .map(|(_, v)| v.clone());
-
-    if let (Some(sub_id), Some(msg_id)) = (sub_id, msg_id) {
-        conn.ack(&sub_id, &msg_id).await?;
+    // conn.ack_frame() needs the subscription id, which is a header on
+    // every MESSAGE frame, and the frame itself.
+    if let Some(sub_id) = frame.get_header("subscription") {
+        conn.ack_frame(sub_id, &frame).await?;
     }
 }
 ```
+
+### Acknowledging
+
+Acknowledge with `sub.ack_frame(&frame)`, or `conn.ack_frame(sub_id, &frame)`
+when you only have the connection, and `nack_frame` likewise. They read the id
+from the frame, so you cannot pick the wrong header. It matters: STOMP 1.2
+says an ACK's `id` must be the MESSAGE's `ack` header, where 1.1 used
+`message-id`. RabbitMQ and Artemis send the same value in both. ActiveMQ
+Classic does not, and it **silently ignores** an ACK that carries the
+`message-id`: no ERROR frame, and the message is redelivered later.
+
+`ack(id)` and `nack(id)` still take a string, which may be either header's
+value; for a message the library knows is outstanding it sends the `ack`
+header's value whichever you gave.
 
 ---
 
@@ -370,7 +377,7 @@ other indication of why. The error task above is the only way to detect this.
 
 ## Checklist before production use
 
-- [ ] Use `AckMode::ClientIndividual` and ACK every message explicitly, passing both `subscription-id` and `message-id` to `conn.ack()`
+- [ ] Use `AckMode::ClientIndividual` and ACK every message explicitly with `sub.ack_frame(&frame)` (or `conn.ack_frame(sub_id, &frame)`)
 - [ ] Use durable queues/subscriptions so messages survive restarts
 - [ ] Set heartbeats to an interval your broker and network can sustain
 - [ ] Run a separate task polling `conn.next_frame()` to catch broker ERROR frames and abandonment notifications

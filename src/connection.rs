@@ -126,7 +126,7 @@ impl std::fmt::Display for Heartbeat {
 pub(crate) struct SubscriptionEntry {
     pub(crate) id: String,
     pub(crate) sender: mpsc::Sender<Frame>,
-    pub(crate) ack: String,
+    pub(crate) ack: AckMode,
     pub(crate) headers: Vec<(String, String)>,
     /// Frames waiting for room in `sender`'s channel, oldest first.
     pub(crate) overflow: Overflow,
@@ -201,11 +201,35 @@ pub(crate) enum Delivery {
 /// `SubscriptionEntry`.
 pub(crate) type Subscriptions = HashMap<String, Vec<SubscriptionEntry>>;
 
-/// Alias for the pending map: subscription_id -> queue of (message-id, Frame).
-pub(crate) type PendingMap = HashMap<String, VecDeque<(String, Frame)>>;
+/// A delivered MESSAGE the application has not yet acknowledged.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingMessage {
+    /// The value an ACK or NACK must carry in its `id` header: the MESSAGE's
+    /// `ack` header (STOMP 1.2), or its `message-id` when the broker sent no
+    /// `ack` header (STOMP 1.0/1.1), in which case the two are the same.
+    pub(crate) ack_id: String,
+    /// The MESSAGE's `message-id` header. Kept so a caller may name the
+    /// message by either value.
+    pub(crate) message_id: String,
+    #[allow(dead_code)]
+    pub(crate) frame: Frame,
+}
+
+impl PendingMessage {
+    pub(crate) fn new(ack_id: Option<&str>, message_id: &str, frame: Frame) -> Self {
+        Self {
+            ack_id: ack_id.unwrap_or(message_id).to_string(),
+            message_id: message_id.to_string(),
+            frame,
+        }
+    }
+}
+
+/// Alias for the pending map: subscription_id -> queue of `PendingMessage`.
+pub(crate) type PendingMap = HashMap<String, VecDeque<PendingMessage>>;
 
 /// Internal type for resubscribe snapshot entries: (destination, id, ack, headers)
-pub(crate) type ResubEntry = (String, String, String, Vec<(String, String)>);
+pub(crate) type ResubEntry = (String, String, AckMode, Vec<(String, String)>);
 
 /// Alias for pending receipt map: receipt-id -> oneshot sender to notify when resolved.
 pub(crate) type PendingReceipts = HashMap<String, oneshot::Sender<Result<(), ServerError>>>;
@@ -235,6 +259,10 @@ pub enum ConnError {
     /// still be usable depending on broker behavior.
     #[error("frame rejected: {0}")]
     FrameRejected(Box<ServerError>),
+    /// `ack_frame` or `nack_frame` was given a frame with neither an `ack` nor
+    /// a `message-id` header, so there is nothing to acknowledge it by.
+    #[error("frame has no `ack` or `message-id` header to acknowledge")]
+    MissingAckId,
 }
 
 /// Represents an ERROR frame received from the STOMP server.
@@ -810,7 +838,7 @@ fn park(entry: &mut SubscriptionEntry, destination: &str, frame: Frame) -> bool 
         tracing::error!(
             destination = %destination,
             subscription_id = %entry.id,
-            ack = %entry.ack,
+            ack = entry.ack.as_str(),
             limit = entry.overflow.limit,
             "subscription overflow limit exceeded; failing the subscription",
         );
@@ -1449,7 +1477,7 @@ impl Connection {
                 {
                     let mut map = subscriptions.lock().await;
                     for entry in map.values_mut().flatten() {
-                        if entry.ack != "auto" && !entry.overflow.queue.is_empty() {
+                        if entry.ack != AckMode::Auto && !entry.overflow.queue.is_empty() {
                             entry.overflow.queue.clear();
                             entry.overflow.reset_warnings();
                         }
@@ -1471,7 +1499,7 @@ impl Connection {
                                 v.push((
                                     dest.clone(),
                                     entry.id.clone(),
-                                    entry.ack.clone(),
+                                    entry.ack,
                                     entry.headers.clone(),
                                 ));
                             }
@@ -1484,7 +1512,7 @@ impl Connection {
                         sf = sf
                             .header("id", &id)
                             .header("destination", &dest)
-                            .header("ack", &ack);
+                            .header("ack", ack.as_str());
                         for (k, v) in headers {
                             sf = sf.header(&k, &v);
                         }
@@ -1554,6 +1582,7 @@ impl Connection {
                                         let mut dest_opt: Option<String> = None;
                                         let mut sub_opt: Option<String> = None;
                                         let mut msg_id_opt: Option<String> = None;
+                                        let mut ack_id_opt: Option<String> = None;
                                         for (k, v) in &f.headers {
                                             let kl = k.to_lowercase();
                                             if kl == "destination" {
@@ -1562,6 +1591,8 @@ impl Connection {
                                                 sub_opt = Some(v.clone());
                                             } else if kl == "message-id" {
                                                 msg_id_opt = Some(v.clone());
+                                            } else if kl == "ack" && ack_id_opt.is_none() {
+                                                ack_id_opt = Some(v.clone());
                                             }
                                         }
 
@@ -1579,7 +1610,7 @@ impl Connection {
                                             let map = subscriptions.lock().await;
                                             for vec in map.values() {
                                                 for entry in vec.iter() {
-                                                    if &entry.id == sub_id && entry.ack != "auto" {
+                                                    if &entry.id == sub_id && entry.ack != AckMode::Auto {
                                                         need_pending = true;
                                                     }
                                                 }
@@ -1588,7 +1619,7 @@ impl Connection {
                                             let map = subscriptions.lock().await;
                                             if let Some(vec) = map.get(dest) {
                                                 for entry in vec.iter() {
-                                                    if entry.ack != "auto" {
+                                                    if entry.ack != AckMode::Auto {
                                                         need_pending = true;
                                                         break;
                                                     }
@@ -1608,7 +1639,7 @@ impl Connection {
                                                 let q = p
                                                     .entry(sub_id.clone())
                                                     .or_insert_with(VecDeque::new);
-                                                q.push_back((msg_id.clone(), f.clone()));
+                                                q.push_back(PendingMessage::new(ack_id_opt.as_deref(), &msg_id, f.clone()));
                                             } else if let Some(dest) = &dest_opt {
                                                 // Destination-based delivery: add the message to
                                                 // the pending queue for each matching
@@ -1628,7 +1659,7 @@ impl Connection {
                                                     map.get(dest)
                                                         .map(|vec| {
                                                             vec.iter()
-                                                                .filter(|entry| entry.ack != "auto")
+                                                                .filter(|entry| entry.ack != AckMode::Auto)
                                                                 .map(|entry| entry.id.clone())
                                                                 .collect()
                                                         })
@@ -1640,7 +1671,7 @@ impl Connection {
                                                         let q = p
                                                             .entry(id)
                                                             .or_insert_with(VecDeque::new);
-                                                        q.push_back((msg_id.clone(), f.clone()));
+                                                        q.push_back(PendingMessage::new(ack_id_opt.as_deref(), &msg_id, f.clone()));
                                                     }
                                                 }
                                             }
@@ -2200,7 +2231,7 @@ impl Connection {
                 .push(SubscriptionEntry {
                     id: id.clone(),
                     sender: tx.clone(),
-                    ack: ack.as_str().to_string(),
+                    ack,
                     headers: extra_headers.clone(),
                     overflow: Overflow::new(overflow_limit, capacity),
                 });
@@ -2343,6 +2374,9 @@ impl Connection {
     /// Acknowledge a message previously received in `client` or
     /// `client-individual` ack modes.
     ///
+    /// Prefer [`ack_frame`](Self::ack_frame), which takes the MESSAGE itself
+    /// and cannot be given the wrong header.
+    ///
     /// STOMP ack semantics:
     /// - `auto`: server considers message delivered immediately; the client
     ///   should not ack.
@@ -2355,48 +2389,116 @@ impl Connection {
     /// - `subscription_id`: the local subscription id returned by
     ///   `Connection::subscribe`. This disambiguates which subscription's
     ///   pending queue to advance for cumulative ACKs.
-    /// - `message_id`: the `message-id` header value from the received
-    ///   MESSAGE frame to acknowledge.
+    /// - `message_id`: the MESSAGE's `ack` header value or its `message-id`
+    ///   header value; either identifies the message.
     ///
     /// Behavior
-    /// - The pending queue for `subscription_id` is searched for `message_id`.
-    ///   If the subscription used `client` ack mode, all pending messages up to
-    ///   and including the matched message are removed. If the subscription
-    ///   used `client-individual`, only the matched message is removed.
-    /// - An `ACK` frame is sent to the server with `id=<message_id>` and
-    ///   `subscription=<subscription_id>` headers.
-    #[allow(clippy::collapsible_if, clippy::collapsible_else_if)]
+    /// - The pending queue for `subscription_id` is searched for the message,
+    ///   by `ack` header first and then by `message-id`. If the subscription
+    ///   used `client` ack mode, all pending messages up to and including the
+    ///   matched message are removed. If the subscription used
+    ///   `client-individual`, only the matched message is removed.
+    /// - An `ACK` frame is sent to the server with `subscription` and `id`
+    ///   headers. STOMP 1.2 requires `id` to be the MESSAGE's `ack` header, so
+    ///   that is what is sent for a message found in the pending queue,
+    ///   whichever of the two values the caller gave. Brokers whose `ack` and
+    ///   `message-id` differ (ActiveMQ Classic) silently ignore an ACK that
+    ///   carries the `message-id`. A message not found in the pending queue
+    ///   (after a reconnect, say) is acknowledged with the id as given.
     pub async fn ack(&self, subscription_id: &str, message_id: &str) -> Result<(), ConnError> {
-        // Remove from the local pending queue according to subscription ack mode.
-        let mut removed_any = false;
+        self.acknowledge("ACK", subscription_id, message_id).await
+    }
+
+    /// Negative-acknowledge a message (NACK).
+    ///
+    /// Prefer [`nack_frame`](Self::nack_frame), which takes the MESSAGE itself.
+    ///
+    /// Parameters
+    /// - `subscription_id`: the local subscription id the message was delivered under.
+    /// - `message_id`: the MESSAGE's `ack` header value or its `message-id`
+    ///   header value, as for [`ack`](Self::ack).
+    ///
+    /// Behavior
+    /// - Removes the message from the local pending queue (cumulatively if the
+    ///   subscription used `client` ack mode, otherwise only the single
+    ///   message). Sends a `NACK` frame to the server with `subscription` and
+    ///   `id` headers, `id` chosen as for [`ack`](Self::ack).
+    pub async fn nack(&self, subscription_id: &str, message_id: &str) -> Result<(), ConnError> {
+        self.acknowledge("NACK", subscription_id, message_id).await
+    }
+
+    /// Acknowledge a received MESSAGE frame.
+    ///
+    /// Reads the id from the frame: its `ack` header (STOMP 1.2), or its
+    /// `message-id` when the broker sent no `ack` header (STOMP 1.0/1.1).
+    /// Returns [`ConnError::MissingAckId`] if the frame has neither.
+    /// Otherwise as [`ack`](Self::ack).
+    pub async fn ack_frame(&self, subscription_id: &str, frame: &Frame) -> Result<(), ConnError> {
+        let id = Self::ack_id_of(frame)?;
+        self.acknowledge("ACK", subscription_id, id).await
+    }
+
+    /// Negative-acknowledge a received MESSAGE frame. See
+    /// [`ack_frame`](Self::ack_frame) for how the id is chosen.
+    pub async fn nack_frame(&self, subscription_id: &str, frame: &Frame) -> Result<(), ConnError> {
+        let id = Self::ack_id_of(frame)?;
+        self.acknowledge("NACK", subscription_id, id).await
+    }
+
+    /// The id to acknowledge `frame` with: `ack`, then `message-id`.
+    fn ack_id_of(frame: &Frame) -> Result<&str, ConnError> {
+        frame
+            .get_header("ack")
+            .or_else(|| frame.get_header("message-id"))
+            .ok_or(ConnError::MissingAckId)
+    }
+
+    /// Shared body of `ack` and `nack`: settle the local pending queue and
+    /// send `command` with the id the broker expects.
+    async fn acknowledge(
+        &self,
+        command: &str,
+        subscription_id: &str,
+        id: &str,
+    ) -> Result<(), ConnError> {
         // Determine ack mode for this subscription (default to client). Read
         // and released before `pending` is taken: the two locks are never
         // held together.
-        let mut ack_mode = "client".to_string();
+        let mut ack_mode = AckMode::Client;
         {
             let map = self.subscriptions.lock().await;
             'outer: for vec in map.values() {
                 for entry in vec.iter() {
                     if entry.id == subscription_id {
-                        ack_mode = entry.ack.clone();
+                        ack_mode = entry.ack;
                         break 'outer;
                     }
                 }
             }
         }
+
+        // Remove from the local pending queue according to subscription ack
+        // mode, and learn the id to send. The caller may have named the
+        // message by its `ack` header or by its `message-id`.
+        let mut send_id = id.to_string();
         {
             let mut p = self.pending.lock().await;
             if let Some(queue) = p.get_mut(subscription_id) {
-                if let Some(pos) = queue.iter().position(|(mid, _)| mid == message_id) {
-                    if ack_mode == "client" {
+                let pos = queue
+                    .iter()
+                    .position(|m| m.ack_id == id)
+                    .or_else(|| queue.iter().position(|m| m.message_id == id));
+                if let Some(pos) = pos {
+                    send_id = queue[pos].ack_id.clone();
+                    match ack_mode {
                         // cumulative: remove up to and including pos
-                        for _ in 0..=pos {
-                            queue.pop_front();
-                            removed_any = true;
+                        AckMode::Client => {
+                            queue.drain(..=pos);
                         }
-                    } else if queue.remove(pos).is_some() {
-                        // client-individual: remove only the specific message
-                        removed_any = true;
+                        // only the specific message
+                        AckMode::ClientIndividual | AckMode::Auto => {
+                            queue.remove(pos);
+                        }
                     }
 
                     if queue.is_empty() {
@@ -2406,80 +2508,18 @@ impl Connection {
             }
         }
 
-        // Send ACK to server (include subscription header for clarity)
-        let mut f = Frame::new("ACK");
+        // If the message wasn't found locally, still send the frame with the
+        // id as given; the server may ignore it or treat it as a no-op.
+        // (Include the subscription header for clarity.)
+        let mut f = Frame::new(command);
         f = f
-            .header("id", message_id)
+            .header("id", &send_id)
             .header("subscription", subscription_id);
         self.outbound_tx
             .send(StompItem::Frame(f))
             .await
             .map_err(|_| ConnError::Protocol("send channel closed".into()))?;
 
-        // If message wasn't found locally, still send ACK to server; server
-        // may ignore or treat it as no-op.
-        let _ = removed_any;
-        Ok(())
-    }
-
-    /// Negative-acknowledge a message (NACK).
-    ///
-    /// Parameters
-    /// - `subscription_id`: the local subscription id the message was delivered under.
-    /// - `message_id`: the `message-id` header value from the received MESSAGE.
-    ///
-    /// Behavior
-    /// - Removes the message from the local pending queue (cumulatively if the
-    ///   subscription used `client` ack mode, otherwise only the single
-    ///   message). Sends a `NACK` frame to the server with `id` and
-    ///   `subscription` headers.
-    #[allow(clippy::collapsible_if, clippy::collapsible_else_if)]
-    pub async fn nack(&self, subscription_id: &str, message_id: &str) -> Result<(), ConnError> {
-        // Mirror ack removal semantics for pending map.
-        let mut removed_any = false;
-        // As in `ack`: read the mode, release, then take `pending`.
-        let mut ack_mode = "client".to_string();
-        {
-            let map = self.subscriptions.lock().await;
-            'outer2: for vec in map.values() {
-                for entry in vec.iter() {
-                    if entry.id == subscription_id {
-                        ack_mode = entry.ack.clone();
-                        break 'outer2;
-                    }
-                }
-            }
-        }
-        {
-            let mut p = self.pending.lock().await;
-            if let Some(queue) = p.get_mut(subscription_id) {
-                if let Some(pos) = queue.iter().position(|(mid, _)| mid == message_id) {
-                    if ack_mode == "client" {
-                        for _ in 0..=pos {
-                            queue.pop_front();
-                            removed_any = true;
-                        }
-                    } else if queue.remove(pos).is_some() {
-                        removed_any = true;
-                    }
-
-                    if queue.is_empty() {
-                        p.remove(subscription_id);
-                    }
-                }
-            }
-        }
-
-        let mut f = Frame::new("NACK");
-        f = f
-            .header("id", message_id)
-            .header("subscription", subscription_id);
-        self.outbound_tx
-            .send(StompItem::Frame(f))
-            .await
-            .map_err(|_| ConnError::Protocol("send channel closed".into()))?;
-
-        let _ = removed_any;
         Ok(())
     }
 
@@ -2904,7 +2944,7 @@ mod tests {
         let mut full = SubscriptionEntry {
             id: "1".into(),
             sender: tx,
-            ack: "auto".into(),
+            ack: AckMode::Auto,
             headers: vec![],
             overflow: Overflow::default(),
         };
@@ -2958,7 +2998,7 @@ mod tests {
         let mut closed = SubscriptionEntry {
             id: "2".into(),
             sender: tx,
-            ack: "auto".into(),
+            ack: AckMode::Auto,
             headers: vec![],
             overflow: Overflow::default(),
         };
@@ -2976,7 +3016,7 @@ mod tests {
         let mut entry = SubscriptionEntry {
             id: "1".into(),
             sender: tx,
-            ack: "auto".into(),
+            ack: AckMode::Auto,
             headers: vec![],
             overflow: Overflow::new(2, 1),
         };
@@ -3028,7 +3068,7 @@ mod tests {
         let mut none = SubscriptionEntry {
             id: "2".into(),
             sender: tx,
-            ack: "auto".into(),
+            ack: AckMode::Auto,
             headers: vec![],
             overflow: Overflow::new(0, 1),
         };
@@ -3306,7 +3346,7 @@ mod tests {
         // loses both the `pending` lock and the outbound send.
         conn.pending.lock().await.insert(
             "gone".to_string(),
-            VecDeque::from([("old".to_string(), Frame::new("MESSAGE"))]),
+            VecDeque::from([PendingMessage::new(None, "old", Frame::new("MESSAGE"))]),
         );
 
         conn.send_frame_confirmed(
@@ -3318,7 +3358,7 @@ mod tests {
 
         let p = conn.pending.lock().await;
         assert!(!p.contains_key("gone"), "the orphan queue must be swept");
-        let live: Vec<&str> = p[sub.id()].iter().map(|(id, _)| id.as_str()).collect();
+        let live: Vec<&str> = p[sub.id()].iter().map(|m| m.message_id.as_str()).collect();
         assert_eq!(
             live,
             ["m0"],
@@ -3328,6 +3368,79 @@ mod tests {
 
         let _ = conn.close().await;
         server.join().unwrap();
+    }
+
+    /// A connection whose broker answers SUBSCRIBE with three MESSAGEs in
+    /// which `ack` and `message-id` differ, as ActiveMQ Classic sends them
+    /// (#119). Returns the connection, the subscription and the three frames.
+    async fn three_messages_with_differing_ack_headers(
+        ack: AckMode,
+    ) -> (Connection, crate::subscription::Subscription, Vec<Frame>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _connect = read_stomp_frame(&mut stream);
+            stream
+                .write_all(b"CONNECTED\nversion:1.2\nheart-beat:0,0\n\n\0")
+                .unwrap();
+            let subscribe = read_stomp_frame(&mut stream);
+            let sub_id = header_value(&subscribe, "id").to_string();
+            let mut burst = String::new();
+            for n in 1..=3 {
+                burst.push_str(&format!(
+                    "MESSAGE\nsubscription:{sub_id}\nmessage-id:M{n}\nack:A{n}\ndestination:/queue/t\n\n\0"
+                ));
+            }
+            stream.write_all(burst.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            // Keep the socket open while the test acks.
+            let mut sink = [0u8; 1024];
+            while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
+        });
+
+        let conn = connect_for_test(&addr).await;
+        let mut sub = conn.subscribe("/queue/t", ack).await.unwrap();
+        let mut frames = Vec::new();
+        for _ in 0..3 {
+            frames.push(sub.next().await.unwrap());
+        }
+        (conn, sub, frames)
+    }
+
+    async fn pending_message_ids(conn: &Connection, sub_id: &str) -> Vec<String> {
+        conn.pending
+            .lock()
+            .await
+            .get(sub_id)
+            .map(|q| q.iter().map(|m| m.message_id.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn ack_by_either_header_or_by_frame_clears_pending() {
+        let (conn, sub, frames) =
+            three_messages_with_differing_ack_headers(AckMode::ClientIndividual).await;
+        assert_eq!(
+            pending_message_ids(&conn, sub.id()).await,
+            ["M1", "M2", "M3"]
+        );
+
+        sub.ack("M1").await.unwrap();
+        assert_eq!(pending_message_ids(&conn, sub.id()).await, ["M2", "M3"]);
+        sub.nack("A2").await.unwrap();
+        assert_eq!(pending_message_ids(&conn, sub.id()).await, ["M3"]);
+        sub.ack_frame(&frames[2]).await.unwrap();
+        assert!(!conn.pending.lock().await.contains_key(sub.id()));
+    }
+
+    #[tokio::test]
+    async fn cumulative_ack_by_message_id_clears_everything_before_it() {
+        let (conn, sub, _frames) = three_messages_with_differing_ack_headers(AckMode::Client).await;
+        assert_eq!(pending_message_ids(&conn, sub.id()).await.len(), 3);
+
+        sub.ack("M3").await.unwrap();
+        assert!(!conn.pending.lock().await.contains_key(sub.id()));
     }
 
     #[tokio::test]
@@ -3506,7 +3619,7 @@ mod tests {
                 vec![SubscriptionEntry {
                     id: "s1".to_string(),
                     sender: sub_sender,
-                    ack: "client".to_string(),
+                    ack: AckMode::Client,
                     headers: Vec::new(),
                     overflow: Overflow::default(),
                 }],
@@ -3517,16 +3630,19 @@ mod tests {
         {
             let mut p = pending.lock().await;
             let mut q = VecDeque::new();
-            q.push_back((
-                "m1".to_string(),
+            q.push_back(PendingMessage::new(
+                None,
+                "m1",
                 make_message("m1", Some("s1"), Some("/queue/x")),
             ));
-            q.push_back((
-                "m2".to_string(),
+            q.push_back(PendingMessage::new(
+                None,
+                "m2",
                 make_message("m2", Some("s1"), Some("/queue/x")),
             ));
-            q.push_back((
-                "m3".to_string(),
+            q.push_back(PendingMessage::new(
+                None,
+                "m3",
                 make_message("m3", Some("s1"), Some("/queue/x")),
             ));
             p.insert("s1".to_string(), q);
@@ -3551,7 +3667,7 @@ mod tests {
             let p = pending.lock().await;
             let q = p.get("s1").expect("missing s1");
             assert_eq!(q.len(), 1);
-            assert_eq!(q.front().unwrap().0, "m3");
+            assert_eq!(q.front().unwrap().message_id, "m3");
         }
 
         // verify an ACK frame was emitted
@@ -3586,7 +3702,7 @@ mod tests {
                 vec![SubscriptionEntry {
                     id: "s2".to_string(),
                     sender: sub_sender,
-                    ack: "client-individual".to_string(),
+                    ack: AckMode::ClientIndividual,
                     headers: Vec::new(),
                     overflow: Overflow::default(),
                 }],
@@ -3597,16 +3713,19 @@ mod tests {
         {
             let mut p = pending.lock().await;
             let mut q = VecDeque::new();
-            q.push_back((
-                "a".to_string(),
+            q.push_back(PendingMessage::new(
+                None,
+                "a",
                 make_message("a", Some("s2"), Some("/queue/y")),
             ));
-            q.push_back((
-                "b".to_string(),
+            q.push_back(PendingMessage::new(
+                None,
+                "b",
                 make_message("b", Some("s2"), Some("/queue/y")),
             ));
-            q.push_back((
-                "c".to_string(),
+            q.push_back(PendingMessage::new(
+                None,
+                "c",
                 make_message("c", Some("s2"), Some("/queue/y")),
             ));
             p.insert("s2".to_string(), q);
@@ -3631,8 +3750,8 @@ mod tests {
             let p = pending.lock().await;
             let q = p.get("s2").expect("missing s2");
             assert_eq!(q.len(), 2);
-            assert_eq!(q[0].0, "a");
-            assert_eq!(q[1].0, "c");
+            assert_eq!(q[0].message_id, "a");
+            assert_eq!(q[1].message_id, "c");
         }
 
         // verify an ACK frame was emitted
@@ -3740,8 +3859,9 @@ mod tests {
         {
             let mut p = conn.pending.lock().await;
             let mut q = VecDeque::new();
-            q.push_back((
-                "mid-1".to_string(),
+            q.push_back(PendingMessage::new(
+                None,
+                "mid-1",
                 make_message("mid-1", Some(&sub_id), Some("/queue/ack")),
             ));
             p.insert(sub_id.clone(), q);
@@ -3959,7 +4079,7 @@ mod tests {
                 vec![SubscriptionEntry {
                     id: "1".to_string(),
                     sender,
-                    ack: "auto".to_string(),
+                    ack: AckMode::Auto,
                     headers: Vec::new(),
                     overflow: Overflow::default(),
                 }],

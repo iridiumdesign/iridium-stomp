@@ -33,18 +33,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(frame) = sub.next().await {
         println!("received frame:\n{}", frame);
 
-        // read message-id header for ACK
-        let msg_id = frame
-            .headers
-            .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case("message-id"))
-            .map(|(_, v)| v.to_string());
-
-        if let Some(id) = msg_id {
-            // Acknowledge the message via the subscription convenience method
-            sub.ack(&id).await?;
-            println!("acked message-id={}", id);
-        }
+        // Acknowledge by frame: STOMP 1.2 wants the MESSAGE's `ack` header in
+        // the ACK, 1.1 its `message-id`, and `ack_frame` picks the right one.
+        sub.ack_frame(&frame).await?;
+        println!(
+            "acked message-id={}",
+            frame.get_header("message-id").unwrap_or("")
+        );
     }
 
     // Explicitly unsubscribe when done (consumes the subscription)

@@ -179,15 +179,34 @@ impl Subscription {
         std::mem::replace(&mut self.receiver, dummy_rx)
     }
 
-    /// Acknowledge a message by its `message-id` header. Delegates to
-    /// `Connection::ack` using the local subscription id.
+    /// Acknowledge a message by its `ack` header value or its `message-id`
+    /// header value; either identifies it. Delegates to `Connection::ack`
+    /// using the local subscription id. Prefer [`ack_frame`](Self::ack_frame).
     pub async fn ack(&self, message_id: &str) -> Result<(), ConnError> {
         self.conn.ack(&self.id, message_id).await
     }
 
-    /// Negative-acknowledge a message by its `message-id` header.
+    /// Negative-acknowledge a message by its `ack` header value or its
+    /// `message-id` header value. Prefer [`nack_frame`](Self::nack_frame).
     pub async fn nack(&self, message_id: &str) -> Result<(), ConnError> {
         self.conn.nack(&self.id, message_id).await
+    }
+
+    /// Acknowledge a MESSAGE frame received from this subscription.
+    ///
+    /// This is the form to use: it reads the id from the frame, so the caller
+    /// cannot pick the wrong header. STOMP 1.2 acknowledges by the MESSAGE's
+    /// `ack` header, 1.0/1.1 by its `message-id`, and some brokers (ActiveMQ
+    /// Classic) silently ignore an ACK that carries the wrong one. Returns
+    /// [`ConnError::MissingAckId`] if the frame has neither header.
+    pub async fn ack_frame(&self, frame: &Frame) -> Result<(), ConnError> {
+        self.conn.ack_frame(&self.id, frame).await
+    }
+
+    /// Negative-acknowledge a MESSAGE frame received from this subscription.
+    /// See [`ack_frame`](Self::ack_frame).
+    pub async fn nack_frame(&self, frame: &Frame) -> Result<(), ConnError> {
+        self.conn.nack_frame(&self.id, frame).await
     }
 
     /// Consume the subscription and unsubscribe from the server.

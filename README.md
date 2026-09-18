@@ -151,6 +151,19 @@ let sub = conn.subscribe("/queue/jobs", AckMode::Client).await?;
 let sub = conn.subscribe("/queue/tasks", AckMode::ClientIndividual).await?;
 ```
 
+In the client modes, acknowledge each message with the frame you received:
+
+```rust,ignore
+while let Some(frame) = sub.next().await {
+    // ... handle it ...
+    sub.ack_frame(&frame).await?;   // or sub.nack_frame(&frame)
+}
+```
+
+`ack_frame` reads the id from the frame: the `ack` header on STOMP 1.2, the
+`message-id` on 1.1. Some brokers (ActiveMQ Classic) silently ignore an ACK
+that carries the wrong one, so prefer it to building the id yourself.
+
 For broker-specific headers (durable subscriptions, selectors, etc.):
 
 ```rust,ignore
