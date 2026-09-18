@@ -177,6 +177,28 @@ let options = SubscriptionOptions::new()
 let sub = conn.subscribe_with_options("/topic/events", AckMode::Client, options).await?;
 ```
 
+When a subscription's stream ends (`sub.next()` yields `None`), the handle
+says why:
+
+```rust,ignore
+use iridium_stomp::SubscriptionEnd;
+
+while let Some(frame) = sub.next().await {
+    // ...
+}
+match sub.ended() {
+    Some(SubscriptionEnd::Abandoned { message }) => eprintln!("broker refused it: {message}"),
+    Some(SubscriptionEnd::Overflowed { limit }) => eprintln!("fell more than {limit} behind"),
+    Some(SubscriptionEnd::Unsubscribed) | Some(SubscriptionEnd::ConnectionClosed) => {}
+    other => eprintln!("ended: {other:?}"),
+}
+```
+
+A subscription is abandoned after repeated broker ERROR frames for its
+destination, and failed when more than `overflow_limit` messages are parked
+behind a consumer that has stopped reading. A reconnect is neither: the
+subscription is re-established and `ended()` stays `None`.
+
 ### Cloneable Connection
 
 The `Connection` is cloneable and thread-safe. Multiple tasks can share the
@@ -486,6 +508,15 @@ cargo test --test codec_fuzz        # Randomized chunk splitting
 cargo test --test codec_stress      # Concurrent stress testing
 ```
 
+### Against a Real Broker
+
+`tests/live_broker.rs` runs against a real broker when `STOMP_LIVE_ADDR` is
+set, and is skipped otherwise. It checks what a fake broker cannot vouch
+for: that acks take, that the broker redelivers after an overflow, that an
+idle connection outlives the broker's TTL, and that a subscription survives
+the broker restarting. See CONTRIBUTING for the recipe; it is run against
+Artemis, ActiveMQ Classic and RabbitMQ before a release.
+
 ### Integration Tests in CI
 
 The CI workflow includes a smoke integration test that verifies the library
@@ -536,6 +567,7 @@ The smoke test is skipped by default unless `RUN_STOMP_SMOKE=1` is set, since it
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for
+This project is licensed under the MIT License. See
+[LICENSE](https://github.com/iridiumdesign/iridium-stomp/blob/main/LICENSE) for
 details.
 

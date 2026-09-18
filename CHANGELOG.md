@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-18
+
 ### Changed
 
 - **BREAKING — `ConnError::ServerRejected` and `ConnError::FrameRejected` now hold `Box<ServerError>` instead of `ServerError`.** `ServerError` is 144 bytes (it carries the whole ERROR `Frame`), which made `ConnError` 152 bytes and every `Result<_, ConnError>` in the crate that size — paid on the success path too, and copied up the stack at each `?`. Boxing drops `Result<(), ConnError>` from 152 bytes to 32. Reading is unaffected, since `Box<ServerError>` derefs: `err.message`, `err.body`, and `err.receipt_id` compile unchanged. Constructing needs `Box::new(...)`, and destructuring through the variant in a pattern no longer matches. This also clears `clippy::result_large_err`, which began failing CI when clippy 0.1.98 tightened the lint (#112)
@@ -28,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `Connection::close` during a reconnect backoff was not seen until the backoff, up to thirty seconds, had run out; the four backoff sleeps inside the background task now race the shutdown signal, so the task, and every subscription's stream, ends at once.
 - `Connection::close` (or the background task ending) left every `Subscription` stream open: the registry, and with it each subscription's sender, was never dropped, so `sub.next()` waited forever on a connection that no longer existed. The background task now ends every remaining subscription on its way out, and `sub.ended()` reports `ConnectionClosed` (#89)
 - **An ACK built the way the examples showed was silently ignored by ActiveMQ Classic, and every message was processed at least twice.** STOMP 1.2 requires an ACK's `id` to be the MESSAGE's `ack` header, but the crate acknowledged by `message-id` and never read `ack`. On RabbitMQ and Artemis the two headers carry the same value, so it worked by luck; on Classic they differ (`message-id: ID:…-3:3:-1:1:1`, `ack: ID:…-4:1`), the ACK is dropped without an ERROR frame, and the message comes back on the next connection with `redelivered:true`. The library now records each delivered MESSAGE's `ack` header and sends that in the ACK or NACK. `ack(id)` and `nack(id)` accept either header's value and translate it, so callers passing `message-id` are fixed without a change, and callers already passing the `ack` header value (the workaround) keep working and now also get their local pending entry cleared instead of leaking it until a reconnect (#119)
   - RabbitMQ 3.11: `ack` == `message-id`; unaffected either way
@@ -284,7 +287,8 @@ Every breaking change in this release is listed here, with its migration.
 - Feature-gated CLI (`--features cli`)
 - Comprehensive test suite (150+ tests)
 
-[Unreleased]: https://github.com/iridiumdesign/iridium-stomp/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/iridiumdesign/iridium-stomp/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/iridiumdesign/iridium-stomp/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/iridiumdesign/iridium-stomp/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/iridiumdesign/iridium-stomp/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/iridiumdesign/iridium-stomp/compare/v0.4.0...v0.4.1
