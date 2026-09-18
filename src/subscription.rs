@@ -307,7 +307,7 @@ impl Drop for Subscription {
     /// A dropped handle means the caller is done receiving, so the broker-side
     /// subscription should stop rather than linger and keep delivering (and be
     /// replayed on reconnect). `Drop` cannot `.await`, so this is best-effort
-    /// via [`Connection::unsubscribe_best_effort`]. It is skipped when the
+    /// via `Connection::unsubscribe_best_effort`. It is skipped when the
     /// subscription was already unsubscribed or when the receiver was handed off
     /// through [`into_receiver`](Subscription::into_receiver).
     fn drop(&mut self) {
