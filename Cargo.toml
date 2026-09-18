@@ -34,18 +34,18 @@ required-features = ["cli"]
 [dependencies]
 
 # Async runtime and utilities
-tokio = { version = "1", features = ["net", "time", "rt-multi-thread", "sync", "macros", "io-std", "io-util", "signal"] }
+tokio = { version = "1.38", features = ["net", "time", "rt-multi-thread", "sync", "macros", "io-std", "io-util", "signal"] }
 bytes = "1"
 tokio-util = { version = "0.7", features = ["codec"] }
 futures = "0.3"
-thiserror = "1"
-tracing = "0.1"
+thiserror = "1.0.2"
+tracing = "0.1.6"
 
 # CLI (optional)
 clap = { version = "4", features = ["derive"], optional = true }
 ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.28", optional = true }
-chrono = { version = "0.4", optional = true, default-features = false, features = ["std", "clock"] }
+chrono = { version = "0.4.10", optional = true, default-features = false, features = ["std", "clock"] }
 
 [dev-dependencies]
 rand = "0.8"

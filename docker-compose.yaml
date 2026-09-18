@@ -10,8 +10,6 @@ services:
       - "5672:5672"    # AMQP
       - "15672:15672"  # HTTP management UI
       - "61613:61613"  # STOMP
-    volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
     # Ensure STOMP (and management) plugins are enabled before server start
     command: >
       bash -lc "rabbitmq-plugins enable --offline rabbitmq_stomp && rabbitmq-plugins enable --offline rabbitmq_management && rabbitmq-server"
@@ -20,7 +18,3 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-
-volumes:
-  rabbitmq_data:
-    name: rabbitmq_data

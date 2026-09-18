@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - After: `SubscriptionOptions::new().header("selector", "priority > 5")`, with `.channel_capacity(n)` and `.overflow_limit(n)` for the new fields
   - Before: `match err { ConnError::Io(e) => ..., ConnError::Protocol(m) => ..., ConnError::ReceiptTimeout(id) => ..., ConnError::ServerRejected(e) => ..., ConnError::FrameRejected(e) => ... }`
   - After: the same arms, plus `other => ...` (or `_ => ...`). The same goes for `ReceivedFrame` and `AckMode`
+- The dependency floors in `Cargo.toml` are raised to the lowest versions the crate is actually built and tested against, which nothing checked before: `tokio` 1 → 1.38 (the test suite uses `mpsc::Receiver::max_capacity` and `is_closed`), `thiserror` 1 → 1.0.2 (`#[from]`), `tracing` 0.1 → 0.1.6 (the field-then-message macro form), and `chrono` 0.4 → 0.4.10 (the `std` feature). `bytes` 1, `tokio-util` 0.7, `futures` 0.3, `clap` 4, `ratatui` 0.30, `crossterm` 0.28 and `rand` 0.8 already held. `just minimal-versions` and a non-blocking CI job keep them true; both minimise direct dependencies only (#123)
 
 ### Added
 
