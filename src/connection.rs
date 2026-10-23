@@ -224,6 +224,11 @@ pub(crate) struct PendingMessage {
     pub(crate) message_id: String,
     #[allow(dead_code)]
     pub(crate) frame: Frame,
+    /// Delivered on an earlier connection. Its ack id means nothing to the
+    /// current session, so an ack or nack for it is not sent (#118). Retired
+    /// entries are always at the front of their queue: they are marked at a
+    /// reconnect, before anything is delivered on the new connection.
+    pub(crate) retired: bool,
 }
 
 impl PendingMessage {
@@ -232,8 +237,19 @@ impl PendingMessage {
             ack_id: ack_id.unwrap_or(message_id).to_string(),
             message_id: message_id.to_string(),
             frame,
+            retired: false,
         }
     }
+}
+
+/// Where `id` sits in `queue` among the entries whose `retired` flag is
+/// `retired`: matched by ack id first, then by `message-id`.
+fn locate(queue: &VecDeque<PendingMessage>, id: &str, retired: bool) -> Option<usize> {
+    let among = |m: &PendingMessage| m.retired == retired;
+    queue
+        .iter()
+        .position(|m| among(m) && m.ack_id == id)
+        .or_else(|| queue.iter().position(|m| among(m) && m.message_id == id))
 }
 
 /// Alias for the pending map: subscription_id -> queue of `PendingMessage`.
@@ -1512,12 +1528,23 @@ impl Connection {
                 let in_tx = in_tx.clone();
                 let subscriptions = subscriptions_clone.clone();
 
-                // Clear pending message map on reconnect — messages that were
-                // outstanding before the disconnect are considered lost and
-                // will be redelivered by the server as appropriate.
+                // Retire the pending messages on reconnect. The broker
+                // redelivers what the old session left unacknowledged, under
+                // ids of its own, but the application may still hold the old
+                // copies, in a subscription channel or mid-processing. Keeping
+                // them, marked, lets `acknowledge` recognise an ack for one
+                // and not send an id this session never issued (#118). What
+                // was retired at an earlier reconnect is dropped now, so only
+                // one session's worth is kept.
                 {
                     let mut p = pending_clone.lock().await;
-                    p.clear();
+                    p.retain(|_, queue| {
+                        queue.retain(|m| !m.retired);
+                        for m in queue.iter_mut() {
+                            m.retired = true;
+                        }
+                        !queue.is_empty()
+                    });
                 }
 
                 // The same goes for parked frames. In the client ack modes the
@@ -2491,7 +2518,14 @@ impl Connection {
     ///   whichever of the two values the caller gave. Brokers whose `ack` and
     ///   `message-id` differ (ActiveMQ Classic) silently ignore an ACK that
     ///   carries the `message-id`. A message not found in the pending queue
-    ///   (after a reconnect, say) is acknowledged with the id as given.
+    ///   is acknowledged with the id as given.
+    /// - A message delivered before the most recent reconnect is not
+    ///   acknowledged at all: its id belongs to the old session, and the
+    ///   broker redelivers the message. `Ok(())` is returned, and the
+    ///   redelivered copy is the one to acknowledge. See
+    ///   [what a consumer sees across a reconnect][reconnect].
+    ///
+    /// [reconnect]: https://github.com/iridiumdesign/iridium-stomp/blob/main/docs/subscriber-guide.md#what-a-consumer-sees-across-a-reconnect
     pub async fn ack(&self, subscription_id: &str, message_id: &str) -> Result<(), ConnError> {
         self.acknowledge("ACK", subscription_id, message_id).await
     }
@@ -2567,16 +2601,21 @@ impl Connection {
         // Remove from the local pending queue according to subscription ack
         // mode, and learn the id to send. The caller may have named the
         // message by its `ack` header or by its `message-id`.
+        //
+        // A match among this session's messages wins over a retired one. A
+        // broker that reuses ids across sessions then has the stale copy's
+        // ack settle the redelivered copy, and the redelivered copy's ack
+        // settle the stale one, so each message is acknowledged once,
+        // whichever order the application acks in.
         let mut send_id = id.to_string();
+        let mut retired = false;
         {
             let mut p = self.pending.lock().await;
             if let Some(queue) = p.get_mut(subscription_id) {
-                let pos = queue
-                    .iter()
-                    .position(|m| m.ack_id == id)
-                    .or_else(|| queue.iter().position(|m| m.message_id == id));
+                let pos = locate(queue, id, false).or_else(|| locate(queue, id, true));
                 if let Some(pos) = pos {
                     send_id = queue[pos].ack_id.clone();
+                    retired = queue[pos].retired;
                     match ack_mode {
                         // cumulative: remove up to and including pos
                         AckMode::Client => {
@@ -2593,6 +2632,18 @@ impl Connection {
                     }
                 }
             }
+        }
+
+        // The message was delivered before a reconnect: the broker will
+        // redeliver it, and this session has never issued its id (#118).
+        if retired {
+            tracing::debug!(
+                subscription_id,
+                id = %send_id,
+                command,
+                "message predates the reconnect; not sending its {command}",
+            );
+            return Ok(());
         }
 
         // If the message wasn't found locally, still send the frame with the

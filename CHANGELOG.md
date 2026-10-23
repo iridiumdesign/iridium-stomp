@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **The crate is now licensed under `MIT OR Apache-2.0`**, the Rust ecosystem's usual dual license, instead of MIT alone. Apache-2.0 adds an express patent grant that some downstream users need, and keeping MIT alongside it preserves GPLv2 compatibility. The license texts are `LICENSE-MIT` (the former `LICENSE`) and `LICENSE-APACHE`. Releases through 0.6.0 remain available under MIT. The code contributed under MIT alone (#72, #87, #88, #90) has been rewritten, with the same behaviour and public names, and the first-connection half of #72 now has its own test (#111, #75)
 
+### Fixed
+
+- **After a reconnect, acknowledging a message delivered on the old connection sent an ACK the new session had never issued.** Frames already in a subscription's channel, or still being processed, when the connection dropped could not be recalled. In the `client` and `client-individual` ack modes the broker redelivers them, so the application saw each one twice, and the first ack carried a dead id. Brokers ignore such an ACK or answer it with an ERROR on `next_frame()`, with nothing tying the ERROR to its cause. The library now keeps the old session's pending messages, marked as retired, until the next reconnect. An `ack`, `nack`, `ack_frame` or `nack_frame` naming one returns `Ok(())` without sending anything, and logs at `debug`. The redelivered copy is acknowledged as usual. A broker that reuses message ids across sessions gets each message acknowledged exactly once, whichever copy the application acks first (#118)
+
 ## [0.6.0] - 2026-09-18
 
 ### Changed

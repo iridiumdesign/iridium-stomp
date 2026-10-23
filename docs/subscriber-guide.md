@@ -160,15 +160,19 @@ says can make it. See "What is lost on reconnect" above.
   because they are coming again. It cannot take back a frame that was already
   in the subscription's channel, so on such a destination that frame is seen
   **twice**: once from the channel, then again redelivered. On a plain topic
-  it is seen once, and whatever was not yet in the channel is gone. Acknowledging the first copy does
-  nothing useful, because its id belongs to the old session; the ACK is still
-  sent, and the broker ignores it or answers with an ERROR on
-  `conn.next_frame()`. Acknowledge the redelivered copy, and make message
-  handling idempotent.
+  it is seen once, and whatever was not yet in the channel is gone. The first
+  copy's id belongs to the old session, so acknowledging it sends nothing:
+  `ack_frame` (and `ack`, `nack`, `nack_frame`) returns `Ok(())` and logs at
+  `debug`. The same holds for a message the application was still
+  processing when the connection dropped. Acknowledge the redelivered copy,
+  as you would any message, and make message handling idempotent.
 
-Nothing marks the stale copy as stale today. Tagging frames with the
-connection they arrived on, so that such an ACK is never sent, is planned in
-[#118](https://github.com/iridiumdesign/iridium-stomp/issues/118).
+Some brokers reuse a message's id when they redeliver it, so the two copies
+carry the same id and an ack cannot say which one it means. The library
+then settles the redelivered copy first and the stale one second. Each
+message is still acknowledged exactly once, whichever copy you ack first
+and whether you ack each message or, in `client` mode, only the last of a
+batch.
 
 ---
 
