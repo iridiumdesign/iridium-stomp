@@ -259,23 +259,26 @@ fn frame_duplicate_headers() {
 }
 
 #[test]
-fn frame_get_header_is_case_insensitive() {
-    let frame = Frame::new("MESSAGE")
-        .header("Message-Id", "msg-123")
-        .header("Subscription", "sub-1");
-
-    assert_eq!(frame.get_header("message-id"), Some("msg-123"));
-    assert_eq!(frame.get_header("MESSAGE-ID"), Some("msg-123"));
-    assert_eq!(frame.get_header("subscription"), Some("sub-1"));
+fn get_header_ignores_ascii_case_in_the_name() {
+    // A broker or proxy may send `Destination` where the spec writes
+    // `destination`; either spelling of the lookup finds it.
+    let frame = Frame::new("MESSAGE").header("Destination", "/queue/a");
+    for name in ["destination", "Destination", "DESTINATION"] {
+        assert_eq!(frame.get_header(name), Some("/queue/a"), "lookup by {name}");
+    }
+    assert_eq!(frame.get_header("destinations"), None);
 }
 
 #[test]
-fn frame_get_header_returns_first_case_insensitive_match() {
+fn get_header_returns_the_first_of_repeated_headers() {
+    // STOMP 1.2: when a header repeats, only the first entry is used. That
+    // holds when the repeats differ in case, too.
     let frame = Frame::new("MESSAGE")
-        .header("Message-Id", "first")
-        .header("message-id", "second");
-
-    assert_eq!(frame.get_header("MESSAGE-ID"), Some("first"));
+        .header("custom", "first")
+        .header("custom", "second")
+        .header("Custom", "third");
+    assert_eq!(frame.get_header("custom"), Some("first"));
+    assert_eq!(frame.get_header("CUSTOM"), Some("first"));
 }
 
 #[test]

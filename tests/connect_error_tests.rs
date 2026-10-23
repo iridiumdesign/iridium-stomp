@@ -5,70 +5,68 @@
 
 use iridium_stomp::Connection;
 use iridium_stomp::connection::ConnError;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener};
-use std::thread;
+use std::io::{ErrorKind, Read, Write};
+use std::net::TcpListener;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-fn bind_loopback_listener() -> (TcpListener, SocketAddr) {
+/// A listener on a free loopback port, bound before any thread is spawned so
+/// the client can never dial ahead of it, and the address to dial.
+fn listen() -> (TcpListener, String) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = listener.local_addr().unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
     (listener, addr)
 }
 
-fn unused_loopback_addr() -> String {
-    let (listener, addr) = bind_loopback_listener();
-    drop(listener);
-    addr.to_string()
+/// An address nothing listens on: a free port, bound and released.
+fn closed_port() -> String {
+    listen().1
 }
 
-fn start_error_frame_server() -> (String, thread::JoinHandle<()>) {
-    let (listener, addr) = bind_loopback_listener();
-
-    let handle = thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            // Read the CONNECT frame (we don't need to parse it fully)
-            let mut buf = [0u8; 1024];
-            let _ = stream.read(&mut buf);
-
-            // Send ERROR frame
-            let error_frame = "ERROR\nmessage:Authentication failed\n\nInvalid credentials\0";
-            stream.write_all(error_frame.as_bytes()).unwrap();
-            stream.flush().unwrap();
-        }
+/// A broker that answers the first CONNECT with an ERROR frame.
+fn refusing_broker() -> (String, JoinHandle<()>) {
+    let (listener, addr) = listen();
+    let broker = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        // What the CONNECT says does not matter; wait for it, then refuse.
+        let _ = socket.read(&mut [0u8; 1024]);
+        socket
+            .write_all(b"ERROR\nmessage:Authentication failed\n\nInvalid credentials\0")
+            .unwrap();
     });
-
-    (addr.to_string(), handle)
+    (addr, broker)
 }
 
-fn start_close_during_handshake_server(run_for: Duration) -> (String, thread::JoinHandle<()>) {
-    let (listener, addr) = bind_loopback_listener();
+/// A broker that, for `lifetime`, hangs up on every client once its CONNECT
+/// arrives. The listener polls, so the thread sees the deadline even while
+/// nobody is dialing.
+fn hang_up_broker(lifetime: Duration) -> (String, JoinHandle<()>) {
+    let (listener, addr) = listen();
     listener.set_nonblocking(true).unwrap();
-
-    let handle = thread::spawn(move || {
-        let deadline = Instant::now() + run_for;
-        while Instant::now() < deadline {
+    let broker = thread::spawn(move || {
+        let stop_at = Instant::now() + lifetime;
+        while Instant::now() < stop_at {
             match listener.accept() {
-                Ok((mut stream, _)) => {
-                    let mut buf = [0u8; 1024];
-                    let _ = stream.read(&mut buf);
-                    drop(stream);
+                Ok((mut socket, _)) => {
+                    // Some platforms hand back the listener's non-blocking
+                    // mode; block so the read really waits for the CONNECT.
+                    socket.set_nonblocking(false).unwrap();
+                    let _ = socket.read(&mut [0u8; 1024]);
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(10));
                 }
-                Err(_) => break,
+                Err(_) => return,
             }
         }
     });
-
-    (addr.to_string(), handle)
+    (addr, broker)
 }
 
 /// Test that server sending ERROR frame during CONNECT returns ServerRejected
 #[tokio::test]
 async fn connect_error_frame_returns_server_rejected() {
-    let (addr, server) = start_error_frame_server();
+    let (addr, server) = refusing_broker();
 
     // Attempt connection
     let result = Connection::connect(&addr, "user", "wrongpass", "0,0").await;
@@ -90,7 +88,7 @@ async fn connect_error_frame_returns_server_rejected() {
 /// (not an immediate failure). Protocol errors during handshake are transient.
 #[tokio::test]
 async fn connect_closed_before_connected_retries() {
-    let (addr, server) = start_close_during_handshake_server(Duration::from_secs(2));
+    let (addr, server) = hang_up_broker(Duration::from_secs(2));
 
     // Should keep retrying, not return an error
     let result = tokio::time::timeout(
@@ -114,7 +112,7 @@ async fn connect_closed_before_connected_retries() {
 /// then cancel the attempt.
 #[tokio::test]
 async fn connect_refused_retries_instead_of_failing() {
-    let addr = unused_loopback_addr();
+    let addr = closed_port();
 
     // No server listening — connect should retry, not return an error.
     let result = tokio::time::timeout(

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The crate is now licensed under `MIT OR Apache-2.0`**, the Rust ecosystem's usual dual license, instead of MIT alone. Apache-2.0 adds an express patent grant that some downstream users need, and keeping MIT alongside it preserves GPLv2 compatibility. The license texts are `LICENSE-MIT` (the former `LICENSE`) and `LICENSE-APACHE`. Releases through 0.6.0 remain available under MIT. The code contributed under MIT alone (#72, #87, #88, #90) has been rewritten, with the same behaviour and public names, and the first-connection half of #72 now has its own test (#111, #75)
+
 ## [0.6.0] - 2026-09-18
 
 ### Changed

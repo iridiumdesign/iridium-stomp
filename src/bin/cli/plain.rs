@@ -256,10 +256,10 @@ pub fn format_connection_error_pub(err: &ConnError, address: &str) -> (String, u
             (message, super::exit_codes::AUTH_ERROR)
         }
         ConnError::FrameRejected(server_err) => {
-            let mut message = format!("Frame rejected: {}", server_err.message);
-            if let Some(body) = &server_err.body {
-                message.push_str(&format!(" ({})", body));
-            }
+            let message = match &server_err.body {
+                Some(body) => format!("Frame rejected: {} ({body})", server_err.message),
+                None => format!("Frame rejected: {}", server_err.message),
+            };
             (message, super::exit_codes::FRAME_REJECTED)
         }
         ConnError::Protocol(msg) => (
@@ -281,21 +281,40 @@ pub fn format_connection_error_pub(err: &ConnError, address: &str) -> (String, u
 
 #[cfg(test)]
 mod tests {
+    use super::super::exit_codes;
     use super::*;
     use iridium_stomp::connection::ServerError;
 
+    fn rejection(error: Frame) -> ConnError {
+        ConnError::FrameRejected(Box::new(ServerError::from_frame(error)))
+    }
+
     #[test]
-    fn frame_rejected_uses_distinct_exit_code() {
-        let err = ConnError::FrameRejected(Box::new(ServerError::from_frame(
+    fn a_rejected_frame_exits_4_with_the_brokers_reason() {
+        // Exit code 4 is part of the `--send` scripting contract; it must not
+        // collapse into PROTOCOL_ERROR (3), which means the broker never answered.
+        let detailed = rejection(
             Frame::new("ERROR")
-                .header("message", "publish denied")
-                .header("receipt-id", "receipt-1")
-                .set_body(b"not allowed".to_vec()),
-        )));
+                .header("message", "write access denied")
+                .header("receipt-id", "r-7")
+                .set_body(b"/queue/audit is read-only".to_vec()),
+        );
+        assert_eq!(
+            format_connection_error_pub(&detailed, "broker:61613"),
+            (
+                "Frame rejected: write access denied (/queue/audit is read-only)".to_string(),
+                exit_codes::FRAME_REJECTED
+            )
+        );
 
-        let (message, code) = format_connection_error_pub(&err, "127.0.0.1:61613");
-
-        assert_eq!(message, "Frame rejected: publish denied (not allowed)");
-        assert_eq!(code, super::super::exit_codes::FRAME_REJECTED);
+        // No body: the reason stands alone, without an empty "()".
+        let bare = rejection(Frame::new("ERROR").header("message", "quota exceeded"));
+        assert_eq!(
+            format_connection_error_pub(&bare, "broker:61613"),
+            (
+                "Frame rejected: quota exceeded".to_string(),
+                exit_codes::FRAME_REJECTED
+            )
+        );
     }
 }

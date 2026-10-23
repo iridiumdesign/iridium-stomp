@@ -5,8 +5,9 @@ Contributions are welcome — bug reports, fixes, docs, and features.
 ## Licensing
 
 **By submitting a pull request, you agree that your contribution is
-licensed under the MIT License**, the same terms as the rest of this
-project. See [LICENSE](LICENSE).
+dual licensed under MIT OR Apache-2.0**, the same terms as the rest of
+this project, without any additional terms or conditions. See
+[LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
 
 This is the standard inbound-equals-outbound arrangement used across
 the Rust ecosystem, and it's already how GitHub's Terms of Service treat

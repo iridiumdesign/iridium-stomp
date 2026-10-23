@@ -135,7 +135,7 @@ pub async fn execute_command(
         "about" => {
             if tui_mode {
                 return CommandResult::Info(format!(
-                    "iridium-stomp v{} - © 2025 Brad Siegfreid - MIT License",
+                    "iridium-stomp v{} - © 2025 Brad Siegfreid - MIT OR Apache-2.0",
                     env!("CARGO_PKG_VERSION")
                 ));
             }
@@ -247,7 +247,7 @@ pub fn print_about() {
     println!();
     println!("© 2025 Brad Siegfreid");
     println!();
-    println!("Licensed under the MIT License.");
+    println!("Licensed under MIT OR Apache-2.0, at your option.");
     println!("See https://github.com/iridiumdesign/iridium-stomp for more information.");
     println!();
 }

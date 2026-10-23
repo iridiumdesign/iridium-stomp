@@ -15,6 +15,6 @@ pub mod exit_codes {
     pub const AUTH_ERROR: u8 = 2;
     /// Protocol error (e.g., unexpected server response)
     pub const PROTOCOL_ERROR: u8 = 3;
-    /// A frame requesting a receipt was rejected by the broker via an ERROR frame.
+    /// Broker refused a frame (answered its receipt request with an ERROR)
     pub const FRAME_REJECTED: u8 = 4;
 }

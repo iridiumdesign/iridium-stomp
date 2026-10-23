@@ -5,7 +5,7 @@ edition = "2024"
 # Verified floor: edition 2024 needs 1.85, and the let-chain in connection.rs
 # needs 1.88. Library and the `cli` feature both build on 1.88.0.
 rust-version = "1.88"
-license = "MIT"
+license = "MIT OR Apache-2.0"
 authors = ["Brad Siegfreid <brad@iridiumdesign.com>"]
 description = "Async STOMP 1.2 client for Rust"
 readme = "README.md"
@@ -17,7 +17,7 @@ categories = ["network-programming", "asynchronous"]
 # Ensure docs files are packaged and instruct docs.rs to build with all features.
 # Leading slashes anchor to the package root: an unanchored `README.md` also
 # matched `.github/scripts/README.md` and shipped it in the crate tarball.
-include = ["/src/**", "/examples/**", "/docs/**", "/Cargo.toml", "/README.md", "/LICENSE"]
+include = ["/src/**", "/examples/**", "/docs/**", "/Cargo.toml", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 
 [package.metadata.docs.rs]
 all-features = true

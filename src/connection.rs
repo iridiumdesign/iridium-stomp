@@ -242,8 +242,13 @@ pub(crate) type PendingMap = HashMap<String, VecDeque<PendingMessage>>;
 /// Internal type for resubscribe snapshot entries: (destination, id, ack, headers)
 pub(crate) type ResubEntry = (String, String, AckMode, Vec<(String, String)>);
 
-/// Alias for pending receipt map: receipt-id -> oneshot sender to notify when resolved.
-pub(crate) type PendingReceipts = HashMap<String, oneshot::Sender<Result<(), ServerError>>>;
+/// The broker's answer to a frame that asked for a receipt: a RECEIPT, or an
+/// ERROR carrying the frame's receipt id.
+pub(crate) type ReceiptOutcome = Result<(), Box<ServerError>>;
+
+/// Receipts still awaited, by receipt id, each with the sender that settles
+/// its `ReceiptHandle`.
+pub(crate) type PendingReceipts = HashMap<String, oneshot::Sender<ReceiptOutcome>>;
 
 /// Errors returned by `Connection` operations.
 #[derive(Error, Debug)]
@@ -265,9 +270,11 @@ pub enum ConnError {
     /// unauthorized access, or broker configuration issues.
     #[error("server rejected connection: {0}")]
     ServerRejected(Box<ServerError>),
-    /// A frame that requested a receipt was rejected by the broker via
-    /// an ERROR frame with a matching receipt-id. The connection may
-    /// still be usable depending on broker behavior.
+    /// The broker answered a frame sent with a receipt request with an ERROR
+    /// naming that receipt, instead of a RECEIPT.
+    ///
+    /// Whether the connection survives is up to the broker: STOMP lets it
+    /// close the socket after any ERROR, and some do.
     #[error("frame rejected: {0}")]
     FrameRejected(Box<ServerError>),
     /// `ack_frame` or `nack_frame` was given a frame with neither an `ack` nor
@@ -965,6 +972,24 @@ fn forward_inbound(in_tx: &mpsc::Sender<Frame>, frame: Frame) {
     }
 }
 
+/// Settle the `ReceiptHandle` waiting on `frame`'s `receipt-id`, if one is.
+/// The outcome is built only when there is a handle to give it to, so an
+/// ERROR naming no awaited receipt is not cloned for nothing.
+async fn settle_receipt(
+    pending_receipts: &Mutex<PendingReceipts>,
+    frame: &Frame,
+    outcome: impl FnOnce() -> ReceiptOutcome,
+) {
+    let Some(receipt_id) = frame.get_header("receipt-id") else {
+        return;
+    };
+    let waiter = pending_receipts.lock().await.remove(receipt_id);
+    if let Some(tx) = waiter {
+        // The handle may have been dropped, or timed out, meanwhile.
+        let _ = tx.send(outcome());
+    }
+}
+
 /// High-level connection object that manages a single TCP/STOMP connection.
 ///
 /// The `Connection` spawns a background task that maintains the TCP transport,
@@ -1030,7 +1055,7 @@ pub struct ReceiptHandle {
     /// The client-generated receipt id carried by the sent frame.
     receipt_id: String,
     /// Resolves when the broker answers with RECEIPT or a matching ERROR.
-    rx: oneshot::Receiver<Result<(), ServerError>>,
+    rx: oneshot::Receiver<ReceiptOutcome>,
     /// Shared registry, used to deregister this receipt if the wait times out.
     pending_receipts: Arc<Mutex<PendingReceipts>>,
 }
@@ -1061,8 +1086,7 @@ impl ReceiptHandle {
         } = self;
 
         match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Ok(Err(err))) => Err(ConnError::FrameRejected(Box::new(err))),
+            Ok(Ok(outcome)) => outcome.map_err(ConnError::FrameRejected),
             Ok(Err(_)) => {
                 // Sender dropped without a response - connection likely gone.
                 Err(ConnError::Protocol(
@@ -1359,7 +1383,6 @@ impl Connection {
             let mut current_framed = Some(framed);
             let mut current_send_interval = send_interval;
             let mut current_recv_interval = recv_interval;
-            let mut first_iteration = true;
             // Track subscription errors across reconnections. If a subscription
             // receives too many consecutive errors, we remove it to prevent
             // error loops (e.g., Artemis sending repeated permission errors).
@@ -1389,9 +1412,11 @@ impl Connection {
                     _ = future::ready(()) => {},
                 }
 
-                // Either use existing connection or establish new one (reconnect)
-                let framed = if let Some(f) = current_framed.take() {
-                    f
+                // Either use existing connection or establish new one (reconnect).
+                // Only a new one needs the subscriptions replayed: on the
+                // connection `connect` made, the caller has not subscribed yet.
+                let (framed, just_reconnected) = if let Some(f) = current_framed.take() {
+                    (f, false)
                 } else {
                     // Reconnection attempt
                     match TcpStream::connect(&addr).await {
@@ -1437,7 +1462,7 @@ impl Connection {
                                     let (si, ri) = negotiate_heartbeats(cx, cy, sx, sy);
                                     current_send_interval = si;
                                     current_recv_interval = ri;
-                                    framed
+                                    (framed, true)
                                 }
                                 Err(e) => {
                                     tracing::warn!(
@@ -1514,9 +1539,7 @@ impl Connection {
                 // Resubscribe any existing subscriptions after reconnect.
                 // We snapshot the subscription entries while holding the lock
                 // and then issue SUBSCRIBE frames using the sink.
-                if first_iteration {
-                    first_iteration = false;
-                } else {
+                if just_reconnected {
                     let subs_snapshot: Vec<ResubEntry> = {
                         let map = subscriptions.lock().await;
                         let mut v: Vec<ResubEntry> = Vec::new();
@@ -1824,27 +1847,18 @@ impl Connection {
                                             continue;
                                         }
                                     } else if f.command == "RECEIPT" {
-                                        // Handle RECEIPT frame: notify any waiting callers
-                                        if let Some(receipt_id) = f.get_header("receipt-id") {
-                                            let mut receipts = pending_receipts_clone.lock().await;
-                                            if let Some(sender) = receipts.remove(receipt_id) {
-                                                let _ = sender.send(Ok(()));
-                                            }
-                                        }
+                                        settle_receipt(&pending_receipts_clone, &f, || Ok(())).await;
                                         // Don't forward RECEIPT frames to inbound channel
                                         continue;
                                     } else if f.command == "ERROR" {
-                                        // An ERROR with receipt-id is the failed response to a
-                                        // frame that requested a receipt. Wake that waiter with
-                                        // the broker error, then continue forwarding the frame.
-                                        if let Some(receipt_id) = f.get_header("receipt-id") {
-                                            let mut receipts =
-                                                pending_receipts_clone.lock().await;
-                                            if let Some(sender) = receipts.remove(receipt_id) {
-                                                let _ = sender
-                                                    .send(Err(ServerError::from_frame(f.clone())));
-                                            }
-                                        }
+                                        // The broker may be refusing a frame that asked for
+                                        // a receipt; if so, its handle fails with this
+                                        // error. The ERROR still reaches `next_frame()`
+                                        // below, as every ERROR does.
+                                        settle_receipt(&pending_receipts_clone, &f, || {
+                                            Err(Box::new(ServerError::from_frame(f.clone())))
+                                        })
+                                        .await;
 
                                         // Track subscription-related errors. If we see repeated
                                         // errors for the same destination, remove the subscription
@@ -2774,8 +2788,8 @@ fn current_millis() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
-    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::thread;
     use tokio::sync::mpsc;
 
@@ -2796,17 +2810,65 @@ mod tests {
         f
     }
 
-    fn read_stomp_frame(stream: &mut TcpStream) -> String {
-        let mut bytes = Vec::new();
-        let mut byte = [0u8; 1];
-        loop {
-            stream.read_exact(&mut byte).unwrap();
-            bytes.push(byte[0]);
-            if byte[0] == 0 {
-                break;
-            }
+    /// The broker's end of one loopback connection, played by a test script
+    /// on a plain thread. Frames go both ways as raw text, NUL included, so a
+    /// script reads like the wire.
+    struct StubBroker {
+        wire: BufReader<TcpStream>,
+    }
+
+    impl StubBroker {
+        /// Listen on a loopback port and run `script` against the first
+        /// client to connect. Returns the address to dial and the thread.
+        fn spawn(
+            script: impl FnOnce(StubBroker) + Send + 'static,
+        ) -> (String, thread::JoinHandle<()>) {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let thread = thread::spawn(move || {
+                let (socket, _) = listener.accept().unwrap();
+                script(StubBroker {
+                    wire: BufReader::new(socket),
+                });
+            });
+            (addr, thread)
         }
-        String::from_utf8(bytes).unwrap()
+
+        /// The client's next frame, through its terminating NUL.
+        fn recv(&mut self) -> String {
+            let mut raw = Vec::new();
+            self.wire.read_until(b'\0', &mut raw).unwrap();
+            assert_eq!(raw.last(), Some(&b'\0'), "client closed mid-frame");
+            String::from_utf8(raw).unwrap()
+        }
+
+        fn send(&mut self, raw: &str) {
+            let socket = self.wire.get_mut();
+            socket.write_all(raw.as_bytes()).unwrap();
+            socket.flush().unwrap();
+        }
+
+        /// Take the client's CONNECT and accept it, with heart-beats off.
+        fn accept_connect(&mut self) {
+            let connect = self.recv();
+            assert!(
+                connect.starts_with("CONNECT\n"),
+                "expected CONNECT, got {connect:?}"
+            );
+            self.send("CONNECTED\nversion:1.2\nheart-beat:0,0\n\n\0");
+        }
+
+        /// Keep the socket open a moment, so the client reads what was sent
+        /// before it sees the close.
+        fn linger(self) {
+            thread::sleep(Duration::from_millis(100));
+        }
+
+        /// Keep the socket open until the client closes it.
+        fn wait_for_close(mut self) {
+            let mut rest = Vec::new();
+            let _ = self.wire.read_to_end(&mut rest);
+        }
     }
 
     /// Connect with a short disconnect timeout. These stubs do not answer a
@@ -2836,65 +2898,58 @@ mod tests {
             .unwrap()
     }
 
-    fn start_receipt_rejection_server(
-        message: &'static str,
-        body: &'static str,
-        response_delay: Duration,
-    ) -> (SocketAddr, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let handle = thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let _connect = read_stomp_frame(&mut stream);
-                stream
-                    .write_all(b"CONNECTED\nversion:1.2\nheart-beat:0,0\n\n\0")
-                    .unwrap();
-                stream.flush().unwrap();
-
-                let send_frame = read_stomp_frame(&mut stream);
-                let receipt_id = header_value(&send_frame, "receipt").to_string();
-                thread::sleep(response_delay);
-                let error_frame = format!(
-                    "ERROR\nreceipt-id:{}\nmessage:{}\n\n{}\0",
-                    receipt_id, message, body
-                );
-                stream.write_all(error_frame.as_bytes()).unwrap();
-                stream.flush().unwrap();
-
-                thread::sleep(Duration::from_millis(100));
-            }
-        });
-
-        (addr, handle)
+    /// A broker that accepts the connection, waits `delay` after the first
+    /// frame, and answers it with `reply(receipt id)`.
+    fn answer_first_receipt(
+        delay: Duration,
+        reply: impl FnOnce(&str) -> String + Send + 'static,
+    ) -> (String, thread::JoinHandle<()>) {
+        StubBroker::spawn(move |mut broker| {
+            broker.accept_connect();
+            let frame = broker.recv();
+            let receipt = header_value(&frame, "receipt").to_string();
+            thread::sleep(delay);
+            broker.send(&reply(&receipt));
+            broker.linger();
+        })
     }
 
-    fn start_receipt_success_server(
-        response_delay: Duration,
-    ) -> (SocketAddr, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
+    fn confirm(receipt: &str) -> String {
+        format!("RECEIPT\nreceipt-id:{receipt}\n\n\0")
+    }
 
-        let handle = thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let _connect = read_stomp_frame(&mut stream);
-                stream
-                    .write_all(b"CONNECTED\nversion:1.2\nheart-beat:0,0\n\n\0")
-                    .unwrap();
-                stream.flush().unwrap();
+    /// The ERROR a broker sends to refuse a frame, naming its receipt.
+    fn refuse(receipt: &str) -> String {
+        format!(
+            "ERROR\nreceipt-id:{receipt}\nmessage:not authorized\n\nno write access to /queue/locked\0"
+        )
+    }
 
-                let send_frame = read_stomp_frame(&mut stream);
-                let receipt_id = header_value(&send_frame, "receipt").to_string();
-                thread::sleep(response_delay);
-                let receipt_frame = format!("RECEIPT\nreceipt-id:{}\n\n\0", receipt_id);
-                stream.write_all(receipt_frame.as_bytes()).unwrap();
-                stream.flush().unwrap();
+    /// Check that `result` is the `refuse` ERROR as a `FrameRejected`, and that
+    /// the same ERROR still reaches `next_frame()`, where an application
+    /// watching for broker errors looks. Returns the rejected receipt id.
+    async fn assert_refused(conn: &Connection, result: Result<(), ConnError>) -> String {
+        let err = match result {
+            Err(ConnError::FrameRejected(err)) => err,
+            other => panic!("expected FrameRejected, got {other:?}"),
+        };
+        assert_eq!(err.message, "not authorized");
+        assert_eq!(
+            err.body.as_deref(),
+            Some("no write access to /queue/locked")
+        );
+        let receipt = err
+            .receipt_id
+            .clone()
+            .expect("the refusal names its receipt");
 
-                thread::sleep(Duration::from_millis(100));
+        match tokio::time::timeout(Duration::from_secs(1), conn.next_frame()).await {
+            Ok(Some(ReceivedFrame::Error(seen))) => {
+                assert_eq!(seen.receipt_id.as_deref(), Some(receipt.as_str()));
             }
-        });
-
-        (addr, handle)
+            other => panic!("expected the ERROR on next_frame(), got {other:?}"),
+        }
+        receipt
     }
 
     #[tokio::test]
@@ -2942,17 +2997,13 @@ mod tests {
         // ConnError::Protocol ("closed before CONNECTED received"), and the
         // bound must surface that real reason rather than a synthesized
         // timeout.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let handle = thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let _connect = read_stomp_frame(&mut stream);
-                // Drop the stream without answering: closed mid-handshake.
-            }
+        let (addr, handle) = StubBroker::spawn(|mut broker| {
+            broker.recv();
+            // Drop the stream without answering: closed mid-handshake.
         });
 
         let result = Connection::connect_with_options(
-            &addr.to_string(),
+            &addr,
             "guest",
             "guest",
             "0,0",
@@ -2973,21 +3024,13 @@ mod tests {
     async fn connect_timeout_does_not_disturb_a_reachable_broker() {
         // A generous bound must not interfere with a broker that answers
         // promptly: the connection still succeeds.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let handle = thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let _connect = read_stomp_frame(&mut stream);
-                stream
-                    .write_all(b"CONNECTED\nversion:1.2\nheart-beat:0,0\n\n\0")
-                    .unwrap();
-                stream.flush().unwrap();
-                thread::sleep(Duration::from_millis(100));
-            }
+        let (addr, handle) = StubBroker::spawn(|mut broker| {
+            broker.accept_connect();
+            broker.linger();
         });
 
         let result = Connection::connect_with_options(
-            &addr.to_string(),
+            &addr,
             "guest",
             "guest",
             "0,0",
@@ -3162,16 +3205,10 @@ mod tests {
 
     #[tokio::test]
     async fn overflowed_client_subscription_leaves_nothing_pending() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let _connect = read_stomp_frame(&mut stream);
-            stream
-                .write_all(b"CONNECTED\nversion:1.2\nheart-beat:0,0\n\n\0")
-                .unwrap();
+        let (addr, server) = StubBroker::spawn(|mut broker| {
+            broker.accept_connect();
 
-            let subscribe = read_stomp_frame(&mut stream);
+            let subscribe = broker.recv();
             let sub_id = header_value(&subscribe, "id").to_string();
             // Capacity 1 and a limit of 2: the fourth message trips it.
             let mut burst = String::new();
@@ -3180,14 +3217,14 @@ mod tests {
                     "MESSAGE\nsubscription:{sub_id}\nmessage-id:m{n}\ndestination:/queue/t\n\n\0"
                 ));
             }
-            stream.write_all(burst.as_bytes()).unwrap();
+            broker.send(&burst);
 
             // The UNSUBSCRIBE and the client's SEND race; take them in
             // either order.
             let mut unsubscribed = false;
             let mut receipt_id = None;
             while !unsubscribed || receipt_id.is_none() {
-                let frame = read_stomp_frame(&mut stream);
+                let frame = broker.recv();
                 if frame.starts_with("UNSUBSCRIBE") {
                     assert_eq!(header_value(&frame, "id"), sub_id);
                     unsubscribed = true;
@@ -3195,11 +3232,8 @@ mod tests {
                     receipt_id = Some(header_value(&frame, "receipt").to_string());
                 }
             }
-            let receipt_id = receipt_id.unwrap();
-            let reply = format!("RECEIPT\nreceipt-id:{receipt_id}\n\n\0");
-            stream.write_all(reply.as_bytes()).unwrap();
-            stream.flush().unwrap();
-            thread::sleep(Duration::from_millis(100));
+            broker.send(&confirm(&receipt_id.unwrap()));
+            broker.linger();
         });
 
         let conn = connect_for_test(&addr).await;
@@ -3239,27 +3273,19 @@ mod tests {
 
     #[tokio::test]
     async fn message_for_a_closed_subscription_leaves_nothing_pending() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let _connect = read_stomp_frame(&mut stream);
-            stream
-                .write_all(b"CONNECTED\nversion:1.2\nheart-beat:0,0\n\n\0")
-                .unwrap();
+        let (addr, server) = StubBroker::spawn(|mut broker| {
+            broker.accept_connect();
 
-            let subscribe = read_stomp_frame(&mut stream);
+            let subscribe = broker.recv();
             let sub_id = header_value(&subscribe, "id").to_string();
             // By the time the SEND arrives the client has dropped the receiver.
-            let send = read_stomp_frame(&mut stream);
+            let send = broker.recv();
             let receipt_id = header_value(&send, "receipt");
-            let reply = format!(
-                "MESSAGE\nsubscription:{sub_id}\nmessage-id:m1\ndestination:/queue/t\n\n\0\
-                 RECEIPT\nreceipt-id:{receipt_id}\n\n\0"
-            );
-            stream.write_all(reply.as_bytes()).unwrap();
-            stream.flush().unwrap();
-            thread::sleep(Duration::from_millis(100));
+            broker.send(&format!(
+                "MESSAGE\nsubscription:{sub_id}\nmessage-id:m1\ndestination:/queue/t\n\n\0{}",
+                confirm(receipt_id)
+            ));
+            broker.linger();
         });
 
         let conn = connect_for_test(&addr).await;
@@ -3293,16 +3319,10 @@ mod tests {
     /// Deliver three messages to a client-individual subscription, ack none,
     /// let go of the subscription, and check `pending` forgot them (#117).
     async fn pending_is_forgotten(explicit_unsubscribe: bool) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let _connect = read_stomp_frame(&mut stream);
-            stream
-                .write_all(b"CONNECTED\nversion:1.2\nheart-beat:0,0\n\n\0")
-                .unwrap();
+        let (addr, server) = StubBroker::spawn(|mut broker| {
+            broker.accept_connect();
 
-            let subscribe = read_stomp_frame(&mut stream);
+            let subscribe = broker.recv();
             let sub_id = header_value(&subscribe, "id").to_string();
             let mut burst = String::new();
             for n in 0..3 {
@@ -3310,20 +3330,17 @@ mod tests {
                     "MESSAGE\nsubscription:{sub_id}\nmessage-id:m{n}\ndestination:/queue/t\n\n\0"
                 ));
             }
-            stream.write_all(burst.as_bytes()).unwrap();
+            broker.send(&burst);
 
             // UNSUBSCRIBE, then the SEND whose receipt the client waits for.
             loop {
-                let frame = read_stomp_frame(&mut stream);
+                let frame = broker.recv();
                 if frame.starts_with("SEND") {
-                    let receipt_id = header_value(&frame, "receipt");
-                    let reply = format!("RECEIPT\nreceipt-id:{receipt_id}\n\n\0");
-                    stream.write_all(reply.as_bytes()).unwrap();
-                    stream.flush().unwrap();
+                    broker.send(&confirm(header_value(&frame, "receipt")));
                     break;
                 }
             }
-            thread::sleep(Duration::from_millis(100));
+            broker.linger();
         });
 
         let conn = connect_for_test(&addr).await;
@@ -3378,33 +3395,23 @@ mod tests {
 
     #[tokio::test]
     async fn orphaned_pending_queue_is_swept_on_the_next_message() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let _connect = read_stomp_frame(&mut stream);
-            stream
-                .write_all(b"CONNECTED\nversion:1.2\nheart-beat:0,0\n\n\0")
-                .unwrap();
+        let (addr, server) = StubBroker::spawn(|mut broker| {
+            broker.accept_connect();
 
-            let subscribe = read_stomp_frame(&mut stream);
+            let subscribe = broker.recv();
             let sub_id = header_value(&subscribe, "id").to_string();
             // First SEND: a bare RECEIPT, so the client knows the background
             // task is past its start-up `pending.clear()`.
-            let send = read_stomp_frame(&mut stream);
-            let receipt_id = header_value(&send, "receipt");
-            let reply = format!("RECEIPT\nreceipt-id:{receipt_id}\n\n\0");
-            stream.write_all(reply.as_bytes()).unwrap();
+            let send = broker.recv();
+            broker.send(&confirm(header_value(&send, "receipt")));
 
-            let send = read_stomp_frame(&mut stream);
+            let send = broker.recv();
             let receipt_id = header_value(&send, "receipt");
-            let reply = format!(
-                "MESSAGE\nsubscription:{sub_id}\nmessage-id:m0\ndestination:/queue/t\n\n\0\
-                 RECEIPT\nreceipt-id:{receipt_id}\n\n\0"
-            );
-            stream.write_all(reply.as_bytes()).unwrap();
-            stream.flush().unwrap();
-            thread::sleep(Duration::from_millis(100));
+            broker.send(&format!(
+                "MESSAGE\nsubscription:{sub_id}\nmessage-id:m0\ndestination:/queue/t\n\n\0{}",
+                confirm(receipt_id)
+            ));
+            broker.linger();
         });
 
         let conn = connect_for_test(&addr).await;
@@ -3453,15 +3460,9 @@ mod tests {
     async fn three_messages_with_differing_ack_headers(
         ack: AckMode,
     ) -> (Connection, crate::subscription::Subscription, Vec<Frame>) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let _connect = read_stomp_frame(&mut stream);
-            stream
-                .write_all(b"CONNECTED\nversion:1.2\nheart-beat:0,0\n\n\0")
-                .unwrap();
-            let subscribe = read_stomp_frame(&mut stream);
+        let (addr, _) = StubBroker::spawn(|mut broker| {
+            broker.accept_connect();
+            let subscribe = broker.recv();
             let sub_id = header_value(&subscribe, "id").to_string();
             let mut burst = String::new();
             for n in 1..=3 {
@@ -3469,11 +3470,9 @@ mod tests {
                     "MESSAGE\nsubscription:{sub_id}\nmessage-id:M{n}\nack:A{n}\ndestination:/queue/t\n\n\0"
                 ));
             }
-            stream.write_all(burst.as_bytes()).unwrap();
-            stream.flush().unwrap();
+            broker.send(&burst);
             // Keep the socket open while the test acks.
-            let mut sink = [0u8; 1024];
-            while matches!(stream.read(&mut sink), Ok(n) if n > 0) {}
+            broker.wait_for_close();
         });
 
         let conn = connect_for_test(&addr).await;
@@ -3526,8 +3525,7 @@ mod tests {
         // caller is still holding the handle. Before #82 the background task
         // fired an orphaned sender and removed the registration, so the wait
         // below timed out on a frame the broker had already confirmed.
-        let (addr, server) = start_receipt_success_server(Duration::ZERO);
-        let addr = addr.to_string();
+        let (addr, server) = answer_first_receipt(Duration::ZERO, confirm);
 
         let conn = connect_for_test(&addr).await;
 
@@ -3558,8 +3556,7 @@ mod tests {
         // caller-set header survived, the broker would answer with that id
         // while the client tracked the generated one, and the wait would time
         // out. Mixed case, since header lookup is case-insensitive.
-        let (addr, server) = start_receipt_success_server(Duration::ZERO);
-        let addr = addr.to_string();
+        let (addr, server) = answer_first_receipt(Duration::ZERO, confirm);
 
         let conn = connect_for_test(&addr).await;
 
@@ -3585,94 +3582,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn error_with_receipt_id_rejects_confirmed_send_and_stays_inbound() {
-        let (addr, server) =
-            start_receipt_rejection_server("publish denied", "not allowed", Duration::ZERO);
-        let addr = addr.to_string();
-
+    async fn the_first_connection_does_not_replay_subscriptions() {
+        // Subscriptions are replayed only after a reconnect (#72). On the
+        // connection `connect` made, the caller's SUBSCRIBE is the only one.
+        let (addr, broker) = StubBroker::spawn(|mut broker| {
+            broker.accept_connect();
+            let mut subscribes = 0;
+            loop {
+                let frame = broker.recv();
+                if frame.starts_with("SUBSCRIBE\n") {
+                    subscribes += 1;
+                } else if frame.starts_with("SEND\n") {
+                    assert_eq!(
+                        subscribes, 1,
+                        "only the caller's SUBSCRIBE may precede the SEND"
+                    );
+                    broker.send(&confirm(header_value(&frame, "receipt")));
+                    break;
+                }
+            }
+            broker.linger();
+        });
         let conn = connect_for_test(&addr).await;
-
-        let result = conn
-            .send_frame_confirmed(
-                Frame::new("SEND")
-                    .header("destination", "/queue/forbidden")
-                    .set_body(b"payload".to_vec()),
-                Duration::from_secs(2),
-            )
-            .await;
-
-        let rejected_receipt_id = match result {
-            Err(ConnError::FrameRejected(err)) => {
-                assert_eq!(err.message, "publish denied");
-                assert_eq!(err.body, Some("not allowed".to_string()));
-                err.receipt_id
-                    .expect("frame rejection should include receipt-id")
-            }
-            other => panic!("expected FrameRejected, got {:?}", other),
-        };
-
-        let received = tokio::time::timeout(Duration::from_secs(1), conn.next_frame())
-            .await
-            .unwrap();
-        match received {
-            Some(ReceivedFrame::Error(err)) => {
-                assert_eq!(err.message, "publish denied");
-                assert_eq!(err.body, Some("not allowed".to_string()));
-                assert_eq!(err.receipt_id, Some(rejected_receipt_id));
-            }
-            other => panic!("expected forwarded ERROR frame, got {:?}", other),
-        }
+        let _sub = conn.subscribe("/queue/t", AckMode::Auto).await.unwrap();
+        // The SEND goes out behind anything the background task queued.
+        conn.send_frame_confirmed(
+            Frame::new("SEND").header("destination", "/queue/out"),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
 
         let _ = conn.close().await;
-        server.join().unwrap();
+        broker.join().unwrap();
     }
 
     #[tokio::test]
-    async fn wait_for_receipt_reports_frame_rejection_and_keeps_error_inbound() {
-        let (addr, server) = start_receipt_rejection_server(
-            "receipt rejected",
-            "permission denied",
-            Duration::from_millis(100),
-        );
-        let addr = addr.to_string();
+    async fn a_refused_confirmed_send_fails_with_the_brokers_error() {
+        let (addr, broker) = answer_first_receipt(Duration::ZERO, refuse);
+        let conn = connect_for_test(&addr).await;
 
+        let sent = conn
+            .send_frame_confirmed(
+                Frame::new("SEND").header("destination", "/queue/locked"),
+                Duration::from_secs(2),
+            )
+            .await;
+        assert_refused(&conn, sent).await;
+
+        let _ = conn.close().await;
+        broker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_refusal_settles_a_handle_already_being_awaited() {
+        // The ERROR lands after `wait` has begun: the other order from the
+        // test above, where it can arrive before anyone is waiting.
+        let (addr, broker) = answer_first_receipt(Duration::from_millis(100), refuse);
         let conn = connect_for_test(&addr).await;
 
         let handle = conn
-            .send_frame_with_receipt(
-                Frame::new("SEND")
-                    .header("destination", "/queue/forbidden")
-                    .set_body(b"payload".to_vec()),
-            )
+            .send_frame_with_receipt(Frame::new("SEND").header("destination", "/queue/locked"))
             .await
             .unwrap();
-
-        let receipt_id = handle.receipt_id().to_string();
-        let result = handle.wait(Duration::from_secs(2)).await;
-
-        match result {
-            Err(ConnError::FrameRejected(err)) => {
-                assert_eq!(err.message, "receipt rejected");
-                assert_eq!(err.body, Some("permission denied".to_string()));
-                assert_eq!(err.receipt_id, Some(receipt_id.clone()));
-            }
-            other => panic!("expected FrameRejected, got {:?}", other),
-        }
-
-        let received = tokio::time::timeout(Duration::from_secs(1), conn.next_frame())
-            .await
-            .unwrap();
-        match received {
-            Some(ReceivedFrame::Error(err)) => {
-                assert_eq!(err.message, "receipt rejected");
-                assert_eq!(err.body, Some("permission denied".to_string()));
-                assert_eq!(err.receipt_id, Some(receipt_id));
-            }
-            other => panic!("expected forwarded ERROR frame, got {:?}", other),
-        }
+        let ours = handle.receipt_id().to_string();
+        let refused = assert_refused(&conn, handle.wait(Duration::from_secs(2)).await).await;
+        assert_eq!(refused, ours);
 
         let _ = conn.close().await;
-        server.join().unwrap();
+        broker.join().unwrap();
     }
 
     #[tokio::test]

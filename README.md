@@ -567,7 +567,18 @@ The smoke test is skipped by default unless `RUN_STOMP_SMOKE=1` is set, since it
 
 ## License
 
-This project is licensed under the MIT License. See
-[LICENSE](https://github.com/iridiumdesign/iridium-stomp/blob/main/LICENSE) for
-details.
+Licensed under either of
+
+- Apache License, Version 2.0
+  ([LICENSE-APACHE](https://github.com/iridiumdesign/iridium-stomp/blob/main/LICENSE-APACHE))
+- MIT License
+  ([LICENSE-MIT](https://github.com/iridiumdesign/iridium-stomp/blob/main/LICENSE-MIT))
+
+at your option. Releases through 0.6.0 were published under MIT alone, and
+remain available under those terms.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in the work by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.
 

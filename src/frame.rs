@@ -80,13 +80,13 @@ impl Frame {
 
     /// Get the value of a header by name.
     ///
-    /// Returns the first header value matching the given key (case-insensitive),
-    /// or `None` if no such header exists.
+    /// Names are compared ignoring ASCII case, so `"message-id"` also finds a
+    /// `Message-Id` header. When a header repeats, the first value is returned,
+    /// as STOMP 1.2 requires. `None` if the frame has no such header.
     pub fn get_header(&self, key: &str) -> Option<&str> {
         self.headers
             .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(key))
-            .map(|(_, v)| v.as_str())
+            .find_map(|(name, value)| name.eq_ignore_ascii_case(key).then_some(value.as_str()))
     }
 }
 
