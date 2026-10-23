@@ -170,11 +170,12 @@ says can make it. See "What is lost on reconnect" above.
   as you would any message, and make message handling idempotent.
 
 Some brokers reuse a message's id when they redeliver it, so the two copies
-carry the same id and an ack cannot say which one it means. The library
-then settles the redelivered copy first and the stale one second. Each
-message is still acknowledged exactly once, whichever copy you ack first
-and whether you ack each message or, in `client` mode, only the last of a
-batch.
+carry the same id and an ack cannot say which one it means. The first ack
+for that id then settles the redelivered copy, and any later one finds
+nothing outstanding and sends nothing. Each message is still acknowledged
+exactly once, whichever copy you ack first, whether you ack by frame or by
+id, and whether you ack each message or, in `client` mode, only the last of
+a batch. The same rule holds for a frame kept across several reconnects.
 
 ---
 

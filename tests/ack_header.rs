@@ -93,6 +93,16 @@ async fn ids_of(seen: &Seen, command: &str, count: usize) -> Vec<String> {
     panic!("the broker never saw {count} {command} frame(s)");
 }
 
+/// The `id` header of each `command` frame the broker has seen so far.
+fn ids_of_now(seen: &Seen, command: &str) -> Vec<String> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter(|f| f.lines().next() == Some(command))
+        .map(|f| header(f, "id").unwrap_or_default())
+        .collect()
+}
+
 async fn connect(addr: &str) -> Connection {
     Connection::connect(addr, "guest", "guest", "0,0")
         .await
@@ -181,20 +191,23 @@ async fn cumulative_ack_by_message_id_sends_one_ack_with_the_ack_header() {
 #[tokio::test]
 async fn message_without_an_ack_header_is_acked_by_message_id() {
     // STOMP 1.0/1.1: no `ack` header on the MESSAGE.
-    let (addr, seen) =
-        start_broker("MESSAGE\nsubscription:{sub}\nmessage-id:M1\ndestination:/queue/t\n\n1\0");
+    let (addr, seen) = start_broker(
+        "MESSAGE\nsubscription:{sub}\nmessage-id:M1\ndestination:/queue/t\n\n1\0\
+         MESSAGE\nsubscription:{sub}\nmessage-id:M2\ndestination:/queue/t\n\n2\0",
+    );
     let conn = connect(&addr).await;
     let mut sub = conn
         .subscribe("/queue/t", AckMode::ClientIndividual)
         .await
         .unwrap();
 
-    let frame = next(&mut sub).await;
-    sub.ack_frame(&frame).await.unwrap();
-    sub.nack("M1").await.unwrap();
+    let first = next(&mut sub).await;
+    next(&mut sub).await;
+    sub.ack_frame(&first).await.unwrap();
+    sub.nack("M2").await.unwrap();
 
     assert_eq!(ids_of(&seen, "ACK", 1).await, ["M1"]);
-    assert_eq!(ids_of(&seen, "NACK", 1).await, ["M1"]);
+    assert_eq!(ids_of(&seen, "NACK", 1).await, ["M2"]);
 }
 
 #[tokio::test]
@@ -216,20 +229,32 @@ async fn message_routed_by_destination_records_its_ack_header() {
 }
 
 #[tokio::test]
-async fn unknown_id_is_sent_as_given() {
+async fn an_id_that_is_not_outstanding_is_not_sent() {
+    // On a subscription the library manages, every delivery is recorded, so
+    // an id it does not hold was never delivered, was already settled, or
+    // was forgotten at a reconnect. None of those may reach the broker
+    // (#118); a raw SUBSCRIBE's acks are still sent as given.
     let (addr, seen) = start_broker(DIFFERING);
     let conn = connect(&addr).await;
-    let sub = conn
+    let mut sub = conn
         .subscribe("/queue/t", AckMode::ClientIndividual)
         .await
         .unwrap();
+    let first = next(&mut sub).await;
 
-    // Never delivered, or forgotten at a reconnect: nothing to translate.
     sub.ack("never-seen").await.unwrap();
     sub.nack("nor-this").await.unwrap();
+    sub.ack_frame(&first).await.unwrap();
+    // A second ack for the same message is not outstanding either.
+    sub.ack_frame(&first).await.unwrap();
 
-    assert_eq!(ids_of(&seen, "ACK", 1).await, ["never-seen"]);
-    assert_eq!(ids_of(&seen, "NACK", 1).await, ["nor-this"]);
+    // Frames go out in order, so once A1 has arrived nothing else was sent
+    // before it.
+    assert_eq!(ids_of(&seen, "ACK", 1).await, ["A1"]);
+    assert!(
+        ids_of_now(&seen, "NACK").is_empty(),
+        "no NACK may go out for an unknown id"
+    );
 }
 
 #[tokio::test]

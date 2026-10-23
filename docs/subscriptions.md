@@ -185,7 +185,10 @@ STOMP 1.2 requires in an ACK, or its `message-id` when the broker sent no
 
 `ack(id)` and `nack(id)` accept either header's value. For a message still
 outstanding the library sends the `ack` header's value whichever was given;
-an id it does not know is sent as given. The distinction is not academic:
+an id that is not outstanding (already acknowledged, or delivered before a
+reconnect) sends nothing. Only on a subscription made with a raw SUBSCRIBE
+through `send_frame`, which the library does not track, is an id sent as
+given. The distinction is not academic:
 RabbitMQ and Artemis put the same value in both headers, but ActiveMQ
 Classic does not, and it silently ignores an ACK that carries the
 `message-id`, then redelivers the message.
