@@ -96,8 +96,9 @@ fn deliver(wire: &mut Wire, ids: Ids, session: u8) {
 /// A broker that delivers m1 and m2, drops the connection on a SEND to
 /// `/control/drop`, redelivers both to the replayed SUBSCRIBE, and returns
 /// the ACK and NACK frames of the second session once the client sends to
-/// `/control/done`.
-fn broker(ids: Ids) -> (String, JoinHandle<Vec<String>>) {
+/// `/control/done`. It waits `handshake_delay` before answering the second
+/// CONNECT, which leaves the client reconnecting for that long.
+fn broker(ids: Ids, handshake_delay: Duration) -> (String, JoinHandle<Vec<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let thread = thread::spawn(move || {
@@ -107,6 +108,7 @@ fn broker(ids: Ids) -> (String, JoinHandle<Vec<String>>) {
         assert!(before.is_empty(), "nothing is acked before the reconnect");
         drop(first);
 
+        thread::sleep(handshake_delay);
         let mut second = Wire::accept(&listener);
         deliver(&mut second, ids, 2);
         second.until_send_to("/control/done")
@@ -115,9 +117,9 @@ fn broker(ids: Ids) -> (String, JoinHandle<Vec<String>>) {
 }
 
 /// Subscribe, let m1 and m2 arrive unread, and lose the connection. Returns
-/// once the new session is up, with the stale copies still in the
-/// subscription's channel and the redelivered ones behind them.
-async fn reconnect_holding_two(addr: &str, ack: AckMode) -> (Connection, Subscription) {
+/// once the client has seen the close, with both copies in the
+/// subscription's channel.
+async fn lose_connection(addr: &str, ack: AckMode) -> (Connection, Subscription) {
     let conn = Connection::connect_with_options(
         addr,
         "guest",
@@ -130,32 +132,50 @@ async fn reconnect_holding_two(addr: &str, ack: AckMode) -> (Connection, Subscri
     let sub = conn.subscribe("/queue/t", ack).await.unwrap();
 
     // A round trip: both MESSAGEs have been read into the channel.
-    let barrier = || Frame::new("SEND").header("destination", "/queue/barrier");
     conn.send_frame_confirmed(barrier(), Duration::from_secs(2))
         .await
         .unwrap();
     conn.send_frame(Frame::new("SEND").header("destination", "/control/drop"))
         .await
         .unwrap();
-    // Let the client see the close first: a frame written in the meantime
-    // goes onto the dead socket and is lost. Sent now, it waits for the new
-    // session, behind the replayed SUBSCRIBE.
+    // Let the client see the close: a frame written in the meantime goes
+    // onto the dead socket and is lost.
     tokio::time::sleep(Duration::from_millis(500)).await;
+    (conn, sub)
+}
+
+fn barrier() -> Frame {
+    Frame::new("SEND").header("destination", "/queue/barrier")
+}
+
+/// Wait for the new session. Sent while the client reconnects, the barrier
+/// waits for it, behind the replayed SUBSCRIBE.
+async fn await_new_session(conn: &Connection) {
     conn.send_frame_confirmed(barrier(), Duration::from_secs(10))
         .await
         .expect("the connection must come back");
+}
+
+/// `lose_connection`, then `await_new_session`: the stale copies are still in
+/// the subscription's channel, and the redelivered ones behind them.
+async fn reconnect_holding_two(addr: &str, ack: AckMode) -> (Connection, Subscription) {
+    let (conn, sub) = lose_connection(addr, ack).await;
+    await_new_session(&conn).await;
     (conn, sub)
+}
+
+async fn next_copy(sub: &mut Subscription) -> Frame {
+    tokio::time::timeout(Duration::from_secs(5), sub.next())
+        .await
+        .expect("stalled after reconnect")
+        .expect("subscription ended early")
 }
 
 /// Read the four copies: stale m1, m2, then redelivered m1, m2.
 async fn four_copies(sub: &mut Subscription) -> Vec<Frame> {
     let mut frames = Vec::new();
     for _ in 0..4 {
-        let frame = tokio::time::timeout(Duration::from_secs(5), sub.next())
-            .await
-            .expect("stalled after reconnect")
-            .expect("subscription ended early");
-        frames.push(frame);
+        frames.push(next_copy(sub).await);
     }
     let ids: Vec<_> = frames
         .iter()
@@ -183,7 +203,7 @@ fn ack_ids(acks: &[String]) -> Vec<&str> {
 
 #[tokio::test]
 async fn stale_copies_are_not_acked_on_the_new_session() {
-    let (addr, broker) = broker(Ids::PerSession);
+    let (addr, broker) = broker(Ids::PerSession, Duration::ZERO);
     let (conn, mut sub) = reconnect_holding_two(&addr, AckMode::ClientIndividual).await;
 
     for frame in four_copies(&mut sub).await {
@@ -203,7 +223,7 @@ async fn acking_by_message_id_skips_stale_copies_too() {
     // `ack(id)` names the message by `message-id`, the same in both sessions
     // here: the live copy is acked once, and the second ack finds only the
     // retired copy, so nothing more goes out.
-    let (addr, broker) = broker(Ids::PerSession);
+    let (addr, broker) = broker(Ids::PerSession, Duration::ZERO);
     let (conn, mut sub) = reconnect_holding_two(&addr, AckMode::ClientIndividual).await;
 
     for frame in four_copies(&mut sub).await {
@@ -220,7 +240,7 @@ async fn acking_by_message_id_skips_stale_copies_too() {
 async fn reused_ids_ack_each_message_once() {
     // The ids collide across sessions, so a stale copy's ack cannot be told
     // from the redelivered copy's. Each message is still acked exactly once.
-    let (addr, broker) = broker(Ids::Reused);
+    let (addr, broker) = broker(Ids::Reused, Duration::ZERO);
     let (conn, mut sub) = reconnect_holding_two(&addr, AckMode::ClientIndividual).await;
 
     for frame in four_copies(&mut sub).await {
@@ -236,7 +256,7 @@ async fn a_batched_cumulative_ack_after_reconnect_is_sent() {
     // `client` mode, acking only the last message read. With reused ids the
     // last copy's id is also a retired copy's id; it must still be sent, or
     // the redelivered messages stay unacknowledged.
-    let (addr, broker) = broker(Ids::Reused);
+    let (addr, broker) = broker(Ids::Reused, Duration::ZERO);
     let (conn, mut sub) = reconnect_holding_two(&addr, AckMode::Client).await;
 
     let frames = four_copies(&mut sub).await;
@@ -244,4 +264,41 @@ async fn a_batched_cumulative_ack_after_reconnect_is_sent() {
 
     let acks = finish(conn, broker).await;
     assert_eq!(ack_ids(&acks), ["m2"]);
+}
+
+#[tokio::test]
+async fn cumulative_acks_for_every_copy_ack_each_message_once() {
+    // `client` mode, acking every copy, with reused ids. Acking a stale copy
+    // settles the redelivered one, which must leave the retired entries in
+    // place, or the later acks find nothing and go out a second time.
+    let (addr, broker) = broker(Ids::Reused, Duration::ZERO);
+    let (conn, mut sub) = reconnect_holding_two(&addr, AckMode::Client).await;
+
+    for frame in four_copies(&mut sub).await {
+        sub.ack_frame(&frame).await.unwrap();
+    }
+
+    let acks = finish(conn, broker).await;
+    assert_eq!(ack_ids(&acks), ["m1", "m2"]);
+}
+
+#[tokio::test]
+async fn an_ack_issued_while_reconnecting_is_not_sent_on_the_new_session() {
+    // The broker holds the second handshake for a second, and the stale m1
+    // is acked inside that window. Its entry is not retired yet, so the ACK
+    // is queued; it must be dropped, not written to the new session.
+    let (addr, broker) = broker(Ids::PerSession, Duration::from_secs(1));
+    let (conn, mut sub) = lose_connection(&addr, AckMode::ClientIndividual).await;
+    let stale_m1 = next_copy(&mut sub).await;
+    sub.ack_frame(&stale_m1).await.unwrap();
+
+    await_new_session(&conn).await;
+    // Stale m2, then the redelivered m1 and m2.
+    for _ in 0..3 {
+        let frame = next_copy(&mut sub).await;
+        sub.ack_frame(&frame).await.unwrap();
+    }
+
+    let acks = finish(conn, broker).await;
+    assert_eq!(ack_ids(&acks), ["m1-s2", "m2-s2"]);
 }

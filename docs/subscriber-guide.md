@@ -164,7 +164,9 @@ says can make it. See "What is lost on reconnect" above.
   copy's id belongs to the old session, so acknowledging it sends nothing:
   `ack_frame` (and `ack`, `nack`, `nack_frame`) returns `Ok(())` and logs at
   `debug`. The same holds for a message the application was still
-  processing when the connection dropped. Acknowledge the redelivered copy,
+  processing when the connection dropped, for an ack issued while the
+  client is reconnecting, and for one that was queued but not yet written
+  when the connection went. Acknowledge the redelivered copy,
   as you would any message, and make message handling idempotent.
 
 Some brokers reuse a message's id when they redeliver it, so the two copies
