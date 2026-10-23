@@ -226,8 +226,9 @@ pub(crate) struct PendingMessage {
     pub(crate) frame: Frame,
     /// Delivered on an earlier connection. Its ack id means nothing to the
     /// current session, so an ack or nack for it is not sent (#118). Retired
-    /// entries are always at the front of their queue: they are marked at a
-    /// reconnect, before anything is delivered on the new connection.
+    /// entries are always at the front of their queue: they are marked when
+    /// the connection drops, before anything is delivered on the next one,
+    /// and no ack removes them; they go at the following drop.
     pub(crate) retired: bool,
     /// The connection it was delivered on, counted from 0 by the background
     /// task. An ack for it carries this, so one that is still queued when
@@ -280,6 +281,30 @@ pub(crate) enum Outbound {
     /// before a drop, or while the client reconnected, names an id the next
     /// session never issued (#118).
     Ack { frame: Frame, session: u64 },
+}
+
+impl Outbound {
+    /// What to write for this on connection `session`: the item, or `None`
+    /// for an ACK or NACK issued for an earlier connection. One of those was
+    /// queued but not yet written when its connection dropped, and its id
+    /// belongs to a session that is gone.
+    fn writable_in(self, session: u64) -> Option<StompItem> {
+        match self {
+            Outbound::Item(item) => Some(item),
+            Outbound::Ack {
+                frame,
+                session: issued,
+            } if issued == session => Some(StompItem::Frame(frame)),
+            Outbound::Ack { frame, .. } => {
+                tracing::debug!(
+                    command = %frame.command,
+                    id = frame.get_header("id").unwrap_or(""),
+                    "acknowledgement was queued for an earlier connection; not sending it",
+                );
+                None
+            }
+        }
+    }
 }
 
 impl From<StompItem> for Outbound {
@@ -1565,28 +1590,6 @@ impl Connection {
                 let in_tx = in_tx.clone();
                 let subscriptions = subscriptions_clone.clone();
 
-                // Retire the pending messages on reconnect. The broker
-                // redelivers what the old session left unacknowledged, under
-                // ids of its own, but the application may still hold the old
-                // copies, in a subscription channel or mid-processing. Keeping
-                // them, marked, lets `acknowledge` recognise an ack for one
-                // and not send an id this session never issued (#118). What
-                // was retired at an earlier reconnect is dropped now, so only
-                // one session's worth is kept.
-                if just_reconnected {
-                    session += 1;
-                }
-                {
-                    let mut p = pending_clone.lock().await;
-                    p.retain(|_, queue| {
-                        queue.retain(|m| !m.retired);
-                        for m in queue.iter_mut() {
-                            m.retired = true;
-                        }
-                        !queue.is_empty()
-                    });
-                }
-
                 // The same goes for parked frames. In the client ack modes the
                 // broker redelivers what was never acknowledged, and an ack for
                 // the old copy would name a message this session does not
@@ -1665,22 +1668,8 @@ impl Connection {
                         maybe = out_rx.recv() => {
                             match maybe {
                                 Some(out) => {
-                                    let item = match out {
-                                        Outbound::Item(item) => item,
-                                        Outbound::Ack { frame, session: issued } if issued == session => {
-                                            StompItem::Frame(frame)
-                                        }
-                                        // Queued before the drop, or while this
-                                        // connection was being made: the id
-                                        // belongs to a session that is gone.
-                                        Outbound::Ack { frame, .. } => {
-                                            tracing::debug!(
-                                                command = %frame.command,
-                                                id = frame.get_header("id").unwrap_or(""),
-                                                "acknowledgement was queued for an earlier connection; not sending it",
-                                            );
-                                            continue 'conn;
-                                        }
+                                    let Some(item) = out.writable_in(session) else {
+                                        continue 'conn;
                                     };
                                     // Nothing can ack for a subscription once its
                                     // UNSUBSCRIBE goes out: forget what was pending
@@ -2067,6 +2056,29 @@ impl Connection {
 
                 if shutting_down || shutdown_sub.try_recv().is_ok() {
                     break;
+                }
+
+                // The connection is gone: retire its pending messages now,
+                // before the reconnect, so an ack issued while the client is
+                // reconnecting finds them retired too. The broker redelivers
+                // what the old session left unacknowledged, under ids of its
+                // own, but the application may still hold the old copies, in
+                // a subscription channel or mid-processing. Keeping them,
+                // marked, lets `acknowledge` recognise an ack for one and not
+                // send an id the next session never issued (#118). What was
+                // retired at the previous drop goes now, so only one session's
+                // worth is kept. Messages from the next connection carry the
+                // next session number.
+                session += 1;
+                {
+                    let mut p = pending_clone.lock().await;
+                    p.retain(|_, queue| {
+                        queue.retain(|m| !m.retired);
+                        for m in queue.iter_mut() {
+                            m.retired = true;
+                        }
+                        !queue.is_empty()
+                    });
                 }
                 let stable_duration = conn_start.elapsed();
                 if stable_duration >= Duration::from_secs(backoff_secs.max(5)) {
@@ -2659,11 +2671,14 @@ impl Connection {
         // mode, and learn the id to send. The caller may have named the
         // message by its `ack` header or by its `message-id`.
         //
-        // A match among this session's messages wins over a retired one. A
-        // broker that reuses ids across sessions then has the stale copy's
-        // ack settle the redelivered copy, and the redelivered copy's ack
-        // settle the stale one, so each message is acknowledged once,
-        // whichever order the application acks in.
+        // A match among this session's messages wins over a retired one, and
+        // a retired match removes nothing: the entry stays until the next
+        // reconnect, to catch every later ack that names it. A broker that
+        // reuses ids across sessions then has the stale copy's ack settle the
+        // redelivered copy, and any ack after that, from either copy, find
+        // only the marker, so each message is acknowledged once, whichever
+        // order the application acks in and however redelivery interleaves
+        // with it.
         let mut send_id = id.to_string();
         let mut retired = false;
         // The connection a live match was delivered on, for the background
@@ -2678,27 +2693,22 @@ impl Connection {
                     retired = queue[pos].retired;
                     if !retired {
                         delivered_on = Some(queue[pos].session);
-                    }
-                    match ack_mode {
-                        // cumulative: remove up to and including pos. A live
-                        // match leaves the retired entries ahead of it: they
-                        // still mark stale copies the application holds.
-                        AckMode::Client => {
-                            let from = if retired {
-                                0
-                            } else {
-                                queue.iter().position(|m| !m.retired).unwrap_or(pos)
-                            };
-                            queue.drain(from..=pos);
+                        match ack_mode {
+                            // cumulative: remove up to and including pos,
+                            // leaving the retired entries ahead of it
+                            AckMode::Client => {
+                                let from = queue.iter().position(|m| !m.retired).unwrap_or(pos);
+                                queue.drain(from..=pos);
+                            }
+                            // only the specific message
+                            AckMode::ClientIndividual | AckMode::Auto => {
+                                queue.remove(pos);
+                            }
                         }
-                        // only the specific message
-                        AckMode::ClientIndividual | AckMode::Auto => {
-                            queue.remove(pos);
-                        }
-                    }
 
-                    if queue.is_empty() {
-                        p.remove(subscription_id);
+                        if queue.is_empty() {
+                            p.remove(subscription_id);
+                        }
                     }
                 }
             }
@@ -3704,6 +3714,21 @@ mod tests {
 
         let _ = conn.close().await;
         server.join().unwrap();
+    }
+
+    #[test]
+    fn an_ack_from_an_earlier_connection_is_not_written() {
+        // An ACK still queued when its connection dropped is dropped too,
+        // instead of reaching the next session under an id it never issued
+        // (#118). Anything else is written whatever the connection.
+        let ack = |session| Outbound::Ack {
+            frame: Frame::new("ACK").header("id", "m1"),
+            session,
+        };
+        assert!(ack(3).writable_in(3).is_some());
+        assert!(ack(2).writable_in(3).is_none());
+        let send = Outbound::from(StompItem::Frame(Frame::new("SEND")));
+        assert!(send.writable_in(3).is_some());
     }
 
     #[tokio::test]
