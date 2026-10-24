@@ -224,14 +224,19 @@ pub(crate) struct PendingMessage {
     pub(crate) message_id: String,
     #[allow(dead_code)]
     pub(crate) frame: Frame,
+    /// The connection it was delivered on, counted from 0 by the background
+    /// task. An ack for it carries this, so one that is still queued when
+    /// that connection drops is not written to the next (#118).
+    pub(crate) session: u64,
 }
 
 impl PendingMessage {
-    pub(crate) fn new(ack_id: Option<&str>, message_id: &str, frame: Frame) -> Self {
+    pub(crate) fn new(ack_id: Option<&str>, message_id: &str, frame: Frame, session: u64) -> Self {
         Self {
             ack_id: ack_id.unwrap_or(message_id).to_string(),
             message_id: message_id.to_string(),
             frame,
+            session,
         }
     }
 }
@@ -249,6 +254,58 @@ pub(crate) type ReceiptOutcome = Result<(), Box<ServerError>>;
 /// Receipts still awaited, by receipt id, each with the sender that settles
 /// its `ReceiptHandle`.
 pub(crate) type PendingReceipts = HashMap<String, oneshot::Sender<ReceiptOutcome>>;
+
+/// What the background task writes to the broker, in the order it was queued.
+pub(crate) enum Outbound {
+    /// A frame or heartbeat, written as is.
+    Item(StompItem),
+    /// An ACK or NACK for a message delivered on connection `session`. It is
+    /// written only while that connection is the current one: one queued
+    /// before a drop, or while the client reconnected, names an id the next
+    /// session never issued (#118).
+    Ack { frame: Frame, session: u64 },
+}
+
+impl Outbound {
+    /// What to write for this on connection `session`: the item, or `None`
+    /// for an ACK or NACK issued for an earlier connection. One of those was
+    /// queued but not yet written when its connection dropped, and its id
+    /// belongs to a session that is gone.
+    fn writable_in(self, session: u64) -> Option<StompItem> {
+        match self {
+            Outbound::Item(item) => Some(item),
+            Outbound::Ack {
+                frame,
+                session: issued,
+            } if issued == session => Some(StompItem::Frame(frame)),
+            Outbound::Ack { frame, .. } => {
+                tracing::debug!(
+                    command = %frame.command,
+                    id = frame.get_header("id").unwrap_or(""),
+                    "acknowledgement was queued for an earlier connection; not sending it",
+                );
+                None
+            }
+        }
+    }
+}
+
+impl From<StompItem> for Outbound {
+    fn from(item: StompItem) -> Self {
+        Outbound::Item(item)
+    }
+}
+
+#[cfg(test)]
+impl Outbound {
+    /// The frame to be written, whichever kind of item this is.
+    fn into_frame(self) -> Option<Frame> {
+        match self {
+            Outbound::Item(StompItem::Frame(frame)) | Outbound::Ack { frame, .. } => Some(frame),
+            Outbound::Item(StompItem::Heartbeat) => None,
+        }
+    }
+}
 
 /// Errors returned by `Connection` operations.
 #[derive(Error, Debug)]
@@ -997,7 +1054,7 @@ async fn settle_receipt(
 /// performs simple reconnect logic with exponential backoff.
 #[derive(Clone)]
 pub struct Connection {
-    outbound_tx: mpsc::Sender<StompItem>,
+    outbound_tx: mpsc::Sender<Outbound>,
     /// The inbound receiver is shared behind a mutex so the `Connection`
     /// handle may be cloned and callers can call `next_frame` concurrently.
     inbound_rx: Arc<Mutex<mpsc::Receiver<Frame>>>,
@@ -1235,7 +1292,7 @@ impl Connection {
         client_hb: &str,
         options: ConnectOptions,
     ) -> Result<Self, ConnError> {
-        let (out_tx, mut out_rx) = mpsc::channel::<StompItem>(32);
+        let (out_tx, mut out_rx) = mpsc::channel::<Outbound>(32);
         let (in_tx, in_rx) = mpsc::channel::<Frame>(32);
         let subscriptions: Arc<Mutex<Subscriptions>> = Arc::new(Mutex::new(HashMap::new()));
         let sub_id_counter = Arc::new(AtomicU64::new(1));
@@ -1383,6 +1440,10 @@ impl Connection {
             let mut current_framed = Some(framed);
             let mut current_send_interval = send_interval;
             let mut current_recv_interval = recv_interval;
+            // Which connection this is, from 0 for the one `connect` made.
+            // Stamped on each pending message, and checked against the
+            // session an ACK or NACK was issued for before it is written.
+            let mut session: u64 = 0;
             // Track subscription errors across reconnections. If a subscription
             // receives too many consecutive errors, we remove it to prevent
             // error loops (e.g., Artemis sending repeated permission errors).
@@ -1512,14 +1573,6 @@ impl Connection {
                 let in_tx = in_tx.clone();
                 let subscriptions = subscriptions_clone.clone();
 
-                // Clear pending message map on reconnect — messages that were
-                // outstanding before the disconnect are considered lost and
-                // will be redelivered by the server as appropriate.
-                {
-                    let mut p = pending_clone.lock().await;
-                    p.clear();
-                }
-
                 // The same goes for parked frames. In the client ack modes the
                 // broker redelivers what was never acknowledged, and an ack for
                 // the old copy would name a message this session does not
@@ -1597,7 +1650,10 @@ impl Connection {
                         _ = shutdown_sub.recv() => { let _ = sink.close().await; shutting_down = true; break 'conn; }
                         maybe = out_rx.recv() => {
                             match maybe {
-                                Some(item) => {
+                                Some(out) => {
+                                    let Some(item) = out.writable_in(session) else {
+                                        continue 'conn;
+                                    };
                                     // Nothing can ack for a subscription once its
                                     // UNSUBSCRIBE goes out: forget what was pending
                                     // for it. `unsubscribe` and a dropped
@@ -1688,7 +1744,7 @@ impl Connection {
                                                 let q = p
                                                     .entry(sub_id.clone())
                                                     .or_insert_with(VecDeque::new);
-                                                q.push_back(PendingMessage::new(ack_id_opt.as_deref(), &msg_id, f.clone()));
+                                                q.push_back(PendingMessage::new(ack_id_opt.as_deref(), &msg_id, f.clone(), session));
                                             } else if let Some(dest) = &dest_opt {
                                                 // Destination-based delivery: add the message to
                                                 // the pending queue for each matching
@@ -1720,7 +1776,7 @@ impl Connection {
                                                         let q = p
                                                             .entry(id)
                                                             .or_insert_with(VecDeque::new);
-                                                        q.push_back(PendingMessage::new(ack_id_opt.as_deref(), &msg_id, f.clone()));
+                                                        q.push_back(PendingMessage::new(ack_id_opt.as_deref(), &msg_id, f.clone(), session));
                                                     }
                                                 }
                                             }
@@ -1984,6 +2040,16 @@ impl Connection {
                 if shutting_down || shutdown_sub.try_recv().is_ok() {
                     break;
                 }
+
+                // The connection is gone, and with it every id its session
+                // issued: the broker redelivers what was left unacknowledged,
+                // under ids of the next session. Forget the pending messages
+                // now, before the reconnect, so an ack for one, whenever it
+                // comes, finds nothing outstanding and is not sent (#118).
+                // Messages from the next connection carry the next session
+                // number.
+                session += 1;
+                pending_clone.lock().await.clear();
                 let stable_duration = conn_start.elapsed();
                 if stable_duration >= Duration::from_secs(backoff_secs.max(5)) {
                     // Connection was stable — reset backoff
@@ -2143,7 +2209,7 @@ impl Connection {
         // - `frame`: ownership of the `Frame` to send. The frame is converted
         //   into a `StompItem::Frame` and sent over the internal mpsc channel.
         self.outbound_tx
-            .send(StompItem::Frame(frame))
+            .send(StompItem::Frame(frame).into())
             .await
             .map_err(|_| ConnError::Protocol("send channel closed".into()))
     }
@@ -2326,7 +2392,7 @@ impl Connection {
             f = f.header(k, v);
         }
         self.outbound_tx
-            .send(StompItem::Frame(f))
+            .send(StompItem::Frame(f).into())
             .await
             .map_err(|_| ConnError::Protocol("send channel closed".into()))?;
 
@@ -2419,7 +2485,7 @@ impl Connection {
         let mut f = Frame::new("UNSUBSCRIBE");
         f = f.header("id", subscription_id);
         self.outbound_tx
-            .send(StompItem::Frame(f))
+            .send(StompItem::Frame(f).into())
             .await
             .map_err(|_| ConnError::Protocol("send channel closed".into()))?;
 
@@ -2455,7 +2521,7 @@ impl Connection {
         }
 
         let f = Frame::new("UNSUBSCRIBE").header("id", subscription_id);
-        let _ = self.outbound_tx.try_send(StompItem::Frame(f));
+        let _ = self.outbound_tx.try_send(StompItem::Frame(f).into());
     }
 
     /// Acknowledge a message previously received in `client` or
@@ -2490,8 +2556,20 @@ impl Connection {
     ///   that is what is sent for a message found in the pending queue,
     ///   whichever of the two values the caller gave. Brokers whose `ack` and
     ///   `message-id` differ (ActiveMQ Classic) silently ignore an ACK that
-    ///   carries the `message-id`. A message not found in the pending queue
-    ///   (after a reconnect, say) is acknowledged with the id as given.
+    ///   carries the `message-id`.
+    /// - On a `client` or `client-individual` subscription made through this
+    ///   library, an id that is not outstanding sends nothing and returns
+    ///   `Ok(())`. Every message such a subscription receives is recorded, so
+    ///   the id was already acknowledged (directly, cumulatively, or by its
+    ///   other header) or was delivered before a reconnect, when its session
+    ///   ended and the broker began redelivering it. Acknowledge the
+    ///   redelivered copy. See
+    ///   [what a consumer sees across a reconnect][reconnect].
+    /// - On a subscription the library does not manage (a SUBSCRIBE sent
+    ///   with `send_frame`), there is nothing to look the id up in, and it is
+    ///   sent as given.
+    ///
+    /// [reconnect]: https://github.com/iridiumdesign/iridium-stomp/blob/main/docs/subscriber-guide.md#what-a-consumer-sees-across-a-reconnect
     pub async fn ack(&self, subscription_id: &str, message_id: &str) -> Result<(), ConnError> {
         self.acknowledge("ACK", subscription_id, message_id).await
     }
@@ -2548,26 +2626,30 @@ impl Connection {
         subscription_id: &str,
         id: &str,
     ) -> Result<(), ConnError> {
-        // Determine ack mode for this subscription (default to client). Read
-        // and released before `pending` is taken: the two locks are never
-        // held together.
-        let mut ack_mode = AckMode::Client;
+        // Determine ack mode for this subscription, if the library manages
+        // it. Read and released before `pending` is taken: the two locks are
+        // never held together.
+        let mut managed = None;
         {
             let map = self.subscriptions.lock().await;
             'outer: for vec in map.values() {
                 for entry in vec.iter() {
                     if entry.id == subscription_id {
-                        ack_mode = entry.ack;
+                        managed = Some(entry.ack);
                         break 'outer;
                     }
                 }
             }
         }
+        let ack_mode = managed.unwrap_or(AckMode::Client);
 
         // Remove from the local pending queue according to subscription ack
         // mode, and learn the id to send. The caller may have named the
         // message by its `ack` header or by its `message-id`.
         let mut send_id = id.to_string();
+        // The connection a found message was delivered on, for the
+        // background task to check when it comes to write the frame.
+        let mut delivered_on = None;
         {
             let mut p = self.pending.lock().await;
             if let Some(queue) = p.get_mut(subscription_id) {
@@ -2577,6 +2659,7 @@ impl Connection {
                     .or_else(|| queue.iter().position(|m| m.message_id == id));
                 if let Some(pos) = pos {
                     send_id = queue[pos].ack_id.clone();
+                    delivered_on = Some(queue[pos].session);
                     match ack_mode {
                         // cumulative: remove up to and including pos
                         AckMode::Client => {
@@ -2595,15 +2678,38 @@ impl Connection {
             }
         }
 
-        // If the message wasn't found locally, still send the frame with the
-        // id as given; the server may ignore it or treat it as a no-op.
-        // (Include the subscription header for clarity.)
+        // The library records every MESSAGE a subscription it manages in a
+        // client ack mode receives, so an id not outstanding there was
+        // already acknowledged, cumulatively or by its other header, or
+        // belongs to a connection that has since dropped. Sending it would
+        // name a delivery the broker has settled or a session it no longer
+        // has (#118).
+        if delivered_on.is_none()
+            && matches!(managed, Some(AckMode::Client | AckMode::ClientIndividual))
+        {
+            tracing::debug!(
+                subscription_id,
+                id,
+                command,
+                "message is not outstanding (already settled, or delivered before a reconnect); not sending its {command}",
+            );
+            return Ok(());
+        }
+
+        // A subscription the library does not manage (a SUBSCRIBE sent with
+        // `send_frame`, say) has nothing pending to look in: send the frame
+        // with the id as given; the server may ignore it or treat it as a
+        // no-op. (Include the subscription header for clarity.)
         let mut f = Frame::new(command);
         f = f
             .header("id", &send_id)
             .header("subscription", subscription_id);
+        let out = match delivered_on {
+            Some(session) => Outbound::Ack { frame: f, session },
+            None => StompItem::Frame(f).into(),
+        };
         self.outbound_tx
-            .send(StompItem::Frame(f))
+            .send(out)
             .await
             .map_err(|_| ConnError::Protocol("send channel closed".into()))?;
 
@@ -2618,7 +2724,7 @@ impl Connection {
     ) -> Result<(), ConnError> {
         let f = Frame::new(command).header("transaction", transaction_id);
         self.outbound_tx
-            .send(StompItem::Frame(f))
+            .send(StompItem::Frame(f).into())
             .await
             .map_err(|_| ConnError::Protocol("send channel closed".into()))
     }
@@ -3430,7 +3536,7 @@ mod tests {
         // loses both the `pending` lock and the outbound send.
         conn.pending.lock().await.insert(
             "gone".to_string(),
-            VecDeque::from([PendingMessage::new(None, "old", Frame::new("MESSAGE"))]),
+            VecDeque::from([PendingMessage::new(None, "old", Frame::new("MESSAGE"), 0)]),
         );
 
         conn.send_frame_confirmed(
@@ -3581,6 +3687,21 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[test]
+    fn an_ack_from_an_earlier_connection_is_not_written() {
+        // An ACK still queued when its connection dropped is dropped too,
+        // instead of reaching the next session under an id it never issued
+        // (#118). Anything else is written whatever the connection.
+        let ack = |session| Outbound::Ack {
+            frame: Frame::new("ACK").header("id", "m1"),
+            session,
+        };
+        assert!(ack(3).writable_in(3).is_some());
+        assert!(ack(2).writable_in(3).is_none());
+        let send = Outbound::from(StompItem::Frame(Frame::new("SEND")));
+        assert!(send.writable_in(3).is_some());
+    }
+
     #[tokio::test]
     async fn the_first_connection_does_not_replay_subscriptions() {
         // Subscriptions are replayed only after a reconnect (#72). On the
@@ -3656,7 +3777,7 @@ mod tests {
     #[tokio::test]
     async fn test_cumulative_ack_removes_prefix() {
         // setup channels
-        let (out_tx, mut out_rx) = mpsc::channel::<StompItem>(8);
+        let (out_tx, mut out_rx) = mpsc::channel::<Outbound>(8);
         let (_in_tx, in_rx) = mpsc::channel::<Frame>(8);
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
@@ -3690,16 +3811,19 @@ mod tests {
                 None,
                 "m1",
                 make_message("m1", Some("s1"), Some("/queue/x")),
+                0,
             ));
             q.push_back(PendingMessage::new(
                 None,
                 "m2",
                 make_message("m2", Some("s1"), Some("/queue/x")),
+                0,
             ));
             q.push_back(PendingMessage::new(
                 None,
                 "m3",
                 make_message("m3", Some("s1"), Some("/queue/x")),
+                0,
             ));
             p.insert("s1".to_string(), q);
         }
@@ -3728,9 +3852,9 @@ mod tests {
 
         // verify an ACK frame was emitted
         if let Some(item) = out_rx.recv().await {
-            match item {
-                StompItem::Frame(f) => assert_eq!(f.command, "ACK"),
-                _ => panic!("expected frame"),
+            match item.into_frame() {
+                Some(f) => assert_eq!(f.command, "ACK"),
+                None => panic!("expected frame"),
             }
         } else {
             panic!("no outbound frame sent")
@@ -3740,7 +3864,7 @@ mod tests {
     #[tokio::test]
     async fn test_client_individual_ack_removes_only_one() {
         // setup channels
-        let (out_tx, mut out_rx) = mpsc::channel::<StompItem>(8);
+        let (out_tx, mut out_rx) = mpsc::channel::<Outbound>(8);
         let (_in_tx, in_rx) = mpsc::channel::<Frame>(8);
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
@@ -3774,16 +3898,19 @@ mod tests {
                 None,
                 "a",
                 make_message("a", Some("s2"), Some("/queue/y")),
+                0,
             ));
             q.push_back(PendingMessage::new(
                 None,
                 "b",
                 make_message("b", Some("s2"), Some("/queue/y")),
+                0,
             ));
             q.push_back(PendingMessage::new(
                 None,
                 "c",
                 make_message("c", Some("s2"), Some("/queue/y")),
+                0,
             ));
             p.insert("s2".to_string(), q);
         }
@@ -3813,9 +3940,9 @@ mod tests {
 
         // verify an ACK frame was emitted
         if let Some(item) = out_rx.recv().await {
-            match item {
-                StompItem::Frame(f) => assert_eq!(f.command, "ACK"),
-                _ => panic!("expected frame"),
+            match item.into_frame() {
+                Some(f) => assert_eq!(f.command, "ACK"),
+                None => panic!("expected frame"),
             }
         } else {
             panic!("no outbound frame sent")
@@ -3825,7 +3952,7 @@ mod tests {
     #[tokio::test]
     async fn test_subscription_receive_delivers_message() {
         // setup channels
-        let (out_tx, _out_rx) = mpsc::channel::<StompItem>(8);
+        let (out_tx, _out_rx) = mpsc::channel::<Outbound>(8);
         let (_in_tx, in_rx) = mpsc::channel::<Frame>(8);
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
@@ -3881,7 +4008,7 @@ mod tests {
     #[tokio::test]
     async fn test_subscription_ack_removes_pending_and_sends_ack() {
         // setup channels
-        let (out_tx, mut out_rx) = mpsc::channel::<StompItem>(8);
+        let (out_tx, mut out_rx) = mpsc::channel::<Outbound>(8);
         let (_in_tx, in_rx) = mpsc::channel::<Frame>(8);
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
@@ -3920,6 +4047,7 @@ mod tests {
                 None,
                 "mid-1",
                 make_message("mid-1", Some(&sub_id), Some("/queue/ack")),
+                0,
             ));
             p.insert(sub_id.clone(), q);
         }
@@ -3935,9 +4063,9 @@ mod tests {
 
         // verify an ACK frame was emitted
         if let Some(item) = out_rx.recv().await {
-            match item {
-                StompItem::Frame(f) => assert_eq!(f.command, "ACK"),
-                _ => panic!("expected frame"),
+            match item.into_frame() {
+                Some(f) => assert_eq!(f.command, "ACK"),
+                None => panic!("expected frame"),
             }
         } else {
             panic!("no outbound frame sent")
@@ -3945,8 +4073,8 @@ mod tests {
     }
 
     // Helper function to create a test connection and output receiver
-    fn setup_test_connection() -> (Connection, mpsc::Receiver<StompItem>) {
-        let (out_tx, out_rx) = mpsc::channel::<StompItem>(8);
+    fn setup_test_connection() -> (Connection, mpsc::Receiver<Outbound>) {
+        let (out_tx, out_rx) = mpsc::channel::<Outbound>(8);
         let (_in_tx, in_rx) = mpsc::channel::<Frame>(8);
         let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
@@ -3982,13 +4110,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_ack_for_an_unmanaged_subscription_is_sent_as_given() {
+        // A subscription made with a raw SUBSCRIBE has nothing pending to
+        // check against, so its acks go out unchanged. Only subscriptions the
+        // library manages skip ids that are not outstanding (#118).
+        let (conn, mut out_rx) = setup_test_connection();
+
+        conn.ack("raw-sub", "m7").await.unwrap();
+
+        // `ack` has queued the frame by the time it returns.
+        let frame = out_rx
+            .try_recv()
+            .ok()
+            .and_then(Outbound::into_frame)
+            .expect("the ACK must be sent");
+        assert_eq!(frame.command, "ACK");
+        assert_eq!(frame.get_header("id"), Some("m7"));
+        assert_eq!(frame.get_header("subscription"), Some("raw-sub"));
+    }
+
+    #[tokio::test]
     async fn test_begin_transaction_sends_frame() {
         let (conn, mut out_rx) = setup_test_connection();
 
         conn.begin("tx1").await.expect("begin failed");
 
         // verify BEGIN frame was emitted
-        if let Some(StompItem::Frame(f)) = out_rx.recv().await {
+        if let Some(f) = out_rx.recv().await.and_then(Outbound::into_frame) {
             verify_transaction_frame(f, "BEGIN", "tx1");
         } else {
             panic!("no outbound frame sent")
@@ -4002,7 +4150,7 @@ mod tests {
         conn.commit("tx1").await.expect("commit failed");
 
         // verify COMMIT frame was emitted
-        if let Some(StompItem::Frame(f)) = out_rx.recv().await {
+        if let Some(f) = out_rx.recv().await.and_then(Outbound::into_frame) {
             verify_transaction_frame(f, "COMMIT", "tx1");
         } else {
             panic!("no outbound frame sent")
@@ -4016,7 +4164,7 @@ mod tests {
         conn.abort("tx1").await.expect("abort failed");
 
         // verify ABORT frame was emitted
-        if let Some(StompItem::Frame(f)) = out_rx.recv().await {
+        if let Some(f) = out_rx.recv().await.and_then(Outbound::into_frame) {
             verify_transaction_frame(f, "ABORT", "tx1");
         } else {
             panic!("no outbound frame sent")
@@ -4031,7 +4179,7 @@ mod tests {
             .await
             .expect("send failed");
 
-        if let Some(StompItem::Frame(f)) = out_rx.recv().await {
+        if let Some(f) = out_rx.recv().await.and_then(Outbound::into_frame) {
             assert_eq!(f.command, "SEND");
             assert_eq!(f.get_header("destination"), Some("/queue/events"));
             assert_eq!(f.body, b"hello world");

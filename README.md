@@ -347,7 +347,8 @@ Subscriptions are re-established automatically. In the `client` and
 messages for the subscriber (a queue, or a durable topic subscription), the
 broker redelivers them, so a message that was already in a subscription's
 channel at the moment of the reconnect is seen twice; consumers should be
-idempotent.
+idempotent. Acknowledging the first copy sends nothing, since its id belongs
+to the old session; the redelivered copy is acknowledged as usual.
 See [what a consumer sees across a reconnect](docs/subscriber-guide.md#what-a-consumer-sees-across-a-reconnect)
 for each ack mode.
 
