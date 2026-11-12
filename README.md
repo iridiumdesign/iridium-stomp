@@ -9,8 +9,8 @@
 
 An asynchronous STOMP 1.2 client library for Rust.
 
-> **Early Production Testing**: This library is heavily tested (300+ unit and
-> fuzz tests) and is currently in early production use as a monitoring and
+> **Early Production Testing**: This library is heavily tested (400+ unit,
+> integration and fuzz tests) and is currently in early production use as a monitoring and
 > message processing tool. In that role it has shown improved reliability over
 > previous libraries, surviving broker restarts, message queue cycling, and
 > heartbeat delays with automatic reconnection. Not all features have been
@@ -24,17 +24,35 @@ An asynchronous STOMP 1.2 client library for Rust.
   bodies with embedded NULs, and the full STOMP 1.2 frame format.
 
 - **Automatic heartbeat management** — Negotiates heartbeat intervals per the
-  spec, sends heartbeats when idle, and detects missed heartbeats from the
-  server.
+  spec, sends a heartbeat whenever the connection has been quiet for one
+  interval, and drops and re-establishes the connection when the server goes
+  silent.
 
 - **Transparent reconnection** — Stability-aware exponential backoff, automatic
-  resubscription, and pending message cleanup on disconnect.
+  resubscription, and pending message cleanup on disconnect. Connection
+  attempts and writes are bounded, so a broker that stops answering or stops
+  reading cannot hang the client.
 
 - **Small, explicit API** — One way to do things, clearly documented, easy to
   understand.
 
-- **Production-ready testing** — 150+ tests including fuzz testing, stress
-  testing, and regression capture for previously-failing edge cases.
+- **Production-ready testing** — 400+ tests including fuzz testing, stress
+  testing, stub brokers that misbehave on purpose, and regression capture for
+  previously-failing edge cases.
+
+## Installation
+
+```toml
+[dependencies]
+iridium-stomp = "0.6"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
+
+The minimum supported Rust version is 1.88. The default feature set is empty;
+the `cli` feature builds the [`stomp` command-line client](#cli).
+
+The connection is plain TCP. There is no TLS support yet, so credentials and
+messages cross the network unencrypted; see [Security](#security).
 
 ## Quick Start
 
@@ -105,6 +123,7 @@ Run any example with `cargo run --example <name>` (requires a local STOMP broker
 | `subscribe` | Single subscription with `SubscriptionOptions` and per-message ack |
 | `multi_subscribe` | Multiple subscriptions merged into one stream, error monitoring, graceful shutdown |
 | `subscribe_with_headers` | Passing broker-specific headers via `subscribe_with_headers` |
+| `ack_roundtrip` | Send a message, receive it in `client` ack mode, and acknowledge it |
 | `transactions` | Begin, commit, and abort transactions |
 
 ## Features
@@ -131,8 +150,10 @@ let hb = Heartbeat::from_duration(Duration::from_secs(15));
 ```
 
 The library handles the negotiation (taking the maximum of client and server
-preferences), sends heartbeats when the connection is idle, and closes the
-connection if the server stops responding.
+preferences). It sends a heartbeat once one interval has passed since it last
+wrote anything, and if nothing arrives for twice the receive interval it drops
+the connection and reconnects, whether or not the client itself is busy
+sending. See [docs/heartbeats.md](docs/heartbeats.md).
 
 ### Subscription Management
 
@@ -329,7 +350,21 @@ handshake and protocol failures are retried with exponential backoff.
 |----------|----------|
 | Broker unreachable at startup | Retries with exponential backoff up to 30s cap |
 | Broker crashes mid-handshake | Retries with exponential backoff |
+| Broker accepts the connection and never answers | The attempt is given up after `handshake_timeout` and retried with backoff |
 | Bad credentials | Fails immediately (`ConnError::ServerRejected`) |
+
+By default the initial connection retries for as long as it takes. A
+command-line tool or a script should set `connect_timeout` so that a wrong
+address is an error and not a hang.
+
+**Timeouts**, all set on `ConnectOptions`:
+
+| Option | Default | What it bounds |
+|--------|---------|----------------|
+| `connect_timeout` | none | The initial connection as a whole, across retries. On expiry `connect` returns the last error it saw. |
+| `handshake_timeout` | 30s | One connection attempt (TCP connect, CONNECT, CONNECTED), on the first connection and on every reconnect. |
+| `write_timeout` | 30s | The write of one frame. A broker that has stopped reading makes a write stall; on expiry the connection is dropped and re-established. Raise it if you send very large frames over a slow link. |
+| `disconnect_timeout` | 5s | How long `close()` takes at most, including the wait for the broker's RECEIPT. The connection is torn down either way. |
 
 **Reconnection after a drop (stability-aware):**
 
@@ -342,7 +377,10 @@ handshake and protocol failures are retried with exponential backoff.
 - Authentication failures during reconnection continue exponential backoff
   without checking connection stability (they do not trigger a backoff reset).
 
-Subscriptions are re-established automatically. In the `client` and
+Subscriptions are re-established automatically, each exactly once: one made
+while the client is reconnecting is not sent a second time, and one ended
+while reconnecting is neither replayed nor withdrawn from a session that never
+had it. In the `client` and
 `client-individual` ack modes, where the destination keeps unacknowledged
 messages for the subscriber (a queue, or a durable topic subscription), the
 broker redelivers them, so a message that was already in a subscription's
@@ -361,20 +399,35 @@ for each ack mode.
 
 #### Broker-Specific Notes
 
-**Artemis**: When Artemis rejects a SUBSCRIBE due to permissions, it sends a
-STOMP ERROR frame but does **not** close the TCP connection. This violates the
-[STOMP 1.2 specification](https://stomp.github.io/stomp-specification-1.2.html),
-which states: "The server MAY send ERROR frames if something goes wrong. In this
-case, it **MUST** then close the connection just after sending the ERROR frame."
-Because Artemis keeps the connection open, the reconnect backoff path is never
-triggered — errors are delivered inline on the existing connection, potentially
-causing a rapid error loop if your application automatically retries
-subscriptions. The library surfaces these errors via `ReceivedFrame::Error` for
-application-level handling; you may need to implement your own rate limiting or
-circuit breaker for Artemis deployments.
+These were observed with RabbitMQ 3.11, ActiveMQ Classic 6.2 and ActiveMQ
+Artemis 2.44; other versions may differ.
 
-**RabbitMQ**: Follows the STOMP spec correctly — ERROR frames are followed by
-connection close, which triggers the reconnect backoff as expected.
+**A refused SUBSCRIBE.** RabbitMQ and Artemis answer with an ERROR frame and
+close the connection, as the
+[STOMP 1.2 specification](https://stomp.github.io/stomp-specification-1.2.html)
+requires. The library reconnects and replays its subscriptions, the broker
+refuses again, and after three ERROR frames for the destination the library
+abandons that subscription instead of looping: its stream ends,
+`Subscription::ended()` returns `SubscriptionEnd::Abandoned`, and it is not
+replayed again. Other subscriptions on the connection carry on. (Earlier
+Artemis releases were seen to leave the connection open after the ERROR;
+2.44 closes it.)
+
+**Subscription ids.** RabbitMQ and Artemis close the connection on a second
+SUBSCRIBE with an id already in use, and Artemis on an UNSUBSCRIBE for an id it
+does not know. The library never sends either, across reconnects included. If
+you send raw SUBSCRIBE frames through `send_frame`, keeping ids unique is up to
+you.
+
+**Credentials with special characters.** A colon in a login or passcode works
+on all three brokers. A backslash works on RabbitMQ and ActiveMQ Classic and is
+rejected by Artemis: brokers disagree on whether CONNECT headers are escaped,
+and no encoding of a backslash satisfies all of them. See
+[docs/stomp_spec.md](docs/stomp_spec.md#content-and-encoding).
+
+**Acknowledgements.** ActiveMQ Classic sends different values in a MESSAGE's
+`ack` and `message-id` headers and silently ignores an ACK that carries the
+wrong one. Acknowledge with `ack_frame`, which reads the right header.
 
 ## CLI
 
@@ -452,6 +505,10 @@ Subscribed to: /queue/other
 Commands:
   send <destination> <message>  - Send a message
   sub <destination>             - Subscribe to a destination
+  about                         - Show copyright and license
+  summary [file]                - Print session summary (or save to file)
+  report [file]                 - Full report with message history (or save to file)
+  clear                         - Clear message history
   quit                          - Exit
 
 > quit
@@ -507,7 +564,11 @@ cargo test --test codec_heartbeat   # Wire format encoding/decoding
 cargo test --test parser_unit       # Frame parsing edge cases
 cargo test --test codec_fuzz        # Randomized chunk splitting
 cargo test --test codec_stress      # Concurrent stress testing
+cargo test --test liveness          # Silent, stalled and unresponsive brokers
+cargo test --test resubscribe       # SUBSCRIBE/UNSUBSCRIBE across a reconnect
 ```
+
+The CLI's own tests need its feature: `cargo test --features cli`.
 
 ### Against a Real Broker
 
@@ -565,6 +626,23 @@ docker compose down -v
 ```
 
 The smoke test is skipped by default unless `RUN_STOMP_SMOKE=1` is set, since it requires an external broker.
+
+## Security
+
+- **No TLS.** The client speaks plaintext TCP. Logins, passcodes and message
+  bodies are readable by anything on the network path. Until TLS lands
+  ([#94](https://github.com/iridiumdesign/iridium-stomp/issues/94)), terminate
+  it in front of the client with a tunnel or sidecar such as `stunnel`.
+- **The broker is treated as untrusted input.** Inbound frames are bounded by
+  `ConnectOptions::max_frame_size` (16 MiB by default), so an oversized or
+  never-ending frame is rejected rather than buffered. The crate contains no
+  `unsafe`.
+- **The CLI takes the passcode as a flag** (`-p`), which is visible in the
+  process list and in shell history. Prefer a throwaway account when using it
+  on a shared machine.
+
+To report a vulnerability, see
+[SECURITY.md](https://github.com/iridiumdesign/iridium-stomp/blob/main/SECURITY.md).
 
 ## License
 

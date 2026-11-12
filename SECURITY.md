@@ -44,7 +44,8 @@ network, is a realistic threat model.
 and rejects oversized frames on total wire size, not just on the
 declared `content-length` — so a lying length header alone shouldn't
 cause unbounded buffering. Configure the limit with
-`StompCodec::with_max_frame_size`. If you find a way around that bound,
+`ConnectOptions::max_frame_size`, or `StompCodec::with_max_frame_size` when
+using the codec directly. If you find a way around that bound,
 that's exactly the kind of report I want.
 
 **No `unsafe`.** The crate contains no `unsafe` blocks, so memory-safety

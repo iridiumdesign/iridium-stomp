@@ -4,7 +4,7 @@
 
 This is an asynchronous STOMP 1.2 client library for Rust, built on Tokio. The library focuses on correct frame parsing, automatic heartbeat management, transparent reconnection, and a small, explicit API.
 
-**Status**: Early development - heavily tested (150+ tests) but not yet battle-tested in production. APIs may change.
+**Status**: Early production use - heavily tested (400+ tests). Not every feature has been exercised in production, and APIs may change.
 
 ## Tech Stack
 
