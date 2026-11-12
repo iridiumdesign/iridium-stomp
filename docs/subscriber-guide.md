@@ -121,8 +121,11 @@ than waited on.
 When the connection drops:
 
 1. The background task detects the drop: a TCP error, stream EOF, nothing
-   received for twice the heartbeat interval, or a write that has made no
-   progress for `write_timeout` (a broker that has stopped reading).
+   received for twice the heartbeat interval, or a frame whose write has not
+   finished within `write_timeout`. That last one is usually a broker that
+   has stopped reading, but the limit is on the whole frame, not on
+   progress: a very large frame over a slow link can reach it too, so raise
+   `write_timeout` if you send such frames.
 2. It waits with exponential backoff before attempting to reconnect: 1s → 2s →
    4s → 8s → 16s → 30s (cap).
 3. If the connection had been alive for at least 5 seconds before dropping, it

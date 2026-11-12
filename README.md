@@ -407,15 +407,19 @@ close the connection, as the
 [STOMP 1.2 specification](https://stomp.github.io/stomp-specification-1.2.html)
 requires. The library reconnects and replays its subscriptions, the broker
 refuses again, and after three ERROR frames for the destination the library
-abandons that subscription instead of looping: its stream ends,
-`Subscription::ended()` returns `SubscriptionEnd::Abandoned`, and it is not
-replayed again. Other subscriptions on the connection carry on. (Earlier
+abandons that destination instead of looping: the stream of every
+subscription to it ends, `Subscription::ended()` returns
+`SubscriptionEnd::Abandoned`, and none of them is replayed again.
+Abandonment is per destination, not per subscription, so a second
+subscription to the same destination ends with the refused one;
+subscriptions to other destinations carry on. (Earlier
 Artemis releases were seen to leave the connection open after the ERROR;
 2.44 closes it.)
 
 **Subscription ids.** RabbitMQ and Artemis close the connection on a second
 SUBSCRIBE with an id already in use, and Artemis on an UNSUBSCRIBE for an id it
-does not know. The library never sends either, across reconnects included. If
+does not know. Across a reconnect the library sends each SUBSCRIBE once and
+does not send an UNSUBSCRIBE to a session that never had the subscription. If
 you send raw SUBSCRIBE frames through `send_frame`, keeping ids unique is up to
 you.
 
