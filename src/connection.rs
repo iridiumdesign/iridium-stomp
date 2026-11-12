@@ -263,8 +263,6 @@ pub(crate) struct PendingMessage {
     /// The MESSAGE's `message-id` header. Kept so a caller may name the
     /// message by either value.
     pub(crate) message_id: String,
-    #[allow(dead_code)]
-    pub(crate) frame: Frame,
     /// The connection it was delivered on, counted from 0 by the background
     /// task. An ack for it carries this, so one that is still queued when
     /// that connection drops is not written to the next (#118).
@@ -272,11 +270,10 @@ pub(crate) struct PendingMessage {
 }
 
 impl PendingMessage {
-    pub(crate) fn new(ack_id: Option<&str>, message_id: &str, frame: Frame, session: u64) -> Self {
+    pub(crate) fn new(ack_id: Option<&str>, message_id: &str, session: u64) -> Self {
         Self {
             ack_id: ack_id.unwrap_or(message_id).to_string(),
             message_id: message_id.to_string(),
-            frame,
             session,
         }
     }
@@ -2013,7 +2010,7 @@ impl Connection {
                                                 let q = p
                                                     .entry(sub_id.clone())
                                                     .or_insert_with(VecDeque::new);
-                                                q.push_back(PendingMessage::new(ack_id_opt.as_deref(), &msg_id, f.clone(), session));
+                                                q.push_back(PendingMessage::new(ack_id_opt.as_deref(), &msg_id, session));
                                             } else if let Some(dest) = &dest_opt {
                                                 // Destination-based delivery: add the message to
                                                 // the pending queue for each matching
@@ -2045,7 +2042,7 @@ impl Connection {
                                                         let q = p
                                                             .entry(id)
                                                             .or_insert_with(VecDeque::new);
-                                                        q.push_back(PendingMessage::new(ack_id_opt.as_deref(), &msg_id, f.clone(), session));
+                                                        q.push_back(PendingMessage::new(ack_id_opt.as_deref(), &msg_id, session));
                                                     }
                                                 }
                                             }
@@ -3983,7 +3980,7 @@ mod tests {
         // loses both the `pending` lock and the outbound send.
         conn.pending.lock().await.insert(
             "gone".to_string(),
-            VecDeque::from([PendingMessage::new(None, "old", Frame::new("MESSAGE"), 0)]),
+            VecDeque::from([PendingMessage::new(None, "old", 0)]),
         );
 
         conn.send_frame_confirmed(
@@ -4290,24 +4287,9 @@ mod tests {
         {
             let mut p = pending.lock().await;
             let mut q = VecDeque::new();
-            q.push_back(PendingMessage::new(
-                None,
-                "m1",
-                make_message("m1", Some("s1"), Some("/queue/x")),
-                0,
-            ));
-            q.push_back(PendingMessage::new(
-                None,
-                "m2",
-                make_message("m2", Some("s1"), Some("/queue/x")),
-                0,
-            ));
-            q.push_back(PendingMessage::new(
-                None,
-                "m3",
-                make_message("m3", Some("s1"), Some("/queue/x")),
-                0,
-            ));
+            q.push_back(PendingMessage::new(None, "m1", 0));
+            q.push_back(PendingMessage::new(None, "m2", 0));
+            q.push_back(PendingMessage::new(None, "m3", 0));
             p.insert("s1".to_string(), q);
         }
 
@@ -4378,24 +4360,9 @@ mod tests {
         {
             let mut p = pending.lock().await;
             let mut q = VecDeque::new();
-            q.push_back(PendingMessage::new(
-                None,
-                "a",
-                make_message("a", Some("s2"), Some("/queue/y")),
-                0,
-            ));
-            q.push_back(PendingMessage::new(
-                None,
-                "b",
-                make_message("b", Some("s2"), Some("/queue/y")),
-                0,
-            ));
-            q.push_back(PendingMessage::new(
-                None,
-                "c",
-                make_message("c", Some("s2"), Some("/queue/y")),
-                0,
-            ));
+            q.push_back(PendingMessage::new(None, "a", 0));
+            q.push_back(PendingMessage::new(None, "b", 0));
+            q.push_back(PendingMessage::new(None, "c", 0));
             p.insert("s2".to_string(), q);
         }
 
@@ -4527,12 +4494,7 @@ mod tests {
         {
             let mut p = conn.pending.lock().await;
             let mut q = VecDeque::new();
-            q.push_back(PendingMessage::new(
-                None,
-                "mid-1",
-                make_message("mid-1", Some(&sub_id), Some("/queue/ack")),
-                0,
-            ));
+            q.push_back(PendingMessage::new(None, "mid-1", 0));
             p.insert(sub_id.clone(), q);
         }
 
