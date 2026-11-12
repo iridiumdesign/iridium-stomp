@@ -120,7 +120,14 @@ delivery confirmation from the broker.
   contains NUL bytes; otherwise optional but recommended.
 - **Header encoding** — STOMP 1.2 requires escaping of `\n` as `\\n`,
   `\r` as `\\r`, `:` as `\\c`, and `\\` as `\\\\` in header values.
-  CONNECT and CONNECTED frames are exempt from this escaping.
+  CONNECT and CONNECTED frames are exempt from this escaping, and brokers
+  read that differently: Artemis takes CONNECT header values verbatim,
+  RabbitMQ unescapes them, ActiveMQ Classic accepts either. iridium-stomp
+  writes a colon in a CONNECT value as it is, which all three accept, and
+  still escapes a backslash, CR or LF. A login or passcode containing a
+  backslash therefore works on RabbitMQ and ActiveMQ Classic and is
+  rejected by Artemis, which reads the escape literally. When reading
+  CONNECTED, a value that is not validly escaped is taken verbatim.
 
 ---
 
