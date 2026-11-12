@@ -1213,17 +1213,24 @@ async fn settle_subscribe(subscriptions: &Mutex<Subscriptions>, id: &str, sessio
 /// out on.
 ///
 /// `sent_on` is what the caller found when it removed the entry. A dropped
-/// `Subscription` that could not take the registry lock removed nothing, so
-/// an entry still registered under `id` is removed here, ended as
-/// `Unsubscribed`, and its own record is used instead. Left in place it would
-/// be replayed after the next reconnect.
+/// `Subscription` that could not take the registry lock removed nothing and
+/// knows nothing, and its entry is in one of two places by now:
+///
+/// - still registered under `id`. It is removed here, ended as
+///   `Unsubscribed`, and its own record used. Left in place it would be
+///   replayed after the next reconnect;
+/// - pruned already by the I/O loop, which found the receiver closed when a
+///   MESSAGE arrived for it. The loop kept its record in `pruned` for this
+///   moment, since without it the UNSUBSCRIBE would be skipped and the broker
+///   left delivering to nobody.
 async fn settle_unsubscribe(
     subscriptions: &Mutex<Subscriptions>,
+    pruned: &mut HashMap<String, u64>,
     id: &str,
     sent_on: Option<u64>,
     session: u64,
 ) -> bool {
-    let mut sent_on = sent_on;
+    let mut sent_on = sent_on.or(pruned.remove(id));
     {
         let mut map = subscriptions.lock().await;
         for vec in map.values_mut() {
@@ -1704,6 +1711,14 @@ impl Connection {
             // list is pruned against that registry (`prune_parked`) before
             // every wait so a removed subscription does not linger here.
             let mut parked: Vec<(String, mpsc::Sender<Frame>)> = Vec::new();
+            // Subscriptions the loop pruned on this connection because their
+            // receiver was gone, by id, with the connection their SUBSCRIBE
+            // went out on. A dropped `Subscription` that could not take the
+            // registry lock has an UNSUBSCRIBE queued that knows nothing of
+            // its entry; `settle_unsubscribe` finds the record here (#137).
+            // Emptied when the connection ends, as no later session has any
+            // of them.
+            let mut pruned: HashMap<String, u64> = HashMap::new();
 
             'task: loop {
                 // Check for shutdown before attempting connection
@@ -1894,7 +1909,7 @@ impl Connection {
                                             settle_subscribe(&subscriptions, id, session).await
                                         }
                                         Outbound::Unsubscribe { id, sent_on, .. } => {
-                                            settle_unsubscribe(&subscriptions, id, *sent_on, session).await
+                                            settle_unsubscribe(&subscriptions, &mut pruned, id, *sent_on, session).await
                                         }
                                         _ => true,
                                     };
@@ -2039,6 +2054,11 @@ impl Connection {
                                             let outcome = deliver_and_keep(entry, dest, &f);
                                             let keep = outcome == Delivery::Taken;
                                             delivered |= keep;
+                                            if outcome == Delivery::Closed
+                                                && let Some(sent_on) = entry.sent_on
+                                            {
+                                                pruned.insert(entry.id.clone(), sent_on);
+                                            }
                                             if outcome == Delivery::Overflowed {
                                                 // Before `retain` drops the entry.
                                                 end_subscription(
@@ -2250,6 +2270,9 @@ impl Connection {
                                             return true;
                                         }
                                         closed = !drain_overflow(entry);
+                                        if closed && let Some(sent_on) = entry.sent_on {
+                                            pruned.insert(entry.id.clone(), sent_on);
+                                        }
                                         !closed
                                     });
                                 }
@@ -2291,6 +2314,7 @@ impl Connection {
                 // number.
                 session += 1;
                 pending_clone.lock().await.clear();
+                pruned.clear();
                 let stable_duration = conn_start.elapsed();
                 if stable_duration >= Duration::from_secs(backoff_secs.max(5)) {
                     // Connection was stable — reset backoff
@@ -3809,6 +3833,80 @@ mod tests {
 
         let _ = conn.close().await;
         server.join().unwrap();
+    }
+
+    /// #137: a `Subscription` dropped while the registry is locked queues an
+    /// UNSUBSCRIBE that knows nothing of its entry. If a MESSAGE gets there
+    /// first, the loop prunes the entry for its closed receiver, and the
+    /// record of which connection subscribed it must outlive that, or the
+    /// UNSUBSCRIBE is skipped and the broker goes on delivering.
+    #[tokio::test]
+    async fn unsubscribe_is_sent_after_the_entry_was_pruned_first() {
+        let (addr, server) = StubBroker::spawn(|mut broker| {
+            broker.accept_connect();
+
+            let subscribe = broker.recv();
+            let sub_id = header_value(&subscribe, "id").to_string();
+            // The client says when it holds the registry.
+            let go = broker.recv();
+            assert!(go.starts_with("SEND\n"), "expected SEND, got {go:?}");
+            broker.send(&format!(
+                "MESSAGE\nsubscription:{sub_id}\nmessage-id:m1\ndestination:/queue/t\n\n\0"
+            ));
+
+            let unsubscribe = broker.recv();
+            assert!(
+                unsubscribe.starts_with("UNSUBSCRIBE\n"),
+                "expected UNSUBSCRIBE, got {unsubscribe:?}"
+            );
+            assert_eq!(header_value(&unsubscribe, "id"), sub_id);
+            broker.linger();
+        });
+
+        let conn = connect_for_test(&addr).await;
+        let sub = conn.subscribe("/queue/t", AckMode::Auto).await.unwrap();
+        // Wait for the SUBSCRIBE to be written, and so recorded.
+        for _ in 0..200 {
+            let written = conn
+                .subscriptions
+                .lock()
+                .await
+                .values()
+                .flatten()
+                .any(|entry| entry.sent_on.is_some());
+            if written {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let registry = conn.subscriptions.lock().await;
+        conn.send("/queue/go", "").await.unwrap();
+        // The loop reads the MESSAGE and stops at the registry lock.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // `Drop` cannot take the lock either: its UNSUBSCRIBE is queued
+        // without a record, behind the MESSAGE the loop is holding.
+        drop(sub);
+        drop(registry);
+
+        // If the UNSUBSCRIBE was skipped, the broker reads this DISCONNECT
+        // in its place and fails.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = conn.close().await;
+        server.join().unwrap();
+    }
+
+    /// The record of a pruned subscription is for the connection it was
+    /// pruned on only.
+    #[tokio::test]
+    async fn a_pruned_record_from_another_connection_sends_nothing() {
+        let subscriptions: Mutex<Subscriptions> = Mutex::new(HashMap::new());
+        let mut pruned = HashMap::from([("1".to_string(), 2u64)]);
+        assert!(!settle_unsubscribe(&subscriptions, &mut pruned, "1", None, 3).await);
+        assert!(pruned.is_empty(), "the record is used up either way");
+
+        let mut pruned = HashMap::from([("1".to_string(), 3u64)]);
+        assert!(settle_unsubscribe(&subscriptions, &mut pruned, "1", None, 3).await);
     }
 
     #[tokio::test]
