@@ -1,4 +1,5 @@
 use clap::Parser;
+use iridium_stomp::ConnectOptions;
 
 #[derive(Parser)]
 #[command(name = "stomp")]
@@ -16,6 +17,13 @@ pub struct Cli {
     /// Passcode
     #[arg(short, long, default_value = "guest")]
     pub passcode: String,
+
+    /// Virtual host to connect to: the CONNECT frame's `host` header.
+    ///
+    /// RabbitMQ selects a vhost with it; other brokers may use it to pick a
+    /// broker instance or ignore it. When not given, "/" is sent.
+    #[arg(long, visible_alias = "vhost", value_name = "VHOST")]
+    pub host: Option<String>,
 
     /// Heartbeat settings (client-send,client-receive in ms)
     #[arg(long, default_value = "10000,10000")]
@@ -52,4 +60,17 @@ pub struct Cli {
     /// broker that is still coming up.
     #[arg(long, default_value_t = 5, value_name = "SECONDS")]
     pub timeout: u64,
+}
+
+impl Cli {
+    /// The connect options every mode starts from: what the command line
+    /// says about the CONNECT frame itself. Each mode adds its own timeouts
+    /// and notifications.
+    pub fn connect_options(&self) -> ConnectOptions {
+        let options = ConnectOptions::default();
+        match &self.host {
+            Some(host) => options.host(host),
+            None => options,
+        }
+    }
 }
