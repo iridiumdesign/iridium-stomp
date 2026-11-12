@@ -1,5 +1,6 @@
 use crate::connection::ConnError;
 use crate::connection::Connection;
+use crate::connection::SentOn;
 use crate::frame::Frame;
 use futures::stream::Stream;
 use std::pin::Pin;
@@ -173,6 +174,10 @@ pub struct Subscription {
     /// side of `receiver` is dropped, so that `None` from `next()` always
     /// finds this set. Shared with the connection's registry entry.
     ended: Arc<OnceLock<SubscriptionEnd>>,
+    /// Which connection the SUBSCRIBE was written on, shared with the
+    /// registry entry. `Drop` hands it to the UNSUBSCRIBE it queues, which
+    /// may be reached after the entry has gone.
+    sent_on: SentOn,
 }
 
 impl Subscription {
@@ -182,6 +187,7 @@ impl Subscription {
         receiver: mpsc::Receiver<Frame>,
         conn: Connection,
         ended: Arc<OnceLock<SubscriptionEnd>>,
+        sent_on: SentOn,
     ) -> Self {
         Self {
             id,
@@ -190,6 +196,7 @@ impl Subscription {
             conn,
             unsubscribed: false,
             ended,
+            sent_on,
         }
     }
 
@@ -314,7 +321,8 @@ impl Drop for Subscription {
         if self.unsubscribed {
             return;
         }
-        self.conn.unsubscribe_best_effort(&self.id);
+        self.conn
+            .unsubscribe_best_effort(&self.id, self.sent_on.clone());
     }
 }
 
