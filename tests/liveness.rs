@@ -347,7 +347,10 @@ async fn a_stalled_connection_is_closed_before_the_backoff() {
 
     // The first backoff after a connection this short is two seconds, so the
     // old behaviour put the hang-up at about 2.3s.
-    let hung_up = broker.await.unwrap();
+    let hung_up = tokio::time::timeout(Duration::from_secs(10), broker)
+        .await
+        .expect("client never hung up on the stalled connection")
+        .unwrap();
     assert!(
         hung_up < Duration::from_millis(1500),
         "the old socket stayed open for {hung_up:?}"
