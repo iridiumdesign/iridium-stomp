@@ -28,7 +28,7 @@ cargo run --features cli --bin stomp -- --help
 |------|---------|-------------|
 | `-a, --address` | `127.0.0.1:61613` | Broker address (host:port) |
 | `-l, --login` | `guest` | STOMP login username |
-| `-p, --passcode` | `guest` | STOMP passcode |
+| `-p, --passcode` | `guest` | STOMP passcode. Given on the command line, it is visible in the process list and in shell history. |
 | `--heartbeat` | `10000,10000` | Heartbeat intervals in milliseconds (send,receive) |
 | `-s, --subscribe` | *(none)* | Destination to subscribe to on connect (repeatable) |
 | `--tui` | off | Enable TUI mode |
@@ -235,3 +235,4 @@ The `--summary` flag prints the session summary automatically on exit.
 | 1 | NETWORK_ERROR | Connection refused, timeout, or network failure |
 | 2 | AUTH_ERROR | Authentication failed (bad credentials) |
 | 3 | PROTOCOL_ERROR | Unexpected server response, protocol violation, or a `--send` the broker never answered |
+| 4 | FRAME_REJECTED | The broker refused a `--send` message (it answered the receipt request with an ERROR) |

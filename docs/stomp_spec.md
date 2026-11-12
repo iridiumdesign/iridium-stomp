@@ -156,3 +156,5 @@ iridium-stomp implements the core STOMP 1.2 client features:
 | Binary bodies with content-length | Yes |
 | Automatic reconnection with resubscription | Yes |
 | Transactions (BEGIN / COMMIT / ABORT) | Yes |
+| TLS (`stomp+ssl`) | No — plain TCP only ([#94](https://github.com/iridiumdesign/iridium-stomp/issues/94)) |
+| STOMP over WebSocket | No ([#113](https://github.com/iridiumdesign/iridium-stomp/issues/113)) |

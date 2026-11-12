@@ -202,6 +202,12 @@ automatically re-issues SUBSCRIBE frames for every active subscription.
 The original destination, ack mode, subscription ID, and any extra headers
 or options you provided are all preserved and replayed.
 
+Each subscription is sent to a new connection exactly once. One made while
+the client is between connections is replayed with the rest, and the
+SUBSCRIBE that `subscribe` itself queued is then dropped rather than written
+as well: RabbitMQ and Artemis close the connection on a second SUBSCRIBE with
+the same id.
+
 This means:
 
 - Broker-specific headers (e.g., `activemq.subscriptionName`) are resent,
@@ -226,13 +232,29 @@ point. They are not lost: the broker redelivers them to the next subscriber.
 `unsubscribe` is the explicit form and reports whether the frame was queued.
 Dropping the handle does the same on a best-effort basis — it cannot report an
 error, and because it runs from `Drop` it uses non-blocking `try_lock`/`try_send`
-rather than awaiting. If the outbound channel is momentarily unavailable the
-frame may not be sent; if the subscription registry is momentarily locked, the
-local entry is not removed right then. In that case the entry is reaped when the
-next message for it is delivered (its receiver is closed), so pruning is
-eventual rather than guaranteed at the instant of drop — until it happens, a
-reconnect in that window could briefly resubscribe it. Use the explicit
-`unsubscribe` when you need the removal to be immediate and acknowledged.
+rather than awaiting. If the subscription registry is momentarily locked, the
+local entry is not removed at the instant of the drop; the background task
+removes it when it reaches the queued UNSUBSCRIBE, a moment later. If the
+outbound queue is full, the UNSUBSCRIBE cannot be queued at all: the local
+entry is then reaped when the next message for it finds its receiver closed,
+and the broker is not told. Use the explicit `unsubscribe` when you need the
+removal to be immediate and the frame certain to be queued.
+
+The UNSUBSCRIBE is written only to the connection the subscription's SUBSCRIBE
+went out on. That has two consequences worth knowing:
+
+- **Ended while the client is reconnecting**, a subscription is not replayed
+  on the new connection. No UNSUBSCRIBE is sent, because the new session
+  never had it, and the old one is gone.
+- **Ended before its SUBSCRIBE was written** (subscribed and dropped at
+  once), a subscription sends neither frame. The broker never hears of it.
+
+Both hold when the local entry was removed at the time, which
+`unsubscribe` always does and a drop does unless the registry was locked at
+that instant. In that case the entry is still registered until the queued
+UNSUBSCRIBE is reached, and a reconnect that gets in first replays it: the
+new session is sent the SUBSCRIBE and then, straight after, the
+UNSUBSCRIBE. The end state is the same, with two frames more on the wire.
 
 One exception: if you took the raw receiver with `into_receiver`, you now own
 the stream and dropping it sends nothing. Unsubscribe explicitly with

@@ -110,12 +110,22 @@ application can start before the broker is available — it will connect once
 the broker comes up. Authentication errors (`ConnError::ServerRejected`)
 fail immediately so that bad configuration is surfaced fast.
 
+The retry has no limit unless you set one. For a tool that should give up,
+bound the whole thing with `ConnectOptions::connect_timeout`. Each attempt
+is separately bounded by `handshake_timeout` (30 seconds by default), so
+something that accepts the connection and never answers is retried rather
+than waited on.
+
 ### Reconnection after a drop
 
 When the connection drops:
 
-1. The background task detects the drop (TCP error, stream EOF, or heartbeat
-   timeout).
+1. The background task detects the drop: a TCP error, stream EOF, nothing
+   received for twice the heartbeat interval, or a frame whose write has not
+   finished within `write_timeout`. That last one is usually a broker that
+   has stopped reading, but the limit is on the whole frame, not on
+   progress: a very large frame over a slow link can reach it too, so raise
+   `write_timeout` if you send such frames.
 2. It waits with exponential backoff before attempting to reconnect: 1s → 2s →
    4s → 8s → 16s → 30s (cap).
 3. If the connection had been alive for at least 5 seconds before dropping, it
@@ -124,6 +134,15 @@ When the connection drops:
 4. Once reconnected, the library re-sends a `SUBSCRIBE` frame for every active
    subscription automatically. Your `sub.next()` loop does not need to do
    anything.
+
+A reconnect attempt that gets no answer is given up after
+`handshake_timeout` and tried again, and `conn.close()` interrupts a
+reconnect at any point.
+
+You may subscribe and unsubscribe while the client is reconnecting. A
+subscription made then is sent once, on the new connection. One ended then
+is not replayed, and no UNSUBSCRIBE is sent for it, since the new session
+never had it.
 
 **What the application sees:** `sub.next()` simply stops returning frames during
 the outage and starts again when the connection is restored. There is no
