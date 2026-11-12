@@ -592,6 +592,18 @@ pub struct ConnectOptions {
     /// terminates — is rejected as a `ConnError::Io`, so a malicious or buggy
     /// broker cannot exhaust client memory or panic the decoder.
     pub max_frame_size: Option<usize>,
+
+    /// How long one connection attempt — the TCP connect, the CONNECT frame
+    /// and the wait for CONNECTED — may take before it counts as failed and
+    /// is retried with backoff. Applies to the first connection and to every
+    /// reconnect. Defaults to [`Connection::DEFAULT_HANDSHAKE_TIMEOUT`] if
+    /// not set.
+    pub handshake_timeout: Option<Duration>,
+
+    /// How long the write of a single frame may take before the connection
+    /// is treated as dead and re-established. Defaults to
+    /// [`Connection::DEFAULT_WRITE_TIMEOUT`] if not set.
+    pub write_timeout: Option<Duration>,
 }
 
 impl std::fmt::Debug for ConnectOptions {
@@ -608,6 +620,8 @@ impl std::fmt::Debug for ConnectOptions {
             .field("disconnect_timeout", &self.disconnect_timeout)
             .field("connect_timeout", &self.connect_timeout)
             .field("max_frame_size", &self.max_frame_size)
+            .field("handshake_timeout", &self.handshake_timeout)
+            .field("write_timeout", &self.write_timeout)
             .finish()
     }
 }
@@ -710,6 +724,55 @@ impl ConnectOptions {
     /// ```
     pub fn max_frame_size(mut self, max_frame_size: usize) -> Self {
         self.max_frame_size = Some(max_frame_size);
+        self
+    }
+
+    /// Bound a single connection attempt (builder style).
+    ///
+    /// One attempt is the TCP connect, the CONNECT frame and the wait for the
+    /// broker's CONNECTED. Something that accepts the connection and then
+    /// says nothing — a broker that is still starting, a load balancer with
+    /// no healthy backend — would otherwise hold the attempt open for good,
+    /// and the client would never back off and try again. When the bound
+    /// expires the attempt fails with a [`std::io::ErrorKind::TimedOut`]
+    /// error and is retried like any other failure.
+    ///
+    /// Defaults to [`Connection::DEFAULT_HANDSHAKE_TIMEOUT`]. This is per
+    /// attempt, on the first connection and on every reconnect;
+    /// [`connect_timeout`](Self::connect_timeout) bounds the first connection
+    /// as a whole, across attempts.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let options = ConnectOptions::default()
+    ///     .handshake_timeout(Duration::from_secs(5));
+    /// ```
+    pub fn handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = Some(timeout);
+        self
+    }
+
+    /// Bound the write of a single frame (builder style).
+    ///
+    /// A broker that stops reading eventually fills the socket's send buffer,
+    /// and a write then makes no progress. A frame that has not been written
+    /// in full within this time ends the connection, which is then
+    /// re-established as after any other drop. The frame being written is
+    /// lost; frames still queued behind it are sent on the next connection.
+    ///
+    /// Defaults to [`Connection::DEFAULT_WRITE_TIMEOUT`]. The bound covers
+    /// the whole frame, so raise it if you send frames large enough, over a
+    /// link slow enough, that one legitimately takes longer.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let options = ConnectOptions::default()
+    ///     .write_timeout(Duration::from_secs(120));
+    /// ```
+    pub fn write_timeout(mut self, timeout: Duration) -> Self {
+        self.write_timeout = Some(timeout);
         self
     }
 
@@ -1047,6 +1110,88 @@ async fn settle_receipt(
     }
 }
 
+/// What the background task needs to make a connection, the first one and
+/// every one after it.
+struct ConnectParams {
+    addr: String,
+    accept_version: String,
+    host: String,
+    login: String,
+    passcode: String,
+    client_hb: String,
+    client_id: Option<String>,
+    custom_headers: Vec<(String, String)>,
+    max_frame_size: usize,
+    handshake_timeout: Duration,
+}
+
+/// The transport once the STOMP handshake is done, with the negotiated
+/// heartbeat intervals: (framed, send interval, receive interval).
+type Established = (
+    Framed<TcpStream, StompCodec>,
+    Option<Duration>,
+    Option<Duration>,
+);
+
+/// The instant `after` from now, or `None` when there is no interval or the
+/// sum is out of range (a broker may advertise any heart-beat it likes), in
+/// which case nothing is scheduled.
+fn deadline_after(after: Option<Duration>) -> Option<tokio::time::Instant> {
+    tokio::time::Instant::now().checked_add(after?)
+}
+
+/// Resolve at `deadline`; pend forever when there is none.
+async fn until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => future::pending().await,
+    }
+}
+
+/// How a write to the broker ended.
+enum Written {
+    /// The item is on the wire.
+    Done,
+    /// The write failed, or did not finish within the write timeout. The
+    /// connection is to be dropped.
+    Failed,
+    /// `close()` was called while the write was in progress.
+    Shutdown,
+}
+
+/// Write one item, giving up when `limit` has passed or shutdown is
+/// signalled. Without the bound a broker that stops reading would hold the
+/// I/O loop in this write for good, and with it the heartbeat watchdog and
+/// the shutdown signal (#133).
+async fn write_item<S>(
+    sink: &mut S,
+    item: StompItem,
+    limit: Duration,
+    shutdown: &mut broadcast::Receiver<()>,
+) -> Written
+where
+    S: futures::Sink<StompItem, Error = std::io::Error> + Unpin,
+{
+    tokio::select! {
+        biased;
+        _ = shutdown.recv() => Written::Shutdown,
+        sent = tokio::time::timeout(limit, sink.send(item)) => match sent {
+            Ok(Ok(())) => Written::Done,
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "write to broker failed");
+                Written::Failed
+            }
+            Err(_) => {
+                tracing::warn!(
+                    timeout_ms = limit.as_millis() as u64,
+                    "write to broker stalled; dropping the connection",
+                );
+                Written::Failed
+            }
+        },
+    }
+}
+
 /// High-level connection object that manages a single TCP/STOMP connection.
 ///
 /// The `Connection` spawns a background task that maintains the TCP transport,
@@ -1202,6 +1347,18 @@ impl Connection {
     /// [`ConnectOptions::disconnect_timeout`].
     pub const DEFAULT_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+    /// How long one connection attempt (TCP connect, CONNECT, CONNECTED) may
+    /// take before it is abandoned and retried.
+    ///
+    /// Override per connection with [`ConnectOptions::handshake_timeout`].
+    pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+    /// How long the write of one frame may take before the connection is
+    /// treated as dead.
+    ///
+    /// Override per connection with [`ConnectOptions::write_timeout`].
+    pub const DEFAULT_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
     /// Establish a connection to the STOMP server at `addr` with the given
     /// credentials and heartbeat header string (e.g. "10000,10000").
     ///
@@ -1266,7 +1423,8 @@ impl Connection {
     ///   (`ConnError::ServerRejected`)
     ///
     /// All other errors (TCP refused, connection closed mid-handshake, I/O
-    /// failures) are retried with backoff.
+    /// failures) are retried with backoff. So is an attempt that gets no
+    /// CONNECTED within [`ConnectOptions::handshake_timeout`].
     ///
     /// # Example
     ///
@@ -1302,97 +1460,54 @@ impl Connection {
         let pending_receipts: Arc<Mutex<PendingReceipts>> = Arc::new(Mutex::new(HashMap::new()));
         let pending_receipts_clone = pending_receipts.clone();
 
-        let addr = addr.to_string();
-        let login = login.to_string();
-        let passcode = passcode.to_string();
-        let client_hb = client_hb.to_string();
-
-        // Extract options into owned values for the spawned task
-        let accept_version = options.accept_version.unwrap_or_else(|| "1.2".to_string());
-        let host = options.host.unwrap_or_else(|| "/".to_string());
-        let client_id = options.client_id;
-        let custom_headers = options.headers;
         let heartbeat_notify_tx = options.heartbeat_tx;
         let connect_timeout = options.connect_timeout;
-        let max_frame_size = options.max_frame_size.unwrap_or(DEFAULT_MAX_FRAME_SIZE);
+        let write_timeout = options.write_timeout.unwrap_or(Self::DEFAULT_WRITE_TIMEOUT);
+        // Owned by the background task once the first connection is made.
+        let params = ConnectParams {
+            addr: addr.to_string(),
+            accept_version: options.accept_version.unwrap_or_else(|| "1.2".to_string()),
+            host: options.host.unwrap_or_else(|| "/".to_string()),
+            login: login.to_string(),
+            passcode: passcode.to_string(),
+            client_hb: client_hb.to_string(),
+            client_id: options.client_id,
+            custom_headers: options.headers,
+            max_frame_size: options.max_frame_size.unwrap_or(DEFAULT_MAX_FRAME_SIZE),
+            handshake_timeout: options
+                .handshake_timeout
+                .unwrap_or(Self::DEFAULT_HANDSHAKE_TIMEOUT),
+        };
 
         // Perform initial connection and STOMP handshake before spawning
         // background task. Retries with exponential backoff on I/O and
-        // protocol errors (broker unreachable or crashing mid-handshake)
-        // using the same strategy as reconnection. Only ServerRejected
-        // (authentication failure) fails immediately.
+        // protocol errors (broker unreachable, silent, or crashing
+        // mid-handshake) using the same strategy as reconnection. Only
+        // ServerRejected (authentication failure) fails immediately.
         //
         // `last_err` remembers the most recent failure so that, if a
         // `connect_timeout` bound elapses, the caller gets that error rather
-        // than a bare "timed out". It is written by the retry arms and read
+        // than a bare "timed out". It is written by the retry arm and read
         // only after the attempt future below has been dropped.
         let mut backoff_secs: u64 = 1;
         let mut last_err: Option<ConnError> = None;
         let attempt = async {
             loop {
-                let stream = match TcpStream::connect(&addr).await {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::warn!(
-                            addr = %addr,
-                            error = %e,
-                            backoff_secs,
-                            "initial connect failed, retrying in {}s",
-                            backoff_secs,
-                        );
-                        last_err = Some(ConnError::Io(e));
-                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                        backoff_secs = (backoff_secs * 2).min(30);
-                        continue;
-                    }
-                };
-                let mut framed =
-                    Framed::new(stream, StompCodec::with_max_frame_size(max_frame_size));
-
-                let connect = Self::build_connect_frame(
-                    &accept_version,
-                    &host,
-                    &login,
-                    &passcode,
-                    &client_hb,
-                    &client_id,
-                    &custom_headers,
-                );
-
-                if let Err(e) = framed.send(StompItem::Frame(connect)).await {
-                    tracing::warn!(
-                        addr = %addr,
-                        error = %e,
-                        backoff_secs,
-                        "failed to send CONNECT frame, retrying in {}s",
-                        backoff_secs,
-                    );
-                    last_err = Some(ConnError::Io(e));
-                    tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                    backoff_secs = (backoff_secs * 2).min(30);
-                    continue;
-                }
-
-                match Self::await_connected_response(&mut framed).await {
-                    Ok(server_hb) => {
-                        tracing::info!(addr = %addr, "connected to broker");
-                        let (cx, cy) = parse_heartbeat_header(&client_hb);
-                        let (sx, sy) = parse_heartbeat_header(&server_hb);
-                        let (si, ri) = negotiate_heartbeats(cx, cy, sx, sy);
-                        return Ok::<_, ConnError>((framed, si, ri));
+                match Self::establish(&params).await {
+                    Ok(established) => {
+                        tracing::info!(addr = %params.addr, "connected to broker");
+                        return Ok::<_, ConnError>(established);
                     }
                     // Auth errors fail immediately — bad config should not be retried
                     Err(e @ ConnError::ServerRejected(_)) => {
                         return Err(e);
                     }
-                    // I/O and protocol errors during handshake (e.g., broker
-                    // crashed or closed mid-handshake) — retry with backoff
                     Err(e) => {
                         tracing::warn!(
-                            addr = %addr,
+                            addr = %params.addr,
                             error = %e,
                             backoff_secs,
-                            "handshake failed, retrying in {}s",
+                            "initial connect failed, retrying in {}s",
                             backoff_secs,
                         );
                         last_err = Some(e);
@@ -1414,7 +1529,7 @@ impl Connection {
                     return Err(last_err.unwrap_or_else(|| {
                         ConnError::Io(std::io::Error::new(
                             std::io::ErrorKind::TimedOut,
-                            format!("connect to {} timed out after {:?}", addr, timeout),
+                            format!("connect to {} timed out after {:?}", params.addr, timeout),
                         ))
                     }));
                 }
@@ -1465,7 +1580,7 @@ impl Connection {
             // every wait so a removed subscription does not linger here.
             let mut parked: Vec<(String, mpsc::Sender<Frame>)> = Vec::new();
 
-            loop {
+            'task: loop {
                 // Check for shutdown before attempting connection
                 tokio::select! {
                     biased;
@@ -1479,77 +1594,29 @@ impl Connection {
                 let (framed, just_reconnected) = if let Some(f) = current_framed.take() {
                     (f, false)
                 } else {
-                    // Reconnection attempt
-                    match TcpStream::connect(&addr).await {
-                        Ok(stream) => {
-                            let mut framed = Framed::new(
-                                stream,
-                                StompCodec::with_max_frame_size(max_frame_size),
-                            );
-
-                            let connect = Self::build_connect_frame(
-                                &accept_version,
-                                &host,
-                                &login,
-                                &passcode,
-                                &client_hb,
-                                &client_id,
-                                &custom_headers,
-                            );
-
-                            if let Err(e) = framed.send(StompItem::Frame(connect)).await {
-                                tracing::warn!(
-                                    addr = %addr,
-                                    error = %e,
-                                    backoff_secs,
-                                    "reconnect: failed to send CONNECT frame, retrying in {}s",
-                                    backoff_secs,
-                                );
-                                tokio::select! {
-                                    biased;
-                                    // A close() during the backoff must not wait it out.
-                                    _ = shutdown_sub.recv() => break,
-                                    _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
-                                }
-                                backoff_secs = (backoff_secs * 2).min(30);
-                                continue;
-                            }
-
-                            match Self::await_connected_response(&mut framed).await {
-                                Ok(server_hb) => {
-                                    tracing::info!(addr = %addr, "reconnected to broker");
-                                    let (cx, cy) = parse_heartbeat_header(&client_hb);
-                                    let (sx, sy) = parse_heartbeat_header(&server_hb);
-                                    let (si, ri) = negotiate_heartbeats(cx, cy, sx, sy);
-                                    current_send_interval = si;
-                                    current_recv_interval = ri;
-                                    (framed, true)
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        addr = %addr,
-                                        error = %e,
-                                        backoff_secs,
-                                        "reconnect: handshake failed, retrying in {}s",
-                                        backoff_secs,
-                                    );
-                                    tokio::select! {
-                                        biased;
-                                        // A close() during the backoff must not wait it out.
-                                        _ = shutdown_sub.recv() => break,
-                                        _ = tokio::time::sleep(Duration::from_secs(backoff_secs)) => {}
-                                    }
-                                    backoff_secs = (backoff_secs * 2).min(30);
-                                    continue;
-                                }
-                            }
+                    // Reconnection attempt. Bounded by the handshake timeout
+                    // inside `establish`, and raced against shutdown as a
+                    // whole: a broker that accepts the connection and never
+                    // answers must not hold up the next attempt, or a
+                    // close() (#134).
+                    let attempt = tokio::select! {
+                        biased;
+                        _ = shutdown_sub.recv() => break,
+                        attempt = Self::establish(&params) => attempt,
+                    };
+                    match attempt {
+                        Ok((framed, si, ri)) => {
+                            tracing::info!(addr = %params.addr, "reconnected to broker");
+                            current_send_interval = si;
+                            current_recv_interval = ri;
+                            (framed, true)
                         }
                         Err(e) => {
                             tracing::warn!(
-                                addr = %addr,
+                                addr = %params.addr,
                                 error = %e,
                                 backoff_secs,
-                                "reconnect: broker unreachable, retrying in {}s",
+                                "reconnect failed, retrying in {}s",
                                 backoff_secs,
                             );
                             tokio::select! {
@@ -1566,8 +1633,22 @@ impl Connection {
 
                 let (send_interval, recv_interval) = (current_send_interval, current_recv_interval);
 
-                let last_received = Arc::new(AtomicU64::new(current_millis()));
-                let writer_last_sent = Arc::new(AtomicU64::new(current_millis()));
+                // Heartbeat timing, on the monotonic clock. `hb_due` is when
+                // the next heartbeat must go out: one send interval after the
+                // last write, and every write moves it (#135). `rx_dead` is
+                // when the broker is given up on: two receive intervals after
+                // the last thing received. Only receiving moves it, so a
+                // client that keeps writing still notices a silent broker
+                // (#132).
+                let rx_grace = recv_interval.and_then(|d| d.checked_mul(2));
+                let mut hb_due = deadline_after(send_interval);
+                let mut rx_dead = deadline_after(rx_grace);
+                // An inbound item read ahead of its turn by the receive
+                // deadline's check below, for the read branch to take next.
+                let mut read_ahead = None;
+                // Cleared when a resubscribe cannot be written: the
+                // connection is no good and is dropped before it is used.
+                let mut usable = true;
 
                 let (mut sink, mut stream) = framed.split();
                 let in_tx = in_tx.clone();
@@ -1618,22 +1699,28 @@ impl Connection {
                         for (k, v) in headers {
                             sf = sf.header(&k, &v);
                         }
-                        if let Err(e) = sink.send(StompItem::Frame(sf)).await {
-                            tracing::warn!(
-                                destination = %dest,
-                                subscription_id = %id,
-                                error = %e,
-                                "failed to resubscribe after reconnect",
-                            );
+                        match write_item(
+                            &mut sink,
+                            StompItem::Frame(sf),
+                            write_timeout,
+                            &mut shutdown_sub,
+                        )
+                        .await
+                        {
+                            Written::Done => hb_due = deadline_after(send_interval),
+                            Written::Failed => {
+                                tracing::warn!(
+                                    destination = %dest,
+                                    subscription_id = %id,
+                                    "failed to resubscribe after reconnect",
+                                );
+                                usable = false;
+                                break;
+                            }
+                            Written::Shutdown => break 'task,
                         }
                     }
                 }
-                let mut hb_tick = match send_interval {
-                    Some(d) => tokio::time::interval(d),
-                    None => tokio::time::interval(Duration::from_secs(86400)),
-                };
-                let watchdog_half = recv_interval.map(|d| d / 2);
-
                 let conn_start = tokio::time::Instant::now();
 
                 // Set when the branch below takes the shutdown signal. The
@@ -1642,10 +1729,19 @@ impl Connection {
                 let mut shutting_down = false;
 
                 'conn: loop {
+                    if !usable {
+                        break 'conn;
+                    }
                     if !parked.is_empty() {
                         let map = subscriptions.lock().await;
                         prune_parked(&mut parked, &map);
                     }
+                    // The receive deadline is not enforced while an item read
+                    // ahead is still waiting for the read branch: a second
+                    // look would put another item in its place and lose it,
+                    // or find nothing new and drop a connection that had just
+                    // proved itself.
+                    let watchdog = if read_ahead.is_none() { rx_dead } else { None };
                     tokio::select! {
                         _ = shutdown_sub.recv() => { let _ = sink.close().await; shutting_down = true; break 'conn; }
                         maybe = out_rx.recv() => {
@@ -1666,21 +1762,30 @@ impl Connection {
                                     {
                                         pending_clone.lock().await.remove(id);
                                     }
-                                    if sink.send(item).await.is_err() { break 'conn } else { writer_last_sent.store(current_millis(), Ordering::SeqCst); }
+                                    match write_item(&mut sink, item, write_timeout, &mut shutdown_sub).await {
+                                        Written::Done => hb_due = deadline_after(send_interval),
+                                        Written::Failed => break 'conn,
+                                        Written::Shutdown => { shutting_down = true; break 'conn; }
+                                    }
                                 }
                                 None => break 'conn,
                             }
                         }
-                        item = stream.next() => {
+                        item = async {
+                            match read_ahead.take() {
+                                Some(item) => item,
+                                None => stream.next().await,
+                            }
+                        } => {
                             match item {
                                 Some(Ok(StompItem::Heartbeat)) => {
-                                    last_received.store(current_millis(), Ordering::SeqCst);
+                                    rx_dead = deadline_after(rx_grace);
                                     if let Some(ref tx) = heartbeat_notify_tx {
                                         let _ = tx.try_send(());
                                     }
                                 }
                                 Some(Ok(StompItem::Frame(f))) => {
-                                    last_received.store(current_millis(), Ordering::SeqCst);
+                                    rx_dead = deadline_after(rx_grace);
                                     // Dispatch MESSAGE frames to any matching subscribers.
                                     if f.command == "MESSAGE" {
                                         // try to find destination, subscription and message-id headers
@@ -1889,10 +1994,11 @@ impl Connection {
                                             forward_inbound(&in_tx, overflow_frame);
                                             let unsub = Frame::new("UNSUBSCRIBE").header("id", &id);
                                             overflowed_sub_ids.insert(id);
-                                            if sink.send(StompItem::Frame(unsub)).await.is_err() {
-                                                break 'conn;
+                                            match write_item(&mut sink, StompItem::Frame(unsub), write_timeout, &mut shutdown_sub).await {
+                                                Written::Done => hb_due = deadline_after(send_interval),
+                                                Written::Failed => break 'conn,
+                                                Written::Shutdown => { shutting_down = true; break 'conn; }
                                             }
-                                            writer_last_sent.store(current_millis(), Ordering::SeqCst);
                                         }
 
                                         // A MESSAGE a subscription took is not
@@ -2017,22 +2123,41 @@ impl Connection {
                                 pending_clone.lock().await.remove(&sub_id);
                             }
                         }
-                        _ = hb_tick.tick() => {
-                            if let Some(dur) = send_interval {
-                                let last = writer_last_sent.load(Ordering::SeqCst);
-                                if current_millis().saturating_sub(last) >= dur.as_millis() as u64 {
-                                    if sink.send(StompItem::Heartbeat).await.is_err() { break 'conn; }
-                                    writer_last_sent.store(current_millis(), Ordering::SeqCst);
-                                }
+                        _ = until(hb_due) => {
+                            match write_item(&mut sink, StompItem::Heartbeat, write_timeout, &mut shutdown_sub).await {
+                                Written::Done => hb_due = deadline_after(send_interval),
+                                Written::Failed => break 'conn,
+                                Written::Shutdown => { shutting_down = true; break 'conn; }
                             }
                         }
-                        _ = async { if let Some(interval) = watchdog_half { tokio::time::sleep(interval).await } else { future::pending::<()>().await } } => {
-                            if let Some(recv_dur) = recv_interval {
-                                let last = last_received.load(Ordering::SeqCst);
-                                if current_millis().saturating_sub(last) > (recv_dur.as_millis() as u64 * 2) {
-                                    let _ = sink.close().await; break 'conn;
-                                }
+                        _ = until(watchdog) => {
+                            // Nothing is read while a write is in progress,
+                            // so the deadline can pass with the broker's
+                            // heartbeats sitting unread behind a slow write,
+                            // and this branch can be taken ahead of the read
+                            // that would have moved it. Look before giving
+                            // up: anything that can be read right now means
+                            // the broker is there. It is handed to the read
+                            // branch, and the deadline starts over. The
+                            // deadline itself is never stretched, so a broker
+                            // that is silent is still dropped on time however
+                            // long the writes take.
+                            let ready = tokio::select! {
+                                biased;
+                                item = stream.next() => Some(item),
+                                _ = future::ready(()) => None,
+                            };
+                            if let Some(item) = ready {
+                                read_ahead = Some(item);
+                                rx_dead = deadline_after(rx_grace);
+                                continue 'conn;
                             }
+                            tracing::warn!(
+                                addr = %params.addr,
+                                "nothing received from broker for twice the heartbeat interval; dropping the connection",
+                            );
+                            let _ = sink.close().await;
+                            break 'conn;
                         }
                     }
                 }
@@ -2055,7 +2180,7 @@ impl Connection {
                     // Connection was stable — reset backoff
                     backoff_secs = 1;
                     tracing::info!(
-                        addr = %addr,
+                        addr = %params.addr,
                         stable_secs = stable_duration.as_secs(),
                         "connection dropped after stable session, reconnecting in 1s",
                     );
@@ -2063,7 +2188,7 @@ impl Connection {
                     // Connection died quickly — increase backoff
                     backoff_secs = (backoff_secs * 2).min(30);
                     tracing::warn!(
-                        addr = %addr,
+                        addr = %params.addr,
                         stable_secs = stable_duration.as_secs(),
                         backoff_secs,
                         "connection dropped quickly, reconnecting in {}s",
@@ -2101,6 +2226,44 @@ impl Connection {
                 .disconnect_timeout
                 .unwrap_or(Self::DEFAULT_DISCONNECT_TIMEOUT),
         })
+    }
+
+    /// Make one connection attempt: TCP connect, CONNECT, and the wait for
+    /// CONNECTED, all within the handshake timeout. Used for the first
+    /// connection and for every reconnect, so the two cannot drift apart.
+    async fn establish(params: &ConnectParams) -> Result<Established, ConnError> {
+        let attempt = async {
+            let stream = TcpStream::connect(&params.addr).await?;
+            let mut framed = Framed::new(
+                stream,
+                StompCodec::with_max_frame_size(params.max_frame_size),
+            );
+            let connect = Self::build_connect_frame(
+                &params.accept_version,
+                &params.host,
+                &params.login,
+                &params.passcode,
+                &params.client_hb,
+                &params.client_id,
+                &params.custom_headers,
+            );
+            framed.send(StompItem::Frame(connect)).await?;
+            let server_hb = Self::await_connected_response(&mut framed).await?;
+            let (cx, cy) = parse_heartbeat_header(&params.client_hb);
+            let (sx, sy) = parse_heartbeat_header(&server_hb);
+            let (send_interval, recv_interval) = negotiate_heartbeats(cx, cy, sx, sy);
+            Ok((framed, send_interval, recv_interval))
+        };
+        match tokio::time::timeout(params.handshake_timeout, attempt).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(ConnError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "no CONNECTED from {} within {:?}",
+                    params.addr, params.handshake_timeout
+                ),
+            ))),
+        }
     }
 
     /// Build a CONNECT frame with all specified headers.
@@ -2254,6 +2417,17 @@ impl Connection {
         // cares about the response.
         let (tx, rx) = oneshot::channel();
 
+        // Take a place in the outbound queue first. This is the only await
+        // that can be long (the queue is full while the broker is not
+        // reading), and a caller may give up on it, as `close` does at its
+        // timeout. Nothing is registered yet at that point, so a cancelled
+        // call leaves no receipt behind that nothing will ever answer.
+        let permit = self
+            .outbound_tx
+            .reserve()
+            .await
+            .map_err(|_| ConnError::Protocol("send channel closed".into()))?;
+
         // Register the pending receipt before sending, so the background task
         // can never see the response with nothing registered for it.
         {
@@ -2271,15 +2445,8 @@ impl Connection {
             .headers
             .retain(|(key, _)| !key.eq_ignore_ascii_case("receipt"));
 
-        // Add receipt header and send the frame
-        let frame_with_receipt = frame.receipt(&receipt_id);
-        if let Err(err) = self.send_frame(frame_with_receipt).await {
-            // The frame never went out; deregister rather than leave an entry
-            // that nothing will ever answer.
-            let mut receipts = self.pending_receipts.lock().await;
-            receipts.remove(&receipt_id);
-            return Err(err);
-        }
+        // Add receipt header and queue the frame in the place reserved for it.
+        permit.send(StompItem::Frame(frame.receipt(&receipt_id)).into());
 
         Ok(ReceiptHandle {
             receipt_id,
@@ -2845,7 +3012,10 @@ impl Connection {
     /// `Ok(())` once the broker has confirmed the DISCONNECT.
     /// `Err(ConnError::ReceiptTimeout)` if it did not answer within the
     /// disconnect timeout, or another `ConnError` if the DISCONNECT could not be
-    /// submitted or was rejected.
+    /// submitted or was rejected. A broker that has stopped reading altogether
+    /// can leave no room to queue the DISCONNECT; that is reported as a
+    /// `ConnError::Io` of kind [`TimedOut`](std::io::ErrorKind::TimedOut) once
+    /// the same timeout has passed.
     ///
     /// **The connection is torn down either way.** An error reports that the
     /// shutdown was not clean - that the broker may not have run whatever it
@@ -2869,9 +3039,27 @@ impl Connection {
         // Queued frames are written before this one, and the broker answers the
         // receipt only after processing them, so awaiting it drains the outbound
         // queue rather than abandoning it at the shutdown signal below.
-        let result = match self.send_frame_with_receipt(Frame::new("DISCONNECT")).await {
-            Ok(handle) => handle.wait(self.disconnect_timeout).await,
-            Err(err) => Err(err),
+        //
+        // The timeout covers queuing the DISCONNECT as well as the wait for
+        // its receipt. When the broker has stopped reading, the outbound
+        // queue is full and stays full, and an unbounded wait for room in it
+        // would never reach the shutdown signal below (#133).
+        let started = tokio::time::Instant::now();
+        let submitted = tokio::time::timeout(
+            self.disconnect_timeout,
+            self.send_frame_with_receipt(Frame::new("DISCONNECT")),
+        )
+        .await;
+        let result = match submitted {
+            Ok(Ok(handle)) => {
+                let left = self.disconnect_timeout.saturating_sub(started.elapsed());
+                handle.wait(left).await
+            }
+            Ok(Err(err)) => Err(err),
+            Err(_elapsed) => Err(ConnError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "DISCONNECT could not be queued within the disconnect timeout",
+            ))),
         };
 
         // Tear down regardless of how the broker answered: the caller asked for
@@ -2881,14 +3069,6 @@ impl Connection {
 
         result
     }
-}
-
-fn current_millis() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -3623,6 +3803,41 @@ mod tests {
 
         sub.ack("M3").await.unwrap();
         assert!(!conn.pending.lock().await.contains_key(sub.id()));
+    }
+
+    /// `close` gives up on a full outbound queue at its timeout. A receipt
+    /// registered before the frame had a place in the queue would then stay
+    /// in the registry with nothing ever going to answer it.
+    #[tokio::test]
+    async fn a_cancelled_receipt_send_registers_nothing() {
+        let (conn, mut out_rx) = setup_test_connection();
+        while conn
+            .outbound_tx
+            .try_send(StompItem::Heartbeat.into())
+            .is_ok()
+        {}
+
+        let send = conn.send_frame_with_receipt(Frame::new("DISCONNECT"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), send)
+                .await
+                .is_err(),
+            "the queue is full, so the send cannot have finished"
+        );
+        assert!(conn.pending_receipts.lock().await.is_empty());
+
+        // With room in the queue the same call registers and queues as usual.
+        out_rx.recv().await.unwrap();
+        let handle = conn
+            .send_frame_with_receipt(Frame::new("DISCONNECT"))
+            .await
+            .unwrap();
+        assert!(
+            conn.pending_receipts
+                .lock()
+                .await
+                .contains_key(handle.receipt_id())
+        );
     }
 
     #[tokio::test]
