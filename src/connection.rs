@@ -2326,6 +2326,15 @@ impl Connection {
                     }
                 }
 
+                // Let go of the transport now, not when the backoff below is
+                // over. Usually it is dead already. After a write that
+                // stalled it is not: the socket is still open, and for as
+                // long as it stays open the broker holds the old session,
+                // with its unacknowledged messages and its subscriptions
+                // (#142).
+                drop(sink);
+                drop(stream);
+
                 if shutting_down || shutdown_sub.try_recv().is_ok() {
                     break;
                 }
