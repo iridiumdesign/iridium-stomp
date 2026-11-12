@@ -67,6 +67,19 @@ fn commands(seen: &Seen) -> Vec<String> {
         .collect()
 }
 
+/// Wait until the broker has seen a frame with this command. A subscription
+/// ended before its SUBSCRIBE was written sends nothing at all (#137), so the
+/// tests below let the SUBSCRIBE arrive before they end one.
+async fn broker_saw(seen: &Seen, command: &str) {
+    for _ in 0..200 {
+        if commands(seen).iter().any(|c| c == command) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("broker never saw {command}; it saw {:?}", commands(seen));
+}
+
 /// The `id` header of the first frame whose command matches.
 fn id_of_command(seen: &Seen, command: &str) -> Option<String> {
     seen.lock().unwrap().iter().find_map(|frame| {
@@ -93,6 +106,7 @@ async fn dropping_a_subscription_sends_unsubscribe() {
         .await
         .unwrap();
     let sub_id = sub.id().to_string();
+    broker_saw(&seen, "SUBSCRIBE").await;
     drop(sub);
 
     // Give the drop's best-effort try_send and the broker thread a moment.
@@ -122,6 +136,7 @@ async fn explicit_unsubscribe_then_drop_sends_exactly_one() {
         .subscribe("/queue/orders", AckMode::Auto)
         .await
         .unwrap();
+    broker_saw(&seen, "SUBSCRIBE").await;
     sub.unsubscribe().await.unwrap(); // consumes `sub`, which then drops
 
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -160,4 +175,34 @@ async fn into_receiver_keeps_the_subscription_active() {
     drop(rx);
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(!commands(&seen).contains(&"UNSUBSCRIBE".to_string()));
+}
+
+/// #137: a subscription dropped before its SUBSCRIBE was written never
+/// reaches the broker, so there is nothing to withdraw. Both frames are
+/// skipped, never just one of them.
+#[tokio::test]
+async fn a_subscription_ended_at_once_sends_a_matched_pair_or_nothing() {
+    let (addr, seen) = start_broker();
+    let conn = Connection::connect(&addr, "guest", "guest", "0,0")
+        .await
+        .unwrap();
+
+    for _ in 0..20 {
+        let sub = conn
+            .subscribe("/queue/orders", AckMode::Auto)
+            .await
+            .unwrap();
+        drop(sub);
+    }
+    // Everything queued above is written before this.
+    conn.send("/queue/marker", "end").await.unwrap();
+    broker_saw(&seen, "SEND").await;
+
+    let cmds = commands(&seen);
+    let count = |command: &str| cmds.iter().filter(|c| *c == command).count();
+    assert_eq!(
+        count("SUBSCRIBE"),
+        count("UNSUBSCRIBE"),
+        "every SUBSCRIBE written must be withdrawn, and nothing else: {cmds:?}"
+    );
 }

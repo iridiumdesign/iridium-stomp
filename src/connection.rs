@@ -135,6 +135,10 @@ pub(crate) struct SubscriptionEntry {
     /// Whoever removes the entry sets this first, then lets `sender` drop:
     /// the handle reads it after `next()` yields `None`.
     pub(crate) ended: Arc<OnceLock<SubscriptionEnd>>,
+    /// The connection its SUBSCRIBE was last written on, or `None` while
+    /// that frame is still queued. Decides whether a queued SUBSCRIBE or
+    /// UNSUBSCRIBE still has anything to say to the current session (#137).
+    pub(crate) sent_on: Option<u64>,
 }
 
 /// Record why `entry` is about to go. A second reason is ignored: the first
@@ -264,6 +268,23 @@ pub(crate) enum Outbound {
     /// before a drop, or while the client reconnected, names an id the next
     /// session never issued (#118).
     Ack { frame: Frame, session: u64 },
+    /// The SUBSCRIBE for subscription `id`, queued by one of the subscribe
+    /// methods. It is written only if the subscription is still registered
+    /// and has not been subscribed on the current connection already: one
+    /// queued while the client was reconnecting is covered by the replay of
+    /// registered subscriptions, and a second SUBSCRIBE with the same id
+    /// makes RabbitMQ and Artemis close the connection (#137).
+    Subscribe { frame: Frame, id: String },
+    /// The UNSUBSCRIBE for subscription `id`. `sent_on` is the connection
+    /// its SUBSCRIBE was written on, as far as whoever queued this knew. It
+    /// is written only while that connection is the current one: a session
+    /// that never saw the SUBSCRIBE answers its UNSUBSCRIBE with an ERROR,
+    /// and Artemis closes the connection (#137).
+    Unsubscribe {
+        frame: Frame,
+        id: String,
+        sent_on: Option<u64>,
+    },
 }
 
 impl Outbound {
@@ -271,9 +292,16 @@ impl Outbound {
     /// for an ACK or NACK issued for an earlier connection. One of those was
     /// queued but not yet written when its connection dropped, and its id
     /// belongs to a session that is gone.
+    ///
+    /// `Subscribe` and `Unsubscribe` are settled by the I/O loop, which has
+    /// the registry, through [`settle_subscribe`] and [`settle_unsubscribe`];
+    /// by the time one of them gets here it is to be written.
     fn writable_in(self, session: u64) -> Option<StompItem> {
         match self {
             Outbound::Item(item) => Some(item),
+            Outbound::Subscribe { frame, .. } | Outbound::Unsubscribe { frame, .. } => {
+                Some(StompItem::Frame(frame))
+            }
             Outbound::Ack {
                 frame,
                 session: issued,
@@ -301,7 +329,10 @@ impl Outbound {
     /// The frame to be written, whichever kind of item this is.
     fn into_frame(self) -> Option<Frame> {
         match self {
-            Outbound::Item(StompItem::Frame(frame)) | Outbound::Ack { frame, .. } => Some(frame),
+            Outbound::Item(StompItem::Frame(frame))
+            | Outbound::Ack { frame, .. }
+            | Outbound::Subscribe { frame, .. }
+            | Outbound::Unsubscribe { frame, .. } => Some(frame),
             Outbound::Item(StompItem::Heartbeat) => None,
         }
     }
@@ -1148,6 +1179,75 @@ async fn until(deadline: Option<tokio::time::Instant>) {
     }
 }
 
+/// Decide whether the queued SUBSCRIBE for `id` is still to be written on
+/// connection `session`, and record that it has been if so. It is not when
+/// the subscription is gone (unsubscribed before the frame was reached) or
+/// when the replay after a reconnect has already subscribed it on this
+/// connection.
+async fn settle_subscribe(subscriptions: &Mutex<Subscriptions>, id: &str, session: u64) -> bool {
+    let mut map = subscriptions.lock().await;
+    match map.values_mut().flatten().find(|entry| entry.id == id) {
+        Some(entry) if entry.sent_on != Some(session) => {
+            entry.sent_on = Some(session);
+            true
+        }
+        Some(_) => {
+            tracing::debug!(
+                subscription_id = id,
+                "subscription was replayed on this connection; not sending its queued SUBSCRIBE",
+            );
+            false
+        }
+        None => {
+            tracing::debug!(
+                subscription_id = id,
+                "subscription is gone; not sending its queued SUBSCRIBE",
+            );
+            false
+        }
+    }
+}
+
+/// Decide whether the queued UNSUBSCRIBE for `id` is to be written on
+/// connection `session`: only if that is the connection its SUBSCRIBE went
+/// out on.
+///
+/// `sent_on` is what the caller found when it removed the entry. A dropped
+/// `Subscription` that could not take the registry lock removed nothing, so
+/// an entry still registered under `id` is removed here, ended as
+/// `Unsubscribed`, and its own record is used instead. Left in place it would
+/// be replayed after the next reconnect.
+async fn settle_unsubscribe(
+    subscriptions: &Mutex<Subscriptions>,
+    id: &str,
+    sent_on: Option<u64>,
+    session: u64,
+) -> bool {
+    let mut sent_on = sent_on;
+    {
+        let mut map = subscriptions.lock().await;
+        for vec in map.values_mut() {
+            vec.retain(|entry| {
+                if entry.id != id {
+                    return true;
+                }
+                end_subscription(entry, SubscriptionEnd::Unsubscribed);
+                sent_on = entry.sent_on;
+                false
+            });
+        }
+        map.retain(|_, vec| !vec.is_empty());
+    }
+    if sent_on == Some(session) {
+        return true;
+    }
+    tracing::debug!(
+        subscription_id = id,
+        "subscription was never made on this connection; not sending its UNSUBSCRIBE",
+    );
+    false
+}
+
 /// How a write to the broker ended.
 enum Written {
     /// The item is on the wire.
@@ -1672,10 +1772,13 @@ impl Connection {
                 // and then issue SUBSCRIBE frames using the sink.
                 if just_reconnected {
                     let subs_snapshot: Vec<ResubEntry> = {
-                        let map = subscriptions.lock().await;
+                        let mut map = subscriptions.lock().await;
                         let mut v: Vec<ResubEntry> = Vec::new();
-                        for (dest, vec) in map.iter() {
-                            for entry in vec.iter() {
+                        for (dest, vec) in map.iter_mut() {
+                            for entry in vec.iter_mut() {
+                                // A SUBSCRIBE still queued for this
+                                // entry is not to be written as well.
+                                entry.sent_on = Some(session);
                                 v.push((
                                     dest.clone(),
                                     entry.id.clone(),
@@ -1738,21 +1841,43 @@ impl Connection {
                         maybe = out_rx.recv() => {
                             match maybe {
                                 Some(out) => {
+                                    // Nothing can ack for a subscription once its
+                                    // UNSUBSCRIBE is reached, written or not:
+                                    // forget what was pending for it.
+                                    // `unsubscribe` and a dropped `Subscription`
+                                    // try this themselves; here it cannot be
+                                    // missed or raced by a MESSAGE that was
+                                    // mid-delivery.
+                                    let unsubscribed = match &out {
+                                        Outbound::Unsubscribe { id, .. } => Some(id.as_str()),
+                                        Outbound::Item(StompItem::Frame(frame))
+                                            if frame.command == "UNSUBSCRIBE" =>
+                                        {
+                                            frame.get_header("id")
+                                        }
+                                        _ => None,
+                                    };
+                                    if let Some(id) = unsubscribed {
+                                        pending_clone.lock().await.remove(id);
+                                    }
+                                    // A SUBSCRIBE or UNSUBSCRIBE queued for
+                                    // another connection than this one has
+                                    // nothing to say to it (#137).
+                                    let wanted = match &out {
+                                        Outbound::Subscribe { id, .. } => {
+                                            settle_subscribe(&subscriptions, id, session).await
+                                        }
+                                        Outbound::Unsubscribe { id, sent_on, .. } => {
+                                            settle_unsubscribe(&subscriptions, id, *sent_on, session).await
+                                        }
+                                        _ => true,
+                                    };
+                                    if !wanted {
+                                        continue 'conn;
+                                    }
                                     let Some(item) = out.writable_in(session) else {
                                         continue 'conn;
                                     };
-                                    // Nothing can ack for a subscription once its
-                                    // UNSUBSCRIBE goes out: forget what was pending
-                                    // for it. `unsubscribe` and a dropped
-                                    // `Subscription` try this themselves; here it
-                                    // cannot be missed or raced by a MESSAGE that
-                                    // was mid-delivery.
-                                    if let StompItem::Frame(frame) = &item
-                                        && frame.command == "UNSUBSCRIBE"
-                                        && let Some(id) = frame.get_header("id")
-                                    {
-                                        pending_clone.lock().await.remove(id);
-                                    }
                                     match write_item(&mut sink, item, write_timeout, &mut shutdown_sub).await {
                                         Written::Done => hb_due = deadline_after(send_interval),
                                         Written::Failed => break 'conn,
@@ -2508,6 +2633,7 @@ impl Connection {
                     headers: extra_headers.clone(),
                     overflow: Overflow::new(overflow_limit, capacity),
                     ended: ended.clone(),
+                    sent_on: None,
                 });
         }
 
@@ -2520,7 +2646,10 @@ impl Connection {
             f = f.header(k, v);
         }
         self.outbound_tx
-            .send(StompItem::Frame(f).into())
+            .send(Outbound::Subscribe {
+                frame: f,
+                id: id.clone(),
+            })
             .await
             .map_err(|_| ConnError::Protocol("send channel closed".into()))?;
 
@@ -2584,13 +2713,16 @@ impl Connection {
     /// redelivers them to the next subscriber.
     pub async fn unsubscribe(&self, subscription_id: &str) -> Result<(), ConnError> {
         let mut found = false;
+        // The connection the SUBSCRIBE went out on, for the background task
+        // to check before it writes the UNSUBSCRIBE.
+        let mut sent_on = None;
         {
             let mut map = self.subscriptions.lock().await;
             let mut remove_keys: Vec<String> = Vec::new();
             for (dest, vec) in map.iter_mut() {
                 if let Some(pos) = vec.iter().position(|entry| entry.id == subscription_id) {
                     end_subscription(&vec[pos], SubscriptionEnd::Unsubscribed);
-                    vec.remove(pos);
+                    sent_on = vec.remove(pos).sent_on;
                     found = true;
                 }
                 if vec.is_empty() {
@@ -2613,7 +2745,11 @@ impl Connection {
         let mut f = Frame::new("UNSUBSCRIBE");
         f = f.header("id", subscription_id);
         self.outbound_tx
-            .send(StompItem::Frame(f).into())
+            .send(Outbound::Unsubscribe {
+                frame: f,
+                id: subscription_id.to_string(),
+                sent_on,
+            })
             .await
             .map_err(|_| ConnError::Protocol("send channel closed".into()))?;
 
@@ -2625,17 +2761,24 @@ impl Connection {
     /// `Drop` cannot `.await`, so this cannot use the async paths: it
     /// `try_lock`s the registry to remove the entry and `try_send`s the
     /// UNSUBSCRIBE frame, and silently gives up on either if it would block. A
-    /// dropped subscription whose registry removal loses the lock race is still
-    /// reaped by [`deliver_and_keep`] on the next message, since its receiver is
-    /// now closed; the frame is the only part that can be genuinely missed (when
+    /// dropped subscription whose registry removal loses the lock race is
+    /// removed by the background task when it reaches the UNSUBSCRIBE, or
+    /// failing that reaped by [`deliver_and_keep`] on the next message, since
+    /// its receiver is now closed; the frame is the only part that can be
+    /// genuinely missed (when
     /// the outbound channel is full or gone), which is acceptable for a handle
     /// that is being discarded rather than closed explicitly.
     pub(crate) fn unsubscribe_best_effort(&self, subscription_id: &str) {
+        // As in `unsubscribe`. If the lock is busy the entry stays, and the
+        // background task removes it, and reads this from it, when it
+        // reaches the UNSUBSCRIBE below.
+        let mut sent_on = None;
         if let Ok(mut map) = self.subscriptions.try_lock() {
             for vec in map.values_mut() {
                 vec.retain(|entry| {
                     if entry.id == subscription_id {
                         end_subscription(entry, SubscriptionEnd::Unsubscribed);
+                        sent_on = entry.sent_on;
                     }
                     entry.id != subscription_id
                 });
@@ -2649,7 +2792,11 @@ impl Connection {
         }
 
         let f = Frame::new("UNSUBSCRIBE").header("id", subscription_id);
-        let _ = self.outbound_tx.try_send(StompItem::Frame(f).into());
+        let _ = self.outbound_tx.try_send(Outbound::Unsubscribe {
+            frame: f,
+            id: subscription_id.to_string(),
+            sent_on,
+        });
     }
 
     /// Acknowledge a message previously received in `client` or
@@ -3311,6 +3458,7 @@ mod tests {
             headers: vec![],
             overflow: Overflow::default(),
             ended: Arc::new(OnceLock::new()),
+            sent_on: None,
         };
         assert_eq!(
             deliver_and_keep(&mut full, "/queue/t", &msg(1)),
@@ -3366,6 +3514,7 @@ mod tests {
             headers: vec![],
             overflow: Overflow::default(),
             ended: Arc::new(OnceLock::new()),
+            sent_on: None,
         };
         assert_eq!(
             deliver_and_keep(&mut closed, "/queue/t", &msg(0)),
@@ -3385,6 +3534,7 @@ mod tests {
             headers: vec![],
             overflow: Overflow::new(2, 1),
             ended: Arc::new(OnceLock::new()),
+            sent_on: None,
         };
 
         // One in the channel, two parked: at the limit, not past it.
@@ -3438,6 +3588,7 @@ mod tests {
             headers: vec![],
             overflow: Overflow::new(0, 1),
             ended: Arc::new(OnceLock::new()),
+            sent_on: None,
         };
         assert_eq!(
             deliver_and_keep(&mut none, "/queue/t", &msg(0)),
@@ -3940,6 +4091,7 @@ mod tests {
                     headers: Vec::new(),
                     overflow: Overflow::default(),
                     ended: Arc::new(OnceLock::new()),
+                    sent_on: None,
                 }],
             );
         }
@@ -4027,6 +4179,7 @@ mod tests {
                     headers: Vec::new(),
                     overflow: Overflow::default(),
                     ended: Arc::new(OnceLock::new()),
+                    sent_on: None,
                 }],
             );
         }
@@ -4429,6 +4582,7 @@ mod tests {
                     headers: Vec::new(),
                     overflow: Overflow::default(),
                     ended: Arc::new(OnceLock::new()),
+                    sent_on: None,
                 }],
             );
         }
