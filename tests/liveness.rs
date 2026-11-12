@@ -70,6 +70,67 @@ async fn a_silent_broker_is_noticed_by_a_client_that_keeps_writing() {
     );
 }
 
+/// A write that is slow but succeeds must not cost a healthy connection.
+/// Nothing is read while a write is in progress, so a broker that is late to
+/// read a large frame can have its heartbeats sit unread past the receive
+/// deadline. The time spent writing is not held against it.
+#[tokio::test]
+async fn a_slow_write_to_a_live_broker_keeps_the_connection() {
+    const FRAME: usize = 8 << 20;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let broker = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        handshake(&mut sock, "200,0").await;
+        let (mut reader, mut writer) = sock.into_split();
+        // A live broker: heartbeats well inside the 200ms it promised.
+        let beating = tokio::spawn(async move {
+            while writer.write_all(b"\n").await.is_ok() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        // But slow to read: leave the frame stuck in the socket for well over
+        // the client's 400ms receive deadline before taking it.
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        let mut buf = vec![0u8; 65536];
+        let mut total = 0;
+        while total < FRAME {
+            match reader.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => total += n,
+            }
+        }
+        // Stay up a while longer: the connection has to survive the moment
+        // the write completes, not only reach it.
+        let hung_up = tokio::time::timeout(Duration::from_millis(800), async {
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => total += n,
+                }
+            }
+        })
+        .await
+        .is_ok();
+        beating.abort();
+        (total, hung_up)
+    });
+
+    let conn = Connection::connect(&addr, "u", "p", "0,200").await.unwrap();
+    let frame = Frame::new("SEND")
+        .header("destination", "/queue/x")
+        .set_body(vec![b'x'; FRAME]);
+    conn.send_frame(frame).await.unwrap();
+
+    let (total, hung_up) = broker.await.unwrap();
+    assert!(
+        total >= FRAME,
+        "broker read only {total} bytes of the frame"
+    );
+    assert!(!hung_up, "client dropped a broker that was heartbeating");
+}
+
 /// #135: a heartbeat is due one interval after the last write, whatever that
 /// write was. On a fixed tick, a data frame sent mid-interval made the next
 /// tick skip, and the gap could approach twice the negotiated interval.

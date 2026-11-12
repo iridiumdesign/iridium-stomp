@@ -1163,7 +1163,32 @@ enum Written {
 /// signalled. Without the bound a broker that stops reading would hold the
 /// I/O loop in this write for good, and with it the heartbeat watchdog and
 /// the shutdown signal (#133).
+///
+/// Nothing is read while a write is in progress, so the time it takes is not
+/// held against the broker: `rx_dead`, the receive deadline, is moved back by
+/// as long as the write took. Otherwise a slow write to a healthy broker
+/// could carry the loop past the deadline with the broker's heartbeats
+/// sitting unread, and the connection would be dropped for nothing.
 async fn write_item<S>(
+    sink: &mut S,
+    item: StompItem,
+    limit: Duration,
+    shutdown: &mut broadcast::Receiver<()>,
+    rx_dead: &mut Option<tokio::time::Instant>,
+) -> Written
+where
+    S: futures::Sink<StompItem, Error = std::io::Error> + Unpin,
+{
+    let began = tokio::time::Instant::now();
+    let written = write_bounded(sink, item, limit, shutdown).await;
+    if let Some(at) = *rx_dead {
+        *rx_dead = at.checked_add(began.elapsed()).or(Some(at));
+    }
+    written
+}
+
+/// The write itself, for [`write_item`].
+async fn write_bounded<S>(
     sink: &mut S,
     item: StompItem,
     limit: Duration,
@@ -1701,6 +1726,7 @@ impl Connection {
                             StompItem::Frame(sf),
                             write_timeout,
                             &mut shutdown_sub,
+                            &mut rx_dead,
                         )
                         .await
                         {
@@ -1753,7 +1779,7 @@ impl Connection {
                                     {
                                         pending_clone.lock().await.remove(id);
                                     }
-                                    match write_item(&mut sink, item, write_timeout, &mut shutdown_sub).await {
+                                    match write_item(&mut sink, item, write_timeout, &mut shutdown_sub, &mut rx_dead).await {
                                         Written::Done => hb_due = deadline_after(send_interval),
                                         Written::Failed => break 'conn,
                                         Written::Shutdown => { shutting_down = true; break 'conn; }
@@ -1980,7 +2006,7 @@ impl Connection {
                                             forward_inbound(&in_tx, overflow_frame);
                                             let unsub = Frame::new("UNSUBSCRIBE").header("id", &id);
                                             overflowed_sub_ids.insert(id);
-                                            match write_item(&mut sink, StompItem::Frame(unsub), write_timeout, &mut shutdown_sub).await {
+                                            match write_item(&mut sink, StompItem::Frame(unsub), write_timeout, &mut shutdown_sub, &mut rx_dead).await {
                                                 Written::Done => hb_due = deadline_after(send_interval),
                                                 Written::Failed => break 'conn,
                                                 Written::Shutdown => { shutting_down = true; break 'conn; }
@@ -2110,7 +2136,7 @@ impl Connection {
                             }
                         }
                         _ = until(hb_due) => {
-                            match write_item(&mut sink, StompItem::Heartbeat, write_timeout, &mut shutdown_sub).await {
+                            match write_item(&mut sink, StompItem::Heartbeat, write_timeout, &mut shutdown_sub, &mut rx_dead).await {
                                 Written::Done => hb_due = deadline_after(send_interval),
                                 Written::Failed => break 'conn,
                                 Written::Shutdown => { shutting_down = true; break 'conn; }
@@ -2382,6 +2408,17 @@ impl Connection {
         // cares about the response.
         let (tx, rx) = oneshot::channel();
 
+        // Take a place in the outbound queue first. This is the only await
+        // that can be long (the queue is full while the broker is not
+        // reading), and a caller may give up on it, as `close` does at its
+        // timeout. Nothing is registered yet at that point, so a cancelled
+        // call leaves no receipt behind that nothing will ever answer.
+        let permit = self
+            .outbound_tx
+            .reserve()
+            .await
+            .map_err(|_| ConnError::Protocol("send channel closed".into()))?;
+
         // Register the pending receipt before sending, so the background task
         // can never see the response with nothing registered for it.
         {
@@ -2399,15 +2436,8 @@ impl Connection {
             .headers
             .retain(|(key, _)| !key.eq_ignore_ascii_case("receipt"));
 
-        // Add receipt header and send the frame
-        let frame_with_receipt = frame.receipt(&receipt_id);
-        if let Err(err) = self.send_frame(frame_with_receipt).await {
-            // The frame never went out; deregister rather than leave an entry
-            // that nothing will ever answer.
-            let mut receipts = self.pending_receipts.lock().await;
-            receipts.remove(&receipt_id);
-            return Err(err);
-        }
+        // Add receipt header and queue the frame in the place reserved for it.
+        permit.send(StompItem::Frame(frame.receipt(&receipt_id)).into());
 
         Ok(ReceiptHandle {
             receipt_id,
@@ -3764,6 +3794,41 @@ mod tests {
 
         sub.ack("M3").await.unwrap();
         assert!(!conn.pending.lock().await.contains_key(sub.id()));
+    }
+
+    /// `close` gives up on a full outbound queue at its timeout. A receipt
+    /// registered before the frame had a place in the queue would then stay
+    /// in the registry with nothing ever going to answer it.
+    #[tokio::test]
+    async fn a_cancelled_receipt_send_registers_nothing() {
+        let (conn, mut out_rx) = setup_test_connection();
+        while conn
+            .outbound_tx
+            .try_send(StompItem::Heartbeat.into())
+            .is_ok()
+        {}
+
+        let send = conn.send_frame_with_receipt(Frame::new("DISCONNECT"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), send)
+                .await
+                .is_err(),
+            "the queue is full, so the send cannot have finished"
+        );
+        assert!(conn.pending_receipts.lock().await.is_empty());
+
+        // With room in the queue the same call registers and queues as usual.
+        out_rx.recv().await.unwrap();
+        let handle = conn
+            .send_frame_with_receipt(Frame::new("DISCONNECT"))
+            .await
+            .unwrap();
+        assert!(
+            conn.pending_receipts
+                .lock()
+                .await
+                .contains_key(handle.receipt_id())
+        );
     }
 
     #[tokio::test]
