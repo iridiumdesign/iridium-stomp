@@ -305,6 +305,58 @@ async fn a_stalled_write_drops_the_connection_and_reconnects() {
         .unwrap();
 }
 
+/// #142: when the client gives up on a stalled write it hangs up at once.
+/// The socket used to stay open until the reconnect backoff was over, and
+/// for that long the broker kept the old session, its unacknowledged
+/// messages and its subscriptions.
+#[tokio::test]
+async fn a_stalled_connection_is_closed_before_the_backoff() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let broker = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        handshake(&mut sock, "0,0").await;
+        let start = Instant::now();
+        // Read nothing until the client's 300ms write timeout has passed,
+        // then take what is in the socket and see how soon the end comes.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let mut buf = vec![0u8; 65536];
+        loop {
+            match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => return start.elapsed(),
+                Ok(_) => {}
+            }
+        }
+    });
+
+    let options = ConnectOptions::default().write_timeout(Duration::from_millis(300));
+    let conn = Connection::connect_with_options(&addr, "u", "p", "0,0", options)
+        .await
+        .unwrap();
+    let flood = conn.clone();
+    tokio::spawn(async move {
+        loop {
+            let frame = Frame::new("SEND")
+                .header("destination", "/queue/x")
+                .set_body(vec![b'x'; 1 << 20]);
+            if flood.send_frame(frame).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // The first backoff after a connection this short is two seconds, so the
+    // old behaviour put the hang-up at about 2.3s.
+    let hung_up = tokio::time::timeout(Duration::from_secs(10), broker)
+        .await
+        .expect("client never hung up on the stalled connection")
+        .unwrap();
+    assert!(
+        hung_up < Duration::from_millis(1500),
+        "the old socket stayed open for {hung_up:?}"
+    );
+}
+
 /// A broker that drops the first connection, then accepts the second and
 /// never answers its CONNECT. Reports each further connection it accepts.
 async fn broker_that_stops_answering() -> (String, tokio::sync::mpsc::Receiver<TcpStream>) {
