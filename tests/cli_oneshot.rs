@@ -51,54 +51,64 @@ fn start_broker_keeping_connect(on_send: OnSend) -> (String, Seen, Arc<Mutex<Str
         };
         let mut buf = [0u8; 8192];
 
-        if let Ok(n) = stream.read(&mut buf) {
-            *connect_clone.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
-            let _ = stream.write_all(b"CONNECTED\nversion:1.2\nheart-beat:0,0\n\n\0");
-            let _ = stream.flush();
-        }
+        // Read the CONNECT through its terminating NUL: a single read may
+        // carry only part of the frame. Anything after the NUL belongs to
+        // the next frame and is kept for the loop below.
+        let mut acc: Vec<u8> = Vec::new();
+        let connect_end = loop {
+            if let Some(pos) = acc.iter().position(|&b| b == 0) {
+                break pos;
+            }
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => acc.extend_from_slice(&buf[..n]),
+            }
+        };
+        let frame: Vec<u8> = acc.drain(..=connect_end).collect();
+        *connect_clone.lock().unwrap() =
+            String::from_utf8_lossy(&frame[..connect_end]).into_owned();
+        let _ = stream.write_all(b"CONNECTED\nversion:1.2\nheart-beat:0,0\n\n\0");
+        let _ = stream.flush();
 
         // TCP is a byte stream, so a single read may carry a partial frame or
         // several at once. Accumulate bytes and act only on complete,
         // NUL-terminated frames; a partial trailing frame waits in `acc` for
         // the rest to arrive.
-        let mut acc: Vec<u8> = Vec::new();
         loop {
+            while let Some(pos) = acc.iter().position(|&b| b == 0) {
+                let frame: Vec<u8> = acc.drain(..=pos).collect();
+                let text = String::from_utf8_lossy(&frame);
+                let raw = text.trim_matches('\0').trim_start();
+                if raw.trim().is_empty() {
+                    continue;
+                }
+                let raw = raw.to_string();
+                let command = raw.lines().next().unwrap_or("").to_string();
+                seen_clone.lock().unwrap().push(raw.clone());
+
+                let Some(id) = receipt_id_of(&raw) else {
+                    continue;
+                };
+                let reply = match (command.as_str(), on_send) {
+                    ("SEND", OnSend::Receipt) => {
+                        format!("RECEIPT\nreceipt-id:{}\n\n\0", id)
+                    }
+                    ("SEND", OnSend::Error) => format!(
+                        "ERROR\nreceipt-id:{}\nmessage:publish denied\n\n{}\0",
+                        id, "not allowed"
+                    ),
+                    ("SEND", OnSend::Silence) => continue,
+                    // Always answer the DISCONNECT so teardown is not
+                    // what the timing tests end up measuring.
+                    ("DISCONNECT", _) => format!("RECEIPT\nreceipt-id:{}\n\n\0", id),
+                    _ => continue,
+                };
+                let _ = stream.write_all(reply.as_bytes());
+                let _ = stream.flush();
+            }
             match stream.read(&mut buf) {
                 Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    acc.extend_from_slice(&buf[..n]);
-                    while let Some(pos) = acc.iter().position(|&b| b == 0) {
-                        let frame: Vec<u8> = acc.drain(..=pos).collect();
-                        let text = String::from_utf8_lossy(&frame);
-                        let raw = text.trim_matches('\0').trim_start();
-                        if raw.trim().is_empty() {
-                            continue;
-                        }
-                        let raw = raw.to_string();
-                        let command = raw.lines().next().unwrap_or("").to_string();
-                        seen_clone.lock().unwrap().push(raw.clone());
-
-                        let Some(id) = receipt_id_of(&raw) else {
-                            continue;
-                        };
-                        let reply = match (command.as_str(), on_send) {
-                            ("SEND", OnSend::Receipt) => {
-                                format!("RECEIPT\nreceipt-id:{}\n\n\0", id)
-                            }
-                            ("SEND", OnSend::Error) => format!(
-                                "ERROR\nreceipt-id:{}\nmessage:publish denied\n\n{}\0",
-                                id, "not allowed"
-                            ),
-                            ("SEND", OnSend::Silence) => continue,
-                            // Always answer the DISCONNECT so teardown is not
-                            // what the timing tests end up measuring.
-                            ("DISCONNECT", _) => format!("RECEIPT\nreceipt-id:{}\n\n\0", id),
-                            _ => continue,
-                        };
-                        let _ = stream.write_all(reply.as_bytes());
-                        let _ = stream.flush();
-                    }
-                }
+                Ok(n) => acc.extend_from_slice(&buf[..n]),
             }
         }
     });
