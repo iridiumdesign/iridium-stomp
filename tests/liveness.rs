@@ -131,6 +131,50 @@ async fn a_slow_write_to_a_live_broker_keeps_the_connection() {
     assert!(!hung_up, "client dropped a broker that was heartbeating");
 }
 
+/// The other side of the test above: slow writes must not hide a broker that
+/// has gone silent. It reads, slowly, so every write succeeds, and sends
+/// nothing. The receive deadline is not stretched by the time writes take.
+#[tokio::test]
+async fn slow_writes_do_not_hide_a_silent_broker() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let broker = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        // Promise a heartbeat every 200ms, then never send one.
+        handshake(&mut sock, "200,0").await;
+        let start = Instant::now();
+        // About 1 MiB every 100ms: each of the client's frames takes that
+        // long to write, and none comes near the write timeout.
+        let mut buf = vec![0u8; 64 << 10];
+        loop {
+            match sock.read(&mut buf).await {
+                Ok(0) | Err(_) => return start.elapsed(),
+                Ok(_) => tokio::time::sleep(Duration::from_millis(6)).await,
+            }
+        }
+    });
+
+    let conn = Connection::connect(&addr, "u", "p", "0,200").await.unwrap();
+    let flood = conn.clone();
+    tokio::spawn(async move {
+        loop {
+            let frame = Frame::new("SEND")
+                .header("destination", "/queue/x")
+                .set_body(vec![b'x'; 1 << 20]);
+            if flood.send_frame(frame).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Two receive intervals is 400ms, plus the write in progress when it
+    // passes. Ten seconds of writes like these used to go by unnoticed.
+    tokio::time::timeout(Duration::from_secs(4), broker)
+        .await
+        .expect("client never dropped the silent broker")
+        .unwrap();
+}
+
 /// #135: a heartbeat is due one interval after the last write, whatever that
 /// write was. On a fixed tick, a data frame sent mid-interval made the next
 /// tick skip, and the gap could approach twice the negotiated interval.

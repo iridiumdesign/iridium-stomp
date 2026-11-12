@@ -1163,32 +1163,7 @@ enum Written {
 /// signalled. Without the bound a broker that stops reading would hold the
 /// I/O loop in this write for good, and with it the heartbeat watchdog and
 /// the shutdown signal (#133).
-///
-/// Nothing is read while a write is in progress, so the time it takes is not
-/// held against the broker: `rx_dead`, the receive deadline, is moved back by
-/// as long as the write took. Otherwise a slow write to a healthy broker
-/// could carry the loop past the deadline with the broker's heartbeats
-/// sitting unread, and the connection would be dropped for nothing.
 async fn write_item<S>(
-    sink: &mut S,
-    item: StompItem,
-    limit: Duration,
-    shutdown: &mut broadcast::Receiver<()>,
-    rx_dead: &mut Option<tokio::time::Instant>,
-) -> Written
-where
-    S: futures::Sink<StompItem, Error = std::io::Error> + Unpin,
-{
-    let began = tokio::time::Instant::now();
-    let written = write_bounded(sink, item, limit, shutdown).await;
-    if let Some(at) = *rx_dead {
-        *rx_dead = at.checked_add(began.elapsed()).or(Some(at));
-    }
-    written
-}
-
-/// The write itself, for [`write_item`].
-async fn write_bounded<S>(
     sink: &mut S,
     item: StompItem,
     limit: Duration,
@@ -1668,6 +1643,9 @@ impl Connection {
                 let rx_grace = recv_interval.and_then(|d| d.checked_mul(2));
                 let mut hb_due = deadline_after(send_interval);
                 let mut rx_dead = deadline_after(rx_grace);
+                // An inbound item read ahead of its turn by the receive
+                // deadline's check below, for the read branch to take next.
+                let mut read_ahead = None;
                 // Cleared when a resubscribe cannot be written: the
                 // connection is no good and is dropped before it is used.
                 let mut usable = true;
@@ -1726,7 +1704,6 @@ impl Connection {
                             StompItem::Frame(sf),
                             write_timeout,
                             &mut shutdown_sub,
-                            &mut rx_dead,
                         )
                         .await
                         {
@@ -1779,7 +1756,7 @@ impl Connection {
                                     {
                                         pending_clone.lock().await.remove(id);
                                     }
-                                    match write_item(&mut sink, item, write_timeout, &mut shutdown_sub, &mut rx_dead).await {
+                                    match write_item(&mut sink, item, write_timeout, &mut shutdown_sub).await {
                                         Written::Done => hb_due = deadline_after(send_interval),
                                         Written::Failed => break 'conn,
                                         Written::Shutdown => { shutting_down = true; break 'conn; }
@@ -1788,7 +1765,12 @@ impl Connection {
                                 None => break 'conn,
                             }
                         }
-                        item = stream.next() => {
+                        item = async {
+                            match read_ahead.take() {
+                                Some(item) => item,
+                                None => stream.next().await,
+                            }
+                        } => {
                             match item {
                                 Some(Ok(StompItem::Heartbeat)) => {
                                     rx_dead = deadline_after(rx_grace);
@@ -2006,7 +1988,7 @@ impl Connection {
                                             forward_inbound(&in_tx, overflow_frame);
                                             let unsub = Frame::new("UNSUBSCRIBE").header("id", &id);
                                             overflowed_sub_ids.insert(id);
-                                            match write_item(&mut sink, StompItem::Frame(unsub), write_timeout, &mut shutdown_sub, &mut rx_dead).await {
+                                            match write_item(&mut sink, StompItem::Frame(unsub), write_timeout, &mut shutdown_sub).await {
                                                 Written::Done => hb_due = deadline_after(send_interval),
                                                 Written::Failed => break 'conn,
                                                 Written::Shutdown => { shutting_down = true; break 'conn; }
@@ -2136,13 +2118,34 @@ impl Connection {
                             }
                         }
                         _ = until(hb_due) => {
-                            match write_item(&mut sink, StompItem::Heartbeat, write_timeout, &mut shutdown_sub, &mut rx_dead).await {
+                            match write_item(&mut sink, StompItem::Heartbeat, write_timeout, &mut shutdown_sub).await {
                                 Written::Done => hb_due = deadline_after(send_interval),
                                 Written::Failed => break 'conn,
                                 Written::Shutdown => { shutting_down = true; break 'conn; }
                             }
                         }
                         _ = until(rx_dead) => {
+                            // Nothing is read while a write is in progress,
+                            // so the deadline can pass with the broker's
+                            // heartbeats sitting unread behind a slow write,
+                            // and this branch can be taken ahead of the read
+                            // that would have moved it. Look before giving
+                            // up: anything that can be read right now means
+                            // the broker is there. It is handed to the read
+                            // branch, and the deadline starts over. The
+                            // deadline itself is never stretched, so a broker
+                            // that is silent is still dropped on time however
+                            // long the writes take.
+                            let ready = tokio::select! {
+                                biased;
+                                item = stream.next() => Some(item),
+                                _ = future::ready(()) => None,
+                            };
+                            if let Some(item) = ready {
+                                read_ahead = Some(item);
+                                rx_dead = deadline_after(rx_grace);
+                                continue 'conn;
+                            }
                             tracing::warn!(
                                 addr = %params.addr,
                                 "nothing received from broker for twice the heartbeat interval; dropping the connection",
