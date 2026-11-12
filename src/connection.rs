@@ -1736,6 +1736,12 @@ impl Connection {
                         let map = subscriptions.lock().await;
                         prune_parked(&mut parked, &map);
                     }
+                    // The receive deadline is not enforced while an item read
+                    // ahead is still waiting for the read branch: a second
+                    // look would put another item in its place and lose it,
+                    // or find nothing new and drop a connection that had just
+                    // proved itself.
+                    let watchdog = if read_ahead.is_none() { rx_dead } else { None };
                     tokio::select! {
                         _ = shutdown_sub.recv() => { let _ = sink.close().await; shutting_down = true; break 'conn; }
                         maybe = out_rx.recv() => {
@@ -2124,7 +2130,7 @@ impl Connection {
                                 Written::Shutdown => { shutting_down = true; break 'conn; }
                             }
                         }
-                        _ = until(rx_dead) => {
+                        _ = until(watchdog) => {
                             // Nothing is read while a write is in progress,
                             // so the deadline can pass with the broker's
                             // heartbeats sitting unread behind a slow write,
