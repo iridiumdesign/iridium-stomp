@@ -11,17 +11,36 @@ use iridium_stomp::connection::ConnError;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Helper to find an available port.
+/// Find a port nothing is listening on, and that no other test in this file
+/// has been given.
+///
+/// These tests need a port that refuses connections for a while and accepts
+/// them later, so the listener that found it is dropped and the port bound
+/// again afterwards. Between the two the kernel is free to hand the same
+/// number to the next caller. The tests run in parallel, and two of them
+/// sharing a port connect to each other's broker; that is how
+/// `connect_fails_immediately_on_auth_error` once came back with the other
+/// test's "Access denied". Ports already handed out are remembered and never
+/// given twice.
 fn get_available_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+    static HANDED_OUT: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+    let mut handed_out = HANDED_OUT.lock().unwrap();
+    loop {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        if !handed_out.contains(&port) {
+            handed_out.push(port);
+            return port;
+        }
+    }
 }
 
 /// Broker comes up after a delay — connect should succeed after retrying.
