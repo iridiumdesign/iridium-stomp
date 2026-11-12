@@ -170,6 +170,19 @@ impl SentOn {
     fn set(&self, session: u64) {
         self.0.store(session, Ordering::SeqCst);
     }
+
+    /// Clear the record if it names `session`, and say whether it did.
+    ///
+    /// This is the question to ask before writing an UNSUBSCRIBE: `true`
+    /// means the subscription is the current session's to withdraw, and that
+    /// this caller is the one withdrawing it. Any later UNSUBSCRIBE for the
+    /// same subscription, from whichever path, gets `false`, so the broker is
+    /// never asked twice (#148).
+    fn take(&self, session: u64) -> bool {
+        self.0
+            .compare_exchange(session, Self::NEVER, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
 }
 
 impl Default for SentOn {
@@ -1277,12 +1290,12 @@ async fn settle_unsubscribe(
         }
         map.retain(|_, vec| !vec.is_empty());
     }
-    if sent_on.get() == Some(session) {
+    if sent_on.take(session) {
         return true;
     }
     tracing::debug!(
         subscription_id = id,
-        "subscription was never made on this connection; not sending its UNSUBSCRIBE",
+        "subscription is not this connection's to withdraw (never made on it, or withdrawn already); not sending its UNSUBSCRIBE",
     );
     false
 }
@@ -2060,8 +2073,9 @@ impl Connection {
                                         // `delivered` records whether any
                                         // subscription took the frame.
                                         let mut delivered = false;
-                                        // (subscription id, destination, limit)
-                                        let mut overflowed: Vec<(String, String, usize)> = Vec::new();
+                                        // (subscription id, destination, limit,
+                                        // whether to send UNSUBSCRIBE)
+                                        let mut overflowed: Vec<(String, String, usize, bool)> = Vec::new();
                                         let mut deliver = |entry: &mut SubscriptionEntry, dest: &str| {
                                             let outcome = deliver_and_keep(entry, dest, &f);
                                             let keep = outcome == Delivery::Taken;
@@ -2078,6 +2092,12 @@ impl Connection {
                                                     entry.id.clone(),
                                                     dest.to_string(),
                                                     entry.overflow.limit,
+                                                    // Taken here so the
+                                                    // handle, when the
+                                                    // application drops it,
+                                                    // does not withdraw the
+                                                    // subscription again.
+                                                    entry.sent_on.take(session),
                                                 ));
                                             }
                                             if keep
@@ -2144,7 +2164,7 @@ impl Connection {
                                         // the broker to stop and the
                                         // application what happened.
                                         let failed = !overflowed.is_empty();
-                                        for (id, dest, limit) in overflowed {
+                                        for (id, dest, limit, withdraw) in overflowed {
                                             parked.retain(|(parked_id, _)| *parked_id != id);
                                             let msg = format!(
                                                 "Subscription failed: more than {} messages parked for {}",
@@ -2158,6 +2178,9 @@ impl Connection {
                                             forward_inbound(&in_tx, overflow_frame);
                                             let unsub = Frame::new("UNSUBSCRIBE").header("id", &id);
                                             overflowed_sub_ids.insert(id);
+                                            if !withdraw {
+                                                continue;
+                                            }
                                             match write_item(&mut sink, StompItem::Frame(unsub), write_timeout, &mut shutdown_sub).await {
                                                 Written::Done => hb_due = deadline_after(send_interval),
                                                 Written::Failed => break 'conn,
@@ -3934,6 +3957,9 @@ mod tests {
         assert!(!settle_unsubscribe(&subscriptions, "1", &sent_on, 3).await);
         sent_on.set(3);
         assert!(settle_unsubscribe(&subscriptions, "1", &sent_on, 3).await);
+        // Once only: the record is cleared by the UNSUBSCRIBE it allowed.
+        assert!(!settle_unsubscribe(&subscriptions, "1", &sent_on, 3).await);
+        assert_eq!(sent_on.get(), None);
     }
 
     #[tokio::test]
