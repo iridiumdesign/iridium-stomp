@@ -101,6 +101,31 @@ let conn = Connection::connect(
 
 ---
 
+## What the client does with the negotiated intervals
+
+**Sending.** A heartbeat goes out once one send interval has passed since
+the client last wrote anything. Every frame counts as a write and moves the
+next heartbeat back, so a client that is busy sending writes no heartbeats
+at all, and the broker never waits longer than the interval for data.
+
+**Receiving.** If nothing arrives for twice the receive interval, the
+client treats the broker as gone: it drops the connection and reconnects.
+Every frame counts, not only heartbeats. Only receiving resets this, so a
+client that keeps writing to a broker that has gone silent still notices.
+
+Both are timed on a monotonic clock, so a change to the system time neither
+trips the check nor holds heartbeats back.
+
+Heartbeats are how a silent broker is noticed. Two related bounds apply
+whether or not heartbeats are on:
+
+| Option | Default | What it bounds |
+|--------|---------|----------------|
+| `ConnectOptions::handshake_timeout` | 30s | One connection attempt: TCP connect, CONNECT, and the wait for CONNECTED. On expiry the attempt fails and is retried with backoff. |
+| `ConnectOptions::write_timeout` | 30s | The write of one frame. A broker that has stopped reading makes a write stall; on expiry the connection is dropped and re-established. |
+
+---
+
 ## Monitoring heartbeats
 
 You can receive a notification each time the server sends a heartbeat by
