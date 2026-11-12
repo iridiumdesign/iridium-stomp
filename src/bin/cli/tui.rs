@@ -5,7 +5,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use iridium_stomp::connection::AckMode;
-use iridium_stomp::{ConnectOptions, Connection, Frame};
+use iridium_stomp::{Connection, Frame};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -53,7 +53,8 @@ pub async fn run(cli: &Cli) -> Result<(), (String, u8)> {
 
     // Build connection options. Bound the connect so an unreachable broker
     // fails fast instead of retrying forever (#101).
-    let options = ConnectOptions::default()
+    let options = cli
+        .connect_options()
         .heartbeat_notify(hb_tx)
         .connect_timeout(std::time::Duration::from_secs(cli.timeout));
 

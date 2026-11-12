@@ -4,7 +4,7 @@
 //! exists so a script can publish a message and learn from the exit code
 //! whether the broker took it, without driving the REPL through a pipe.
 
-use iridium_stomp::{ConnectOptions, Connection, Frame};
+use iridium_stomp::{Connection, Frame};
 use std::time::Duration;
 
 use super::args::Cli;
@@ -31,7 +31,7 @@ pub async fn run(cli: &Cli, destination: &str, body: &str) -> Result<(), (String
     }
 
     let timeout = Duration::from_secs(cli.timeout);
-    let options = ConnectOptions::default().disconnect_timeout(timeout);
+    let options = cli.connect_options().disconnect_timeout(timeout);
 
     // `Connection::connect` retries an unreachable broker indefinitely, which is
     // right for a long-lived service and wrong for a script: without this bound

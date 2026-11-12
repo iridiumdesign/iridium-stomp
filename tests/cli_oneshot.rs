@@ -31,10 +31,19 @@ enum OnSend {
 type Seen = Arc<Mutex<Vec<String>>>;
 
 fn start_broker(on_send: OnSend) -> (String, Seen) {
+    let (addr, seen, _connect) = start_broker_keeping_connect(on_send);
+    (addr, seen)
+}
+
+/// As `start_broker`, and also hands back the client's CONNECT frame, which
+/// is not among the frames in `Seen`.
+fn start_broker_keeping_connect(on_send: OnSend) -> (String, Seen, Arc<Mutex<String>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     let seen: Seen = Arc::new(Mutex::new(Vec::new()));
     let seen_clone = seen.clone();
+    let connect = Arc::new(Mutex::new(String::new()));
+    let connect_clone = connect.clone();
 
     thread::spawn(move || {
         let Ok((mut stream, _)) = listener.accept() else {
@@ -42,58 +51,69 @@ fn start_broker(on_send: OnSend) -> (String, Seen) {
         };
         let mut buf = [0u8; 8192];
 
-        if stream.read(&mut buf).is_ok() {
-            let _ = stream.write_all(b"CONNECTED\nversion:1.2\nheart-beat:0,0\n\n\0");
-            let _ = stream.flush();
-        }
+        // Read the CONNECT through its terminating NUL: a single read may
+        // carry only part of the frame. Anything after the NUL belongs to
+        // the next frame and is kept for the loop below.
+        let mut acc: Vec<u8> = Vec::new();
+        let connect_end = loop {
+            if let Some(pos) = acc.iter().position(|&b| b == 0) {
+                break pos;
+            }
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => acc.extend_from_slice(&buf[..n]),
+            }
+        };
+        let frame: Vec<u8> = acc.drain(..=connect_end).collect();
+        *connect_clone.lock().unwrap() =
+            String::from_utf8_lossy(&frame[..connect_end]).into_owned();
+        let _ = stream.write_all(b"CONNECTED\nversion:1.2\nheart-beat:0,0\n\n\0");
+        let _ = stream.flush();
 
         // TCP is a byte stream, so a single read may carry a partial frame or
         // several at once. Accumulate bytes and act only on complete,
         // NUL-terminated frames; a partial trailing frame waits in `acc` for
         // the rest to arrive.
-        let mut acc: Vec<u8> = Vec::new();
         loop {
+            while let Some(pos) = acc.iter().position(|&b| b == 0) {
+                let frame: Vec<u8> = acc.drain(..=pos).collect();
+                let text = String::from_utf8_lossy(&frame);
+                let raw = text.trim_matches('\0').trim_start();
+                if raw.trim().is_empty() {
+                    continue;
+                }
+                let raw = raw.to_string();
+                let command = raw.lines().next().unwrap_or("").to_string();
+                seen_clone.lock().unwrap().push(raw.clone());
+
+                let Some(id) = receipt_id_of(&raw) else {
+                    continue;
+                };
+                let reply = match (command.as_str(), on_send) {
+                    ("SEND", OnSend::Receipt) => {
+                        format!("RECEIPT\nreceipt-id:{}\n\n\0", id)
+                    }
+                    ("SEND", OnSend::Error) => format!(
+                        "ERROR\nreceipt-id:{}\nmessage:publish denied\n\n{}\0",
+                        id, "not allowed"
+                    ),
+                    ("SEND", OnSend::Silence) => continue,
+                    // Always answer the DISCONNECT so teardown is not
+                    // what the timing tests end up measuring.
+                    ("DISCONNECT", _) => format!("RECEIPT\nreceipt-id:{}\n\n\0", id),
+                    _ => continue,
+                };
+                let _ = stream.write_all(reply.as_bytes());
+                let _ = stream.flush();
+            }
             match stream.read(&mut buf) {
                 Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    acc.extend_from_slice(&buf[..n]);
-                    while let Some(pos) = acc.iter().position(|&b| b == 0) {
-                        let frame: Vec<u8> = acc.drain(..=pos).collect();
-                        let text = String::from_utf8_lossy(&frame);
-                        let raw = text.trim_matches('\0').trim_start();
-                        if raw.trim().is_empty() {
-                            continue;
-                        }
-                        let raw = raw.to_string();
-                        let command = raw.lines().next().unwrap_or("").to_string();
-                        seen_clone.lock().unwrap().push(raw.clone());
-
-                        let Some(id) = receipt_id_of(&raw) else {
-                            continue;
-                        };
-                        let reply = match (command.as_str(), on_send) {
-                            ("SEND", OnSend::Receipt) => {
-                                format!("RECEIPT\nreceipt-id:{}\n\n\0", id)
-                            }
-                            ("SEND", OnSend::Error) => format!(
-                                "ERROR\nreceipt-id:{}\nmessage:publish denied\n\n{}\0",
-                                id, "not allowed"
-                            ),
-                            ("SEND", OnSend::Silence) => continue,
-                            // Always answer the DISCONNECT so teardown is not
-                            // what the timing tests end up measuring.
-                            ("DISCONNECT", _) => format!("RECEIPT\nreceipt-id:{}\n\n\0", id),
-                            _ => continue,
-                        };
-                        let _ = stream.write_all(reply.as_bytes());
-                        let _ = stream.flush();
-                    }
-                }
+                Ok(n) => acc.extend_from_slice(&buf[..n]),
             }
         }
     });
 
-    (addr, seen)
+    (addr, seen, connect)
 }
 
 fn receipt_id_of(frame: &str) -> Option<&str> {
@@ -305,6 +325,49 @@ fn send_conflicts_with_the_interactive_modes() {
             stderr(&out)
         );
     }
+}
+
+/// The value of the `host` header in a CONNECT frame.
+fn host_header(connect: &Arc<Mutex<String>>) -> Option<String> {
+    connect
+        .lock()
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("host:").map(str::to_string))
+}
+
+/// #92: `--host` sets the CONNECT frame's `host` header, which is how a
+/// RabbitMQ vhost is chosen. `--vhost` is the same flag by the name RabbitMQ
+/// users know it by.
+#[test]
+fn host_flag_sets_the_connect_host_header() {
+    for flag in ["--host", "--vhost"] {
+        let (addr, _seen, connect) = start_broker_keeping_connect(OnSend::Receipt);
+
+        let out = stomp(&[
+            "-a",
+            &addr,
+            flag,
+            "staging",
+            "--send",
+            "/queue/orders",
+            "hi",
+        ]);
+
+        assert_eq!(out.status.code(), Some(SUCCESS), "stderr: {}", stderr(&out));
+        assert_eq!(host_header(&connect).as_deref(), Some("staging"), "{flag}");
+    }
+}
+
+/// Without the flag the library's default goes out, as it always has.
+#[test]
+fn without_the_host_flag_the_default_vhost_is_sent() {
+    let (addr, _seen, connect) = start_broker_keeping_connect(OnSend::Receipt);
+
+    let out = stomp(&["-a", &addr, "--send", "/queue/orders", "hi"]);
+
+    assert_eq!(out.status.code(), Some(SUCCESS), "stderr: {}", stderr(&out));
+    assert_eq!(host_header(&connect).as_deref(), Some("/"));
 }
 
 fn stderr(out: &std::process::Output) -> String {

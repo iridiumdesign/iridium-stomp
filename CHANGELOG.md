@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The `stomp` CLI takes `--host <VHOST>`, also spelled `--vhost`, which sets the `host` header of the CONNECT frame. RabbitMQ selects a vhost with it, so the CLI can now reach one other than the default. The library has had `ConnectOptions::host` all along; only the flag was missing. It applies to the interactive client, the TUI and `--send` alike, and without it `/` is sent as before (#92)
 - `ConnectOptions::handshake_timeout` bounds one connection attempt: the TCP connect, the CONNECT frame and the wait for CONNECTED. It applies to the first connection and to every reconnect, and defaults to `Connection::DEFAULT_HANDSHAKE_TIMEOUT` (30 seconds). An attempt that runs out fails with an `io::ErrorKind::TimedOut` error and is retried with backoff like any other. `connect_timeout` still bounds the first connection as a whole, across attempts (#134)
 - `ConnectOptions::write_timeout` bounds the write of a single frame, defaulting to `Connection::DEFAULT_WRITE_TIMEOUT` (30 seconds). A frame not written in full within it ends the connection, which is then re-established. The bound covers the whole frame, so raise it if you send frames large enough, over a link slow enough, that one legitimately takes longer (#133)
 

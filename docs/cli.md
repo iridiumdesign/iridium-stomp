@@ -30,6 +30,7 @@ cargo run --features cli --bin stomp -- --help
 | `-l, --login` | `guest` | STOMP login username |
 | `-p, --passcode` | `guest` | STOMP passcode |
 | `--heartbeat` | `10000,10000` | Heartbeat intervals in milliseconds (send,receive) |
+| `--host`, `--vhost` | `/` | Virtual host: the `host` header of the CONNECT frame. On RabbitMQ this selects the vhost. |
 | `-s, --subscribe` | *(none)* | Destination to subscribe to on connect (repeatable) |
 | `--tui` | off | Enable TUI mode |
 | `--summary` | off | Print session summary on exit |
@@ -46,7 +47,15 @@ stomp -a broker.example.com:61613 -l myuser -p mypass \
 
 # TUI mode with faster heartbeats
 stomp --tui --heartbeat 5000,5000 -s /queue/tasks
+
+# A RabbitMQ vhost other than the default
+stomp -a rabbit.example.com:61613 --host staging -s /queue/orders
 ```
+
+`--host` is not the broker's address; that is `-a`. It names the virtual
+host the session is for, which STOMP carries in the CONNECT frame. RabbitMQ
+uses it to choose a vhost, its unit of multi-tenancy, and takes the name as
+configured on the broker: `staging`, or `/` for the default.
 
 ---
 
