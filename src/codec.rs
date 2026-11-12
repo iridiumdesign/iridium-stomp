@@ -12,18 +12,44 @@ use crate::parser::{DEFAULT_MAX_FRAME_SIZE, parse_frame_slice_bounded, unescape_
 /// - carriage return (0x0d) → `\r`
 /// - line feed (0x0a) → `\n`
 /// - colon (0x3a) → `\c` (primarily for header names, but we escape in values too for safety)
-fn escape_header_value(input: &str) -> String {
+///
+/// `escape_colon` is false for the values of a handshake frame, where the
+/// colon is written as it is; see [`is_handshake`].
+fn escape_header_value(input: &str, escape_colon: bool) -> String {
     let mut result = String::with_capacity(input.len());
     for ch in input.chars() {
         match ch {
             '\\' => result.push_str("\\\\"),
             '\r' => result.push_str("\\r"),
             '\n' => result.push_str("\\n"),
-            ':' => result.push_str("\\c"),
+            ':' if escape_colon => result.push_str("\\c"),
             _ => result.push(ch),
         }
     }
     result
+}
+
+/// Whether `command` is one of the handshake frames, whose header values
+/// STOMP 1.2 treats differently: "The CONNECT and CONNECTED frames do not
+/// escape the carriage return, line feed or colon octets found in the
+/// resulting UTF-8 encoded headers in order to remain backward compatible
+/// with STOMP 1.0." STOMP is the 1.2 alias for CONNECT.
+///
+/// Brokers do not agree on what that means. Tested with a passcode holding
+/// each character (#136): Artemis 2.44 reads CONNECT header values verbatim,
+/// RabbitMQ 3.11 unescapes them like any other frame's, and ActiveMQ Classic
+/// 6.2 accepts either. So:
+///
+/// - writing, a colon in a value goes out as it is, which all three accept
+///   (a header line is split at its first colon). Escaped as `\c` it fails
+///   on Artemis;
+/// - writing, a backslash, CR or LF is still escaped. No single form of a
+///   backslash works everywhere (RabbitMQ rejects it bare, Artemis reads the
+///   escape literally), and a bare CR or LF would end the header line;
+/// - reading, a value that is not validly escaped is taken verbatim instead
+///   of failing the frame, since the broker may not have escaped it.
+fn is_handshake(command: &str) -> bool {
+    matches!(command, "CONNECT" | "STOMP" | "CONNECTED")
 }
 
 /// (parser-based implementation uses `src` directly; header parsing is
@@ -150,6 +176,7 @@ impl Decoder for StompCodec {
                 })?;
                 // convert headers Vec<(Vec<u8>,Vec<u8>)> -> Vec<(String,String)>
                 // and unescape per STOMP 1.2 spec
+                let handshake = is_handshake(&command);
                 let mut hdrs: Vec<(String, String)> = Vec::new();
                 for (k, v) in headers {
                     // Unescape header key
@@ -166,12 +193,17 @@ impl Decoder for StompCodec {
                         )
                     })?;
                     // Unescape header value
-                    let v_unescaped = unescape_header_value(&v).map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("invalid escape in header value: {}", e),
-                        )
-                    })?;
+                    let v_unescaped = match unescape_header_value(&v) {
+                        Ok(unescaped) => unescaped,
+                        // The broker may have written it unescaped.
+                        Err(_) if handshake => v,
+                        Err(e) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("invalid escape in header value: {}", e),
+                            ));
+                        }
+                    };
                     let vs = String::from_utf8(v_unescaped).map_err(|e| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -236,6 +268,7 @@ impl Encoder<StompItem> for StompCodec {
             StompItem::Frame(frame) => {
                 dst.extend_from_slice(frame.command.as_bytes());
                 dst.put_u8(b'\n');
+                let handshake = is_handshake(&frame.command);
 
                 let mut headers = frame.headers;
                 let has_cl = headers
@@ -250,9 +283,10 @@ impl Encoder<StompItem> for StompCodec {
                 }
 
                 for (k, v) in headers {
-                    // Escape header name and value per STOMP 1.2 spec
-                    let escaped_key = escape_header_value(&k);
-                    let escaped_val = escape_header_value(&v);
+                    // Escape header name and value per STOMP 1.2 spec. In a
+                    // handshake frame a colon in the value is left alone.
+                    let escaped_key = escape_header_value(&k, true);
+                    let escaped_val = escape_header_value(&v, !handshake);
                     dst.extend_from_slice(escaped_key.as_bytes());
                     dst.put_u8(b':');
                     dst.extend_from_slice(escaped_val.as_bytes());

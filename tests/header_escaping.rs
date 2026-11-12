@@ -447,3 +447,89 @@ fn destination_with_colon() {
         _ => panic!("expected frame"),
     }
 }
+
+// ============================================================================
+// Handshake frames (CONNECT, STOMP, CONNECTED)
+// ============================================================================
+
+fn encode(frame: Frame) -> String {
+    let mut codec = StompCodec::new();
+    let mut buf = BytesMut::new();
+    codec.encode(StompItem::Frame(frame), &mut buf).unwrap();
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+fn decode(raw: &[u8]) -> Frame {
+    let mut codec = StompCodec::new();
+    let mut buf = BytesMut::from(raw);
+    match codec.decode(&mut buf).unwrap().unwrap() {
+        StompItem::Frame(frame) => frame,
+        other => panic!("expected frame, got {other:?}"),
+    }
+}
+
+/// #136: Artemis reads CONNECT header values verbatim, so a colon escaped as
+/// `\c` is a wrong passcode there. Unescaped it is accepted by Artemis,
+/// RabbitMQ and ActiveMQ Classic alike.
+#[test]
+fn connect_writes_a_colon_in_a_value_as_it_is() {
+    for command in ["CONNECT", "STOMP"] {
+        let wire = encode(
+            Frame::new(command)
+                .header("login", "user")
+                .header("passcode", "pa:ss"),
+        );
+        assert!(wire.contains("\npasscode:pa:ss\n"), "{command}: {wire:?}");
+    }
+}
+
+/// A backslash has no form every broker accepts; it stays escaped, as before.
+/// So do CR and LF, which would otherwise end the header line.
+#[test]
+fn connect_still_escapes_backslash_and_line_breaks() {
+    let wire = encode(Frame::new("CONNECT").header("passcode", "a\\b\nc\rd"));
+    assert!(wire.contains("\npasscode:a\\\\b\\nc\\rd\n"), "{wire:?}");
+}
+
+/// A colon in a header name can only be told from the separator if escaped.
+#[test]
+fn connect_still_escapes_a_colon_in_a_header_name() {
+    let wire = encode(Frame::new("CONNECT").header("odd:name", "v"));
+    assert!(wire.contains("\nodd\\cname:v\n"), "{wire:?}");
+}
+
+/// Every other frame escapes the colon, as STOMP 1.2 requires.
+#[test]
+fn other_frames_still_escape_a_colon_in_a_value() {
+    let wire = encode(Frame::new("SEND").header("custom", "a:b"));
+    assert!(wire.contains("\ncustom:a\\cb\n"), "{wire:?}");
+}
+
+#[test]
+fn connect_with_colon_and_backslash_round_trips() {
+    let frame = decode(encode(Frame::new("CONNECT").header("passcode", "a:b\\c")).as_bytes());
+    assert_eq!(frame.get_header("passcode"), Some("a:b\\c"));
+}
+
+/// A broker that does not escape CONNECTED headers may send a backslash that
+/// is no escape sequence. That must not fail the handshake.
+#[test]
+fn connected_value_that_is_not_escaped_is_read_verbatim() {
+    let frame = decode(b"CONNECTED\nversion:1.2\nserver:Broker\\x/1.0:beta\n\n\0");
+    assert_eq!(frame.get_header("server"), Some("Broker\\x/1.0:beta"));
+}
+
+/// A broker that does escape them is still read as before.
+#[test]
+fn connected_value_that_is_escaped_is_unescaped() {
+    let frame = decode(b"CONNECTED\nversion:1.2\nserver:a\\cb\\\\c\n\n\0");
+    assert_eq!(frame.get_header("server"), Some("a:b\\c"));
+}
+
+/// Leniency is for the handshake only.
+#[test]
+fn other_frames_still_reject_an_invalid_escape() {
+    let mut codec = StompCodec::new();
+    let mut buf = BytesMut::from(&b"MESSAGE\nheader:bad\\xescape\n\n\0"[..]);
+    assert!(codec.decode(&mut buf).is_err());
+}
