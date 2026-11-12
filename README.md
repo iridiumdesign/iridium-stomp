@@ -123,7 +123,7 @@ Run any example with `cargo run --example <name>` (requires a local STOMP broker
 | `subscribe` | Single subscription with `SubscriptionOptions` and per-message ack |
 | `multi_subscribe` | Multiple subscriptions merged into one stream, error monitoring, graceful shutdown |
 | `subscribe_with_headers` | Passing broker-specific headers via `subscribe_with_headers` |
-| `ack_roundtrip` | Send a message, receive it in `client` ack mode, and acknowledge it |
+| `ack_roundtrip` | Diagnostic: does an ACK take on this broker? Sends a message, acknowledges it in `client-individual` mode, reconnects, and reports whether the broker redelivers it (takes arguments; see the file's header) |
 | `transactions` | Begin, commit, and abort transactions |
 
 ## Features

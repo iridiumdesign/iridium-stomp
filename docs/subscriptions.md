@@ -243,11 +243,18 @@ removal to be immediate and the frame certain to be queued.
 The UNSUBSCRIBE is written only to the connection the subscription's SUBSCRIBE
 went out on. That has two consequences worth knowing:
 
-- **Ended while the client is reconnecting**, a subscription is simply not
-  replayed on the new connection. No UNSUBSCRIBE is sent, because the new
-  session never had it, and the old one is gone.
+- **Ended while the client is reconnecting**, a subscription is not replayed
+  on the new connection. No UNSUBSCRIBE is sent, because the new session
+  never had it, and the old one is gone.
 - **Ended before its SUBSCRIBE was written** (subscribed and dropped at
   once), a subscription sends neither frame. The broker never hears of it.
+
+Both hold when the local entry was removed at the time, which
+`unsubscribe` always does and a drop does unless the registry was locked at
+that instant. In that case the entry is still registered until the queued
+UNSUBSCRIBE is reached, and a reconnect that gets in first replays it: the
+new session is sent the SUBSCRIBE and then, straight after, the
+UNSUBSCRIBE. The end state is the same, with two frames more on the wire.
 
 One exception: if you took the raw receiver with `into_receiver`, you now own
 the stream and dropping it sends nothing. Unsubscribe explicitly with
