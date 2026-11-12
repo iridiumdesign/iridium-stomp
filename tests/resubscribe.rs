@@ -4,7 +4,8 @@
 //! RabbitMQ and Artemis close the connection on a duplicate SUBSCRIBE id, and
 //! Artemis on an UNSUBSCRIBE for an id it does not know.
 
-use iridium_stomp::{AckMode, Connection};
+use futures::StreamExt;
+use iridium_stomp::{AckMode, Connection, SubscriptionEnd, SubscriptionOptions};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -163,4 +164,84 @@ async fn subscription_replayed_after_reconnect_can_be_unsubscribed() {
     sub.unsubscribe().await.unwrap();
 
     assert_eq!(broker.await.unwrap(), ["SUBSCRIBE", "UNSUBSCRIBE"]);
+}
+
+/// A broker for one connection. It takes the SUBSCRIBE, sends `messages`
+/// MESSAGE frames for subscription 1, and reports every command after that
+/// up to the SEND the test uses as an end marker. `subscribed` fires once
+/// the SUBSCRIBE has arrived.
+async fn one_connection_broker(
+    messages: usize,
+) -> (
+    String,
+    oneshot::Receiver<()>,
+    tokio::task::JoinHandle<Vec<String>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let (subscribed_tx, subscribed_rx) = oneshot::channel();
+    let broker = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        connected(&mut sock).await;
+        commands_until(&mut sock, "SUBSCRIBE").await;
+        let _ = subscribed_tx.send(());
+        for n in 0..messages {
+            let message =
+                format!("MESSAGE\nsubscription:1\nmessage-id:m{n}\ndestination:/queue/a\n\nx\0");
+            sock.write_all(message.as_bytes())
+                .await
+                .expect("write MESSAGE");
+        }
+        let mut seen = commands_until(&mut sock, "SEND").await;
+        seen.pop(); // the marker
+        seen
+    });
+    (addr, subscribed_rx, broker)
+}
+
+/// #148: the library withdraws a subscription that overflows, and the
+/// handle the application then drops must not withdraw it a second time.
+/// Artemis closes the connection on an UNSUBSCRIBE for an id it no longer
+/// knows.
+#[tokio::test]
+async fn an_overflowed_subscription_is_unsubscribed_once() {
+    let (addr, _subscribed, broker) = one_connection_broker(3).await;
+    let conn = Connection::connect(&addr, "u", "p", "0,0").await.unwrap();
+    // One frame fits in the channel and none may be parked: the second
+    // MESSAGE fails the subscription.
+    let options = SubscriptionOptions::new()
+        .channel_capacity(1)
+        .overflow_limit(0);
+    let mut sub = conn
+        .subscribe_with_options("/queue/a", AckMode::Auto, options)
+        .await
+        .unwrap();
+
+    while sub.next().await.is_some() {}
+    assert!(matches!(
+        sub.ended(),
+        Some(SubscriptionEnd::Overflowed { .. })
+    ));
+    drop(sub);
+    conn.send("/queue/marker", "end").await.unwrap();
+
+    assert_eq!(broker.await.unwrap(), ["UNSUBSCRIBE"]);
+}
+
+/// #148: `Connection::unsubscribe` by id does not tell the handle, which
+/// must still not send a second UNSUBSCRIBE when it is dropped.
+#[tokio::test]
+async fn unsubscribe_by_id_then_drop_is_unsubscribed_once() {
+    let (addr, subscribed, broker) = one_connection_broker(0).await;
+    let conn = Connection::connect(&addr, "u", "p", "0,0").await.unwrap();
+    let sub = conn.subscribe("/queue/a", AckMode::Auto).await.unwrap();
+
+    // Ended before its SUBSCRIBE is written, a subscription sends nothing at
+    // all, so wait for the broker to have it.
+    subscribed.await.unwrap();
+    conn.unsubscribe(sub.id()).await.unwrap();
+    drop(sub);
+    conn.send("/queue/marker", "end").await.unwrap();
+
+    assert_eq!(broker.await.unwrap(), ["UNSUBSCRIBE"]);
 }
